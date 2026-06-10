@@ -100,7 +100,8 @@ Run the local smoke suite:
 scripts/verify-local.sh
 ```
 
-Run the high-fanout bridge stress gate:
+Run the high-fanout bridge stress gate. By default this exercises 256
+concurrent 1 MiB responses over the primary agent transport:
 
 ```sh
 scripts/stress-bridge-lab.sh
