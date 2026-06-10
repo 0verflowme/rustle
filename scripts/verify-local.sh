@@ -8,6 +8,7 @@ RUN_ROOTLESS="${RUSTLE_VERIFY_ROOTLESS:-1}"
 RUN_PRIVILEGED="${RUSTLE_VERIFY_PRIVILEGED:-auto}"
 REQUIRE_PRIVILEGED="${RUSTLE_VERIFY_REQUIRE_PRIVILEGED:-0}"
 RUN_BENCH="${RUSTLE_VERIFY_BENCH:-1}"
+RUN_STRESS="${RUSTLE_VERIFY_STRESS:-1}"
 RUN_LIVE="${RUSTLE_VERIFY_LIVE:-0}"
 LIVE_TRANSPORTS="${RUSTLE_VERIFY_LIVE_TRANSPORTS:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-direct-tcpip agent}}"
 
@@ -139,6 +140,11 @@ if [[ "$RUN_BENCH" == "1" ]]; then
     RUSTLE_BENCH_AGENT_UDP_PIPELINES="1 8" \
     "${SCRIPT_DIR}/bench-agent-udp-lab.sh"
 
+  verify_run smoke_wait_for_uploaded_agent_cleanup
+fi
+
+if [[ "$RUN_STRESS" == "1" ]]; then
+  verify_run_skip_ok "${SCRIPT_DIR}/stress-bridge-lab.sh"
   verify_run smoke_wait_for_uploaded_agent_cleanup
 fi
 

@@ -140,6 +140,19 @@ jobs:
           fi
           exit "$status"
 
+      - name: Rootless high-fanout bridge stress
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/stress-bridge-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "bridge stress skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
       - name: Linux TUN DNS smoke
         if: runner.os == 'Linux'
         shell: bash

@@ -93,6 +93,12 @@ Run the local smoke suite:
 scripts/verify-local.sh
 ```
 
+Run the high-fanout bridge stress gate:
+
+```sh
+scripts/stress-bridge-lab.sh
+```
+
 Run live tunnel benchmarks, including optional sshuttle comparison:
 
 ```sh

@@ -72,6 +72,7 @@ const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const BRIDGE_LAB_EVENT_BATCH: usize = 64;
+const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
 const SSH_PASSWORD_FILE_ENV: &str = "RUSTLE_SSH_PASSWORD_FILE";
 const AGENT_INITIAL_CONNECT_BATCH: usize = 4;
 const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
@@ -1739,7 +1740,9 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         let _ = drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
 
         let mut processed_bridge_events = 0_usize;
-        while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH {
+        while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH
+            && !remote_backlogs.should_pause_bridge_events()
+        {
             let Ok(event) = event_rx.try_recv() else {
                 break;
             };
@@ -2309,7 +2312,7 @@ async fn run_tunnel_loop(
                     }
                 }
             }
-            event = event_rx.recv() => {
+            event = event_rx.recv(), if !remote_backlogs.should_pause_bridge_events() => {
                 let Some(event) = event else {
                     bail!("SSH bridge event channel closed");
                 };
@@ -5284,6 +5287,7 @@ struct RemoteBacklog {
     front_offset: usize,
     bytes: usize,
     close_after_flush: bool,
+    close_defer_flushes: u8,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -5323,6 +5327,15 @@ impl RemoteBacklogs {
         self.total_bytes as u64
     }
 
+    fn should_pause_bridge_events(&self) -> bool {
+        self.total_bytes >= self.bridge_event_pause_threshold()
+    }
+
+    fn bridge_event_pause_threshold(&self) -> usize {
+        self.max_total_bytes
+            .saturating_sub(self.max_total_bytes / 4)
+    }
+
     fn push(&mut self, flow: tcp_core::FlowKey, bytes: impl Into<Bytes>) -> RemoteBacklogPush {
         let bytes = bytes.into();
         if bytes.is_empty() {
@@ -5338,11 +5351,16 @@ impl RemoteBacklogs {
         backlog.bytes += bytes.len();
         self.total_bytes += bytes.len();
         backlog.chunks.push_back(bytes);
+        if backlog.close_after_flush {
+            backlog.close_defer_flushes = REMOTE_CLOSE_DEFER_FLUSHES;
+        }
         RemoteBacklogPush::Accepted
     }
 
     fn close_after_flush(&mut self, flow: tcp_core::FlowKey) {
-        self.flows.entry(flow).or_default().close_after_flush = true;
+        let backlog = self.flows.entry(flow).or_default();
+        backlog.close_after_flush = true;
+        backlog.close_defer_flushes = REMOTE_CLOSE_DEFER_FLUSHES;
     }
 
     fn remove(&mut self, flow: tcp_core::FlowKey) {
@@ -5412,6 +5430,10 @@ impl RemoteBacklogs {
         }
 
         if backlog.close_after_flush {
+            if backlog.close_defer_flushes > 0 {
+                backlog.close_defer_flushes -= 1;
+                return Ok(());
+            }
             self.flows.remove(&flow);
             flow_manager.close_flow(flow, tcp_core::FlowState::HalfClosedRemote)?;
         } else if backlog.bytes == 0 {
@@ -9193,6 +9215,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_backlog_pauses_bridge_events_at_high_watermark() {
+        let first = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+        );
+        let second = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 3),
+            49153,
+            Ipv4Addr::new(192, 168, 1, 11),
+            443,
+        );
+        let mut backlogs = RemoteBacklogs::with_limits(16, 8);
+
+        assert!(!backlogs.should_pause_bridge_events());
+        assert_eq!(
+            backlogs.push(first, Bytes::from_static(b"hello")),
+            RemoteBacklogPush::Accepted
+        );
+        assert!(!backlogs.should_pause_bridge_events());
+        assert_eq!(
+            backlogs.push(second, Bytes::from_static(b"!")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(backlogs.total_bytes(), 6);
+        assert!(backlogs.should_pause_bridge_events());
+
+        backlogs.remove(first);
+        assert!(!backlogs.should_pause_bridge_events());
+    }
+
+    #[test]
     fn remote_backlogs_flush_all_into_reuses_scratch_vectors() {
         let client_ip = Ipv4Addr::new(10, 255, 255, 2);
         let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
@@ -9384,6 +9439,96 @@ mod tests {
         assert_eq!(outcome.stale_bridge_events, 1);
         assert!(manager.contains_flow_id(new_id));
         assert_eq!(backlogs.total_bytes(), b"new-flow-data".len() as u64);
+    }
+
+    #[test]
+    fn remote_close_defers_flow_close_for_late_remote_data() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+
+        let close_outcome = handle_bridge_event(
+            ssh_bridge::BridgeEvent::Closed { id },
+            &mut manager,
+            &mut backlogs,
+            SmolInstant::from_millis(1),
+        )
+        .expect("remote close event");
+        assert_eq!(close_outcome.closed_flows, vec![flow]);
+        assert_eq!(close_outcome.stale_bridge_events, 0);
+        assert!(manager.contains_flow_id(id));
+        assert_eq!(backlogs.active_flow_count(), 1);
+
+        let late_bytes = Bytes::from_static(b"late remote bytes after close marker");
+        let expected_len = late_bytes.len() as u64;
+        let data_outcome = handle_bridge_event(
+            ssh_bridge::BridgeEvent::RemoteData {
+                id,
+                bytes: late_bytes,
+            },
+            &mut manager,
+            &mut backlogs,
+            SmolInstant::from_millis(2),
+        )
+        .expect("late remote data event");
+        assert!(data_outcome.closed_flows.is_empty());
+        assert_eq!(data_outcome.stale_bridge_events, 0);
+        assert_eq!(backlogs.total_bytes(), 0);
+
+        let snapshot = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key == flow)
+            .expect("flow snapshot");
+        assert_eq!(snapshot.remote_to_local_bytes, expected_len);
+        assert_eq!(snapshot.state, tcp_core::FlowState::TcpEstablished);
+
+        let mut flow_keys = Vec::new();
+        let mut closed_flows = Vec::new();
+        backlogs
+            .flush_all_into(
+                &mut manager,
+                SmolInstant::from_millis(3),
+                &mut flow_keys,
+                &mut closed_flows,
+            )
+            .expect("first deferred flush");
+        assert!(manager.contains_flow_id(id));
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::TcpEstablished
+        );
+
+        backlogs
+            .flush_all_into(
+                &mut manager,
+                SmolInstant::from_millis(4),
+                &mut flow_keys,
+                &mut closed_flows,
+            )
+            .expect("second deferred flush");
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::HalfClosedRemote
+        );
+        assert_eq!(backlogs.active_flow_count(), 0);
     }
 
     #[test]
