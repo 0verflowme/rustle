@@ -34,6 +34,7 @@ CURL_TIMEOUT="${RUSTLE_BENCH_CURL_TIMEOUT:-45}"
 START_TIMEOUT="${RUSTLE_BENCH_START_TIMEOUT:-45}"
 KEEP_LOGS="${RUSTLE_BENCH_KEEP_LOGS:-0}"
 MIN_AGENT_SSHUTTLE_RATIO="${RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO:-}"
+EXPECT_BYTES="${RUSTLE_BENCH_EXPECT_BYTES:-${RUSTLE_LIVE_EXPECT_BYTES:-}}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$TARGET_CIDR" ]] || smoke_die "set RUSTLE_BENCH_TARGET_CIDR, for example 192.168.0.0/16"
@@ -62,6 +63,14 @@ except ValueError as exc:
 if ratio <= 0:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO must be greater than 0")
 PY
+fi
+if [[ -n "$EXPECT_BYTES" ]]; then
+  case "$EXPECT_BYTES" in
+    '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_EXPECT_BYTES must be a positive integer" ;;
+  esac
+  if [[ "$EXPECT_BYTES" -lt 1 ]]; then
+    smoke_die "RUSTLE_BENCH_EXPECT_BYTES must be at least 1"
+  fi
 fi
 if [[ "$CONCURRENCY" -gt "$REQUESTS" ]]; then
   CONCURRENCY="$REQUESTS"
@@ -544,6 +553,16 @@ run_curl_batch() {
       if ! grep -q "${RUSTLE_BENCH_EXPECT:-${RUSTLE_LIVE_EXPECT:-}}" "$response_path"; then
         sed 's/^/curl: /' "$response_path" >&2 || true
         smoke_die "${tool} response did not contain expected text"
+      fi
+    done
+  fi
+  if [[ -n "$EXPECT_BYTES" ]]; then
+    for metric_path in "$metrics_dir"/*.metric; do
+      local size_download
+      size_download="$(awk 'NF >= 2 { printf "%.0f", $2; exit }' "$metric_path")"
+      if [[ "$size_download" != "$EXPECT_BYTES" ]]; then
+        sed 's/^/curl: /' "${metric_path%.metric}.err" >&2 || true
+        smoke_die "${tool} response downloaded ${size_download:-0} bytes, expected ${EXPECT_BYTES}"
       fi
     done
   fi

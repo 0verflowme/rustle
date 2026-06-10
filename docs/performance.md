@@ -224,6 +224,36 @@ local firewall hooks and a remote Python helper. If sshuttle cannot make the URL
 reachable before the readiness deadline, the benchmark exits with diagnostics
 instead of reporting a misleading comparison row.
 
+## Controlled Live Large-Response Fixture
+
+Use `scripts/bench-live-fixture.sh` when the existing live URL returns tiny
+responses and mostly measures request latency. The fixture starts a temporary
+Python HTTP server on the SSH host, then runs `scripts/bench-live-compare.sh`
+against controlled 1 MiB / 10 MiB / 100 MiB responses. Each run sets
+`RUSTLE_BENCH_EXPECT_BYTES` so the benchmark fails if a response is truncated.
+
+```sh
+RUSTLE_FIXTURE_REMOTE=alice@ssh.example.com \
+RUSTLE_FIXTURE_HOST=192.168.190.45 \
+RUSTLE_BENCH_REQUESTS=8 \
+RUSTLE_BENCH_CONCURRENCY=4 \
+RUSTLE_BENCH_RUSTLE_TRANSPORTS=agent \
+scripts/bench-live-fixture.sh
+```
+
+`RUSTLE_FIXTURE_HOST` must be an IPv4 address on the remote SSH host that is
+reachable through the Rustle target route. It should be a remote-side target
+address, not the SSH control address that Rustle protects with a direct host
+route. By default the script uses `${RUSTLE_FIXTURE_HOST}/32` as
+`RUSTLE_BENCH_TARGET_CIDR`; set `RUSTLE_FIXTURE_TARGET_CIDR` when the fixture
+address should be covered by a larger route. Override
+`RUSTLE_FIXTURE_BODY_BYTES` to change the body-size matrix.
+
+For password-auth labs, the fixture SSH command can reuse
+`RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with
+`RUSTLE_FIXTURE_PASSWORD=1`. That path requires `sshpass` because the fixture
+itself is started with the OpenSSH client.
+
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is
 that it can lean on OS-specific firewall and kernel TCP behavior. That means the

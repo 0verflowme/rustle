@@ -109,6 +109,15 @@ RUSTLE_BENCH_TOOLS="rustle sshuttle" \
 scripts/bench-live-compare.sh
 ```
 
+Run controlled live large-response benchmarks by starting a temporary HTTP
+fixture on the SSH server:
+
+```sh
+RUSTLE_FIXTURE_REMOTE=alice@ssh.example.com \
+RUSTLE_FIXTURE_HOST=192.168.190.45 \
+scripts/bench-live-fixture.sh
+```
+
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md): architecture and protocol notes

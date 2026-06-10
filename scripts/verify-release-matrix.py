@@ -18,6 +18,7 @@ ARCHITECTURE_NOTES = REPO / "docs" / "architecture.md"
 PERFORMANCE_NOTES = REPO / "docs" / "performance.md"
 LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
+LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
 
 
@@ -275,10 +276,18 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
 
 REQUIRED_LIVE_BENCH_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
+    "RUSTLE_BENCH_EXPECT_BYTES",
     "smoke_wait_for_rustle_target_route_logs",
     "rustle-agent",
     "sshuttle",
     "agent/sshuttle",
+]
+
+REQUIRED_LIVE_FIXTURE_SNIPPETS = [
+    "RUSTLE_FIXTURE_BODY_BYTES",
+    "1048576 10485760 104857600",
+    "RUSTLE_BENCH_EXPECT_BYTES",
+    "bench-live-compare.sh",
 ]
 
 REQUIRED_LIVE_SMOKE_SNIPPETS = [
@@ -297,6 +306,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "hard gate",
     "rustle-agent",
     "same SSH server, target URL, request",
+    "bench-live-fixture.sh",
+    "1 MiB / 10 MiB / 100 MiB",
     "split default routes",
     "intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`",
     "compact command already defaults to the framed agent transport",
@@ -390,6 +401,7 @@ def main() -> None:
     performance_notes = PERFORMANCE_NOTES.read_text(encoding="utf-8")
     live_smoke = LIVE_SMOKE.read_text(encoding="utf-8")
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
+    live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
 
     matrix = parse_matrix(workflow)
@@ -466,6 +478,17 @@ def main() -> None:
         fail(
             "scripts/bench-live-compare.sh is missing required snippets: "
             f"{missing_live_bench!r}"
+        )
+
+    missing_live_fixture = [
+        snippet
+        for snippet in REQUIRED_LIVE_FIXTURE_SNIPPETS
+        if snippet not in live_fixture
+    ]
+    if missing_live_fixture:
+        fail(
+            "scripts/bench-live-fixture.sh is missing required snippets: "
+            f"{missing_live_fixture!r}"
         )
 
     missing_live_smoke = [
