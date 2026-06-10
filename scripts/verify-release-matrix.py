@@ -497,6 +497,7 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_VERIFY_LIVE_FIXTURE=1",
     "compact command already defaults to the framed agent transport",
     "compact auto-lane path starts after the primary agent lane",
+    "short first-flow defer",
     "explicit `--agent-sessions`",
     "bridge-lab` disables the compact tunnel's auto-lane fast-start",
     "rootless `bridge-lab` keeps full lane warmup",

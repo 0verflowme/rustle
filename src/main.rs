@@ -69,6 +69,7 @@ const DEFAULT_AGENT_SESSIONS: usize = AUTO_AGENT_SESSIONS;
 const MAX_AUTO_AGENT_SESSIONS: usize = 4;
 const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+const AGENT_FAST_START_WARMUP_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const BRIDGE_LAB_EVENT_BATCH: usize = 64;
@@ -1501,11 +1502,12 @@ async fn connect_bridge_runtime(
                 agent_command.to_owned(),
                 mtu,
             ));
-            let agent = if should_fast_start_agent_lanes(
+            let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,
                 desired_agent_sessions,
-            ) {
+            );
+            let agent = if fast_start_agent_lanes {
                 connect_auto_agent_bridge_transports_from_connector(
                     connector.as_ref(),
                     desired_agent_sessions,
@@ -1515,11 +1517,20 @@ async fn connect_bridge_runtime(
                 connector.connect_initial(desired_agent_sessions).await?
             };
             ensure_agent_dns_remote_supported(&agent, dns_remote)?;
-            let agent = ReconnectingAgentBridge::new_with_desired_lanes(
-                connector,
-                agent,
-                desired_agent_sessions,
-            );
+            let agent = if fast_start_agent_lanes {
+                ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
+                    connector,
+                    agent,
+                    desired_agent_sessions,
+                    Some(AGENT_FAST_START_WARMUP_DELAY),
+                )
+            } else {
+                ReconnectingAgentBridge::new_with_desired_lanes(
+                    connector,
+                    agent,
+                    desired_agent_sessions,
+                )
+            };
             let dns_transport = DnsTransport::Agent(agent.clone());
             Ok((BridgeRuntime::Agent(agent), dns_transport))
         }
@@ -1530,11 +1541,12 @@ async fn connect_bridge_runtime(
                 agent_command.to_owned(),
                 mtu,
             ));
-            let agent_result = if should_fast_start_agent_lanes(
+            let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,
                 desired_agent_sessions,
-            ) {
+            );
+            let agent_result = if fast_start_agent_lanes {
                 connect_auto_agent_bridge_transports_from_connector(
                     connector.as_ref(),
                     desired_agent_sessions,
@@ -1556,11 +1568,20 @@ async fn connect_bridge_runtime(
                         ));
                     }
                     eprintln!("transport: auto selected agent");
-                    let agent = ReconnectingAgentBridge::new_with_desired_lanes(
-                        connector,
-                        agent,
-                        desired_agent_sessions,
-                    );
+                    let agent = if fast_start_agent_lanes {
+                        ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
+                            connector,
+                            agent,
+                            desired_agent_sessions,
+                            Some(AGENT_FAST_START_WARMUP_DELAY),
+                        )
+                    } else {
+                        ReconnectingAgentBridge::new_with_desired_lanes(
+                            connector,
+                            agent,
+                            desired_agent_sessions,
+                        )
+                    };
                     let dns_transport = DnsTransport::Agent(agent.clone());
                     Ok((BridgeRuntime::Agent(agent), dns_transport))
                 }
@@ -4098,6 +4119,20 @@ impl ReconnectingAgentBridge {
         initial: Vec<AgentBridgeTransport>,
         desired_lanes: usize,
     ) -> Self {
+        Self::new_with_desired_lanes_and_missing_repair_delay(
+            connector,
+            initial,
+            desired_lanes,
+            None,
+        )
+    }
+
+    fn new_with_desired_lanes_and_missing_repair_delay(
+        connector: Arc<dyn AgentBridgeConnector>,
+        initial: Vec<AgentBridgeTransport>,
+        desired_lanes: usize,
+        missing_repair_delay: Option<Duration>,
+    ) -> Self {
         assert!(
             !initial.is_empty(),
             "agent bridge requires at least one transport"
@@ -4135,7 +4170,11 @@ impl ReconnectingAgentBridge {
             reconnects: Arc::new(AgentReconnectCounters::default()),
         };
         for index in initial_len..desired_lanes {
-            bridge.spawn_lane_repair(index, "missing startup exec transport".to_owned());
+            bridge.spawn_lane_repair_with_delay(
+                index,
+                "missing startup exec transport".to_owned(),
+                missing_repair_delay,
+            );
         }
         bridge
     }
@@ -4719,6 +4758,15 @@ impl ReconnectingAgentBridge {
     }
 
     fn spawn_lane_repair(&self, lane_index: usize, failure: String) {
+        self.spawn_lane_repair_with_delay(lane_index, failure, None);
+    }
+
+    fn spawn_lane_repair_with_delay(
+        &self,
+        lane_index: usize,
+        failure: String,
+        delay: Option<Duration>,
+    ) {
         let lane = &self.lanes[lane_index];
         if !self.try_start_background_lane_repair(lane) {
             return;
@@ -4728,6 +4776,10 @@ impl ReconnectingAgentBridge {
         let reconnects = Arc::downgrade(&self.reconnects);
         let connector = Arc::clone(&self.connector);
         tokio::spawn(async move {
+            if let Some(delay) = delay.filter(|delay| !delay.is_zero()) {
+                tokio::time::sleep(delay).await;
+            }
+
             let mut last_failure = failure;
             let mut attempts = 0_usize;
 
@@ -11812,6 +11864,69 @@ mod tests {
 
         drop(bridge);
         for agent in [first_agent, second_agent, third_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_start_missing_lane_warmup_can_be_deferred() {
+        let (first_transport, first_agent) = test_agent_transport().await;
+        let (second_transport, second_agent) = test_agent_transport().await;
+        let connector = QueuedAgentConnector::new(
+            "rustle agent",
+            vec![AgentBridgeTransport {
+                carrier: AgentBridgeCarrier::Detached,
+                transport: first_transport,
+                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
+            }],
+            vec![AgentBridgeTransport {
+                carrier: AgentBridgeCarrier::Detached,
+                transport: second_transport,
+                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
+            }],
+        );
+
+        let transports = connect_auto_agent_bridge_transports_from_connector(connector.as_ref(), 2)
+            .await
+            .expect("auto startup connects primary lane");
+        let bridge = ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
+            connector.clone(),
+            transports,
+            2,
+            Some(Duration::from_millis(100)),
+        );
+
+        tokio::task::yield_now().await;
+        assert!(
+            connector.command_requests().is_empty(),
+            "deferred warmup should not compete with the first scheduler turn"
+        );
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(snapshot.lanes_total, 2);
+        assert_eq!(snapshot.lanes_available, 1);
+        assert_eq!(snapshot.lanes_missing, 1);
+        assert_eq!(snapshot.lanes_repairing, 1);
+
+        wait_for_reconnect_snapshot(
+            &bridge,
+            AgentReconnectSnapshot {
+                attempts: 1,
+                successes: 1,
+                failures: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            connector.command_requests(),
+            vec!["/tmp/rustle-uploaded agent".to_owned()]
+        );
+
+        drop(bridge);
+        for agent in [first_agent, second_agent] {
             tokio::time::timeout(std::time::Duration::from_secs(1), agent)
                 .await
                 .expect("agent exits")

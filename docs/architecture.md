@@ -93,8 +93,9 @@ Rustle keeps three transport choices, but only one is the normal path:
   while giving larger machines more parallel SSH exec capacity without exposing
   a public tuning knob. The compact auto-lane path starts after the primary
   agent lane is established, then warms the remaining recommended lanes in
-  background so first-request latency does not wait for every extra SSH exec
-  transport. Larger lane counts remain available through the hidden
+  background after a short defer so first-request latency does not wait for, or
+  immediately compete with, every extra SSH exec transport. Larger lane counts
+  remain available through the hidden
   `--agent-sessions` override for unusual high-latency or high-bandwidth links;
   explicit lane counts keep the full initial startup gate.
   Stream assignment uses a deterministic two-candidate choice: the primary hash
@@ -372,7 +373,8 @@ failure, timeout, or route/device shutdown.
   startup pool, and those missing desired slots remain repairable in the
   background. For the compact default auto-lane path, only the primary lane is
   required before the tunnel can start; remaining recommended lanes use the same
-  background repair path as missing startup lanes.
+  background repair path as missing startup lanes after a short first-flow
+  defer.
   Uploaded helpers are staged in private Rustle-owned temporary directories
   before execution. POSIX remotes create the directory with `mktemp -d` under
   `umask 077` and `chmod 700`; Windows remotes create a GUID-suffixed

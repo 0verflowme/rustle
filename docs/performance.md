@@ -363,8 +363,8 @@ Performance work must preserve these invariants:
   auto-selected as capped `ceil(sqrt(local CPU parallelism))` by default and
   remains a hidden/internal tuning knob so the public command stays compact
 - the compact auto-lane path starts after the primary agent lane and warms the
-  remaining recommended lanes in background, while explicit `--agent-sessions`
-  requests keep the full initial startup gate
+  remaining recommended lanes in background after a short first-flow defer,
+  while explicit `--agent-sessions` requests keep the full initial startup gate
 - rootless `bridge-lab` keeps full lane warmup for steady-state throughput and
   stress evidence instead of timing the compact tunnel fast-start path
 - each agent exec lane must be a fresh SSH connection with one exec channel, not
