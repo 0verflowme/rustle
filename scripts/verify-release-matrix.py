@@ -109,6 +109,15 @@ REQUIRED_WORKFLOW_SNIPPETS = [
     "musl release binary appears dynamically linked",
     "sha256sum > SHA256SUMS",
     "name: rustle-checksums",
+    "Verify agent sidecar store",
+    "scripts/prepare-agent-sidecars.sh",
+    "RUSTLE_AGENT_REQUIRE_ALL=1",
+    "rustle-agent-linux-x86_64",
+    "rustle-agent-linux-aarch64",
+    "rustle-agent-macos-x86_64",
+    "rustle-agent-macos-aarch64",
+    "rustle-agent-windows-x86_64.exe",
+    "rustle-agent-windows-aarch64.exe",
 ]
 
 REQUIRED_BUILD_SCRIPT_SNIPPETS = [
@@ -272,7 +281,10 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "scripts/smoke-agent-sidecars.sh",
     "RUSTLE_AGENT_RELEASE_TAG",
     "RUSTLE_AGENT_ARCHIVE_DIR",
+    "RUSTLE_AGENT_REQUIRE_ALL=1",
     "rustle-agent-linux-x86_64",
+    "rustle-agent-macos-aarch64",
+    "rustle-agent-windows-x86_64.exe",
     "RUSTLE_AGENT_DIR",
     "cross-platform sidecar candidate selection",
     "CI operating-system matrix",
@@ -347,8 +359,17 @@ REQUIRED_AGENT_SIDECAR_SNIPPETS = [
 
 REQUIRED_AGENT_SIDECAR_SMOKE_SNIPPETS = [
     "RUSTLE_AGENT_FORCE=1",
-    "grep -q 'musl-sidecar'",
+    "linux-x64-musl-sidecar",
+    "linux-arm64-musl-sidecar",
+    "macos-x64-sidecar",
+    "macos-arm64-sidecar",
+    "windows-x64-sidecar",
+    "windows-arm-sidecar",
     "rustle-agent-linux-x86_64",
+    "rustle-agent-linux-aarch64",
+    "rustle-agent-macos-x86_64",
+    "rustle-agent-macos-aarch64",
+    "rustle-agent-windows-x86_64.exe",
     "rustle-agent-windows-aarch64.exe",
     "SHA256SUMS",
 ]

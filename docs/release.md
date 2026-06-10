@@ -18,6 +18,10 @@ this release note. The workflow verifies that each archive contains those files,
 extracts the archive, runs the extracted packaged binary with `--help`, checks
 musl archives for static linkage, requires all eight native archives before
 publishing, and publishes a `SHA256SUMS` file with one entry per archive.
+The checksum job also runs `scripts/prepare-agent-sidecars.sh` against the
+assembled release archives with `RUSTLE_AGENT_REQUIRE_ALL=1`, proving the release
+can produce the full `RUSTLE_AGENT_DIR` sidecar store used by automatic
+remote-agent bootstrap.
 `scripts/verify-release-matrix.py` keeps this target list, the release workflow
 matrix, archive naming, checksum count, CI operating-system matrix, and required
 smoke coverage in sync.
@@ -41,8 +45,9 @@ The same helper can prepare sidecars from a local release directory with
 `RUSTLE_AGENT_ARCHIVE_DIR=dist`. It verifies `SHA256SUMS` when present, prepares
 all eight release targets by default, accepts a smaller `RUSTLE_AGENT_TARGETS`
 set for diagnostics, and creates both exact-triple aliases and short platform
-aliases such as `rustle-agent-linux-x86_64`. Linux platform aliases preserve the
-static musl sidecar preference when both musl and GNU archives are available.
+aliases such as `rustle-agent-linux-x86_64`, `rustle-agent-macos-aarch64`, and
+`rustle-agent-windows-x86_64.exe`. Linux platform aliases preserve the static
+musl sidecar preference when both musl and GNU archives are available.
 
 ## Platform Contract
 
@@ -135,9 +140,10 @@ Required before tagging a release:
   generation, including PowerShell platform parsing, upload command selection,
   cross-platform sidecar candidate selection, Windows cleanup command shape, and
   the POSIX multi-lane staged-helper cleanup execution proof.
-- `scripts/smoke-agent-sidecars.sh` passes, proving release archives can be
-  verified, extracted into `RUSTLE_AGENT_DIR`, and exposed through the same
-  exact-triple and short platform aliases used by automatic agent bootstrap.
+- `scripts/smoke-agent-sidecars.sh` passes, proving release archives for Linux,
+  macOS, and Windows can be verified, extracted into `RUSTLE_AGENT_DIR`, and
+  exposed through the same exact-triple and short platform aliases used by
+  automatic agent bootstrap.
 - `agent_initial_startup_keeps_successful_extra_lanes_after_extra_failure`
   passes, proving a transient extra-lane startup failure does not discard other
   successful lanes from the initial framed-agent pool.

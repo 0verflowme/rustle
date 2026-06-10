@@ -227,6 +227,43 @@ jobs:
           fi
           cat SHA256SUMS
 
+      - name: Verify agent sidecar store
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf agent-archives agent-store
+          mkdir -p agent-archives agent-store
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} agent-archives/ \;
+          cp SHA256SUMS agent-archives/SHA256SUMS
+          RUSTLE_AGENT_ARCHIVE_DIR="$PWD/agent-archives" \
+          RUSTLE_AGENT_DIR="$PWD/agent-store" \
+          RUSTLE_AGENT_REQUIRE_ALL=1 \
+          RUSTLE_AGENT_FORCE=1 \
+            scripts/prepare-agent-sidecars.sh
+          expected_sidecars=(
+            rustle-agent-x86_64-unknown-linux-musl
+            rustle-agent-x86_64-unknown-linux-gnu
+            rustle-agent-aarch64-unknown-linux-musl
+            rustle-agent-aarch64-unknown-linux-gnu
+            rustle-agent-x86_64-apple-darwin
+            rustle-agent-aarch64-apple-darwin
+            rustle-agent-x86_64-pc-windows-msvc.exe
+            rustle-agent-aarch64-pc-windows-msvc.exe
+            rustle-agent-linux-x86_64
+            rustle-agent-linux-aarch64
+            rustle-agent-macos-x86_64
+            rustle-agent-macos-aarch64
+            rustle-agent-windows-x86_64.exe
+            rustle-agent-windows-aarch64.exe
+          )
+          for sidecar in "${expected_sidecars[@]}"; do
+            test -f "agent-store/${sidecar}"
+          done
+          test -x agent-store/rustle-agent-linux-x86_64
+          test -x agent-store/rustle-agent-linux-aarch64
+          test -x agent-store/rustle-agent-macos-x86_64
+          test -x agent-store/rustle-agent-macos-aarch64
+
       - name: Upload checksums
         uses: actions/upload-artifact@v4
         with:

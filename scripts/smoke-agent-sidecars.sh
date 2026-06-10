@@ -60,24 +60,33 @@ PY
 }
 
 make_checksums() {
+  local archive_root
+  local archive_base
+  archive_root="$(dirname "$ARCHIVE_DIR")"
+  archive_base="$(basename "$ARCHIVE_DIR")"
   (
-    cd "$ARCHIVE_DIR"
+    cd "$archive_root"
     if command -v sha256sum >/dev/null 2>&1; then
-      sha256sum rustle-* >SHA256SUMS
+      sha256sum "${archive_base}"/rustle-* >"${ARCHIVE_DIR}/SHA256SUMS"
     elif command -v shasum >/dev/null 2>&1; then
-      shasum -a 256 rustle-* >SHA256SUMS
+      shasum -a 256 "${archive_base}"/rustle-* >"${ARCHIVE_DIR}/SHA256SUMS"
     else
       smoke_die "missing required command: sha256sum or shasum"
     fi
   )
 }
 
-targets="x86_64-unknown-linux-musl x86_64-unknown-linux-gnu"
-make_unix_archive x86_64-unknown-linux-musl musl-sidecar
-make_unix_archive x86_64-unknown-linux-gnu gnu-sidecar
+targets="x86_64-unknown-linux-musl x86_64-unknown-linux-gnu aarch64-unknown-linux-musl aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin"
+make_unix_archive x86_64-unknown-linux-musl linux-x64-musl-sidecar
+make_unix_archive x86_64-unknown-linux-gnu linux-x64-gnu-sidecar
+make_unix_archive aarch64-unknown-linux-musl linux-arm64-musl-sidecar
+make_unix_archive aarch64-unknown-linux-gnu linux-arm64-gnu-sidecar
+make_unix_archive x86_64-apple-darwin macos-x64-sidecar
+make_unix_archive aarch64-apple-darwin macos-arm64-sidecar
 
 if command -v unzip >/dev/null 2>&1; then
-  targets="${targets} aarch64-pc-windows-msvc"
+  targets="${targets} x86_64-pc-windows-msvc aarch64-pc-windows-msvc"
+  make_windows_archive x86_64-pc-windows-msvc windows-x64-sidecar
   make_windows_archive aarch64-pc-windows-msvc windows-arm-sidecar
 else
   smoke_info "unzip unavailable; Windows sidecar archive extraction check skipped"
@@ -95,14 +104,29 @@ RUSTLE_AGENT_FORCE=1 \
 grep -q "^RUSTLE_AGENT_DIR=${AGENT_DIR}$" "${TMP_ROOT}/prepare.out"
 test -x "${AGENT_DIR}/rustle-x86_64-unknown-linux-musl/rustle"
 test -x "${AGENT_DIR}/rustle-x86_64-unknown-linux-gnu/rustle"
+test -x "${AGENT_DIR}/rustle-aarch64-unknown-linux-musl/rustle"
+test -x "${AGENT_DIR}/rustle-aarch64-unknown-linux-gnu/rustle"
+test -x "${AGENT_DIR}/rustle-x86_64-apple-darwin/rustle"
+test -x "${AGENT_DIR}/rustle-aarch64-apple-darwin/rustle"
 test -f "${AGENT_DIR}/rustle-agent-x86_64-unknown-linux-musl"
 test -f "${AGENT_DIR}/rustle-agent-x86_64-unknown-linux-gnu"
-grep -q 'musl-sidecar' "${AGENT_DIR}/rustle-agent-linux-x86_64"
-grep -q 'musl-sidecar' "${AGENT_DIR}/rustle-linux-x86_64"
+test -f "${AGENT_DIR}/rustle-agent-aarch64-unknown-linux-musl"
+test -f "${AGENT_DIR}/rustle-agent-aarch64-unknown-linux-gnu"
+test -f "${AGENT_DIR}/rustle-agent-x86_64-apple-darwin"
+test -f "${AGENT_DIR}/rustle-agent-aarch64-apple-darwin"
+grep -q 'linux-x64-musl-sidecar' "${AGENT_DIR}/rustle-agent-linux-x86_64"
+grep -q 'linux-x64-musl-sidecar' "${AGENT_DIR}/rustle-linux-x86_64"
+grep -q 'linux-arm64-musl-sidecar' "${AGENT_DIR}/rustle-agent-linux-aarch64"
+grep -q 'linux-arm64-musl-sidecar' "${AGENT_DIR}/rustle-linux-aarch64"
+grep -q 'macos-x64-sidecar' "${AGENT_DIR}/rustle-agent-macos-x86_64"
+grep -q 'macos-arm64-sidecar' "${AGENT_DIR}/rustle-agent-macos-aarch64"
 
 if [[ "$targets" == *aarch64-pc-windows-msvc* ]]; then
+  test -f "${AGENT_DIR}/rustle-x86_64-pc-windows-msvc/rustle.exe"
   test -f "${AGENT_DIR}/rustle-aarch64-pc-windows-msvc/rustle.exe"
+  test -f "${AGENT_DIR}/rustle-agent-windows-x86_64.exe"
   test -f "${AGENT_DIR}/rustle-agent-windows-aarch64.exe"
+  grep -q 'windows-x64-sidecar' "${AGENT_DIR}/rustle-agent-windows-x86_64.exe"
   grep -q 'windows-arm-sidecar' "${AGENT_DIR}/rustle-agent-windows-aarch64.exe"
 fi
 
