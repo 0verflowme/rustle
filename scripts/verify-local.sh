@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/smoke-lib.sh"
 RUN_ROOTLESS="${RUSTLE_VERIFY_ROOTLESS:-1}"
 RUN_PRIVILEGED="${RUSTLE_VERIFY_PRIVILEGED:-auto}"
 REQUIRE_PRIVILEGED="${RUSTLE_VERIFY_REQUIRE_PRIVILEGED:-0}"
+RUN_DNS_TAKEOVER="${RUSTLE_VERIFY_DNS_TAKEOVER:-0}"
 RUN_BENCH="${RUSTLE_VERIFY_BENCH:-1}"
 RUN_STRESS="${RUSTLE_VERIFY_STRESS:-1}"
 RUN_LIVE="${RUSTLE_VERIFY_LIVE:-0}"
@@ -17,6 +18,13 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 
 passes=0
 skips=0
+
+for bool_flag in RUN_DNS_TAKEOVER RUN_LIVE_FIXTURE; do
+  case "${!bool_flag}" in
+    0 | 1) ;;
+    *) smoke_die "${bool_flag/RUN_/RUSTLE_VERIFY_} must be 0 or 1" ;;
+  esac
+done
 
 verify_info() {
   smoke_info "verify: $*"
@@ -111,6 +119,9 @@ fi
 if should_run_privileged; then
   verify_run_skip_ok env RUSTLE_SMOKE_BRIDGE_TRANSPORT=direct-tcpip "${SCRIPT_DIR}/smoke-tun-dns.sh"
   verify_run_skip_ok env RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-tun-dns.sh"
+  if [[ "$RUN_DNS_TAKEOVER" == "1" ]]; then
+    verify_run_skip_ok env RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-tun-dns.sh"
+  fi
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
   verify_run_skip_ok env RUSTLE_NETNS_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-udp.sh"

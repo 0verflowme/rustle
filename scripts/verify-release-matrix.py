@@ -445,6 +445,14 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        'RUN_DNS_TAKEOVER="${RUSTLE_VERIFY_DNS_TAKEOVER:-0}"',
+    ),
+    (
+        VERIFY_LOCAL,
+        "RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent",
+    ),
+    (
+        VERIFY_LOCAL,
         'RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip"',
     ),
 ]
@@ -493,6 +501,7 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "split default routes",
     "intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",
+    "RUSTLE_VERIFY_DNS_TAKEOVER=1",
     "DNS resolver takeover, normal system resolver delivery through Rustle",
     "RUSTLE_VERIFY_LIVE_FIXTURE=1",
     "compact command already defaults to the framed agent transport",

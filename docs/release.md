@@ -110,8 +110,10 @@ The live verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
 intentionally narrowing that matrix for diagnostics. Set
 `RUSTLE_VERIFY_LIVE_FIXTURE=1` on release performance runs to prove the
-controlled 1 MiB / 10 MiB / 100 MiB live fixture path as well. Skips are useful
-diagnostics, but they are not release evidence for the skipped platform or path.
+controlled 1 MiB / 10 MiB / 100 MiB live fixture path as well. Set
+`RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged release runs to include the system
+resolver takeover smoke. Skips are useful diagnostics, but they are not release
+evidence for the skipped platform or path.
 
 Required before tagging a release:
 

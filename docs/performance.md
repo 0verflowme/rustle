@@ -280,6 +280,8 @@ the same run. Live smoke runs `agent` first and `direct-tcpip` second by
 default before the benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the
 smoke matrix when debugging one transport. Add `RUSTLE_VERIFY_LIVE_FIXTURE=1`
 to include the controlled large-response fixture in the live verifier run.
+Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
+system resolver takeover and exact-restore DNS smoke.
 
 ## Agent Promotion Criteria
 
