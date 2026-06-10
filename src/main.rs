@@ -5542,10 +5542,12 @@ fn handle_bridge_event_into(
     let id = bridge_event_id(&event);
     let flow = id.key;
     if !flow_manager.contains_flow(flow) {
-        eprintln!(
-            "ssh: ignoring stale {} event for removed {flow:?}",
-            bridge_event_name(&event)
-        );
+        if should_log_stale_bridge_event(&event) {
+            eprintln!(
+                "ssh: ignoring stale {} event for removed {flow:?}",
+                bridge_event_name(&event)
+            );
+        }
         remote_backlogs.remove_id(id);
         return Ok(BridgeEventStats {
             stale_bridge_events: 1,
@@ -5553,11 +5555,13 @@ fn handle_bridge_event_into(
         });
     }
     if !flow_manager.contains_flow_id(id) {
-        eprintln!(
-            "ssh: ignoring stale {} event for reused {flow:?} generation={}",
-            bridge_event_name(&event),
-            id.generation
-        );
+        if should_log_stale_bridge_event(&event) {
+            eprintln!(
+                "ssh: ignoring stale {} event for reused {flow:?} generation={}",
+                bridge_event_name(&event),
+                id.generation
+            );
+        }
         remote_backlogs.remove_id(id);
         return Ok(BridgeEventStats {
             stale_bridge_events: 1,
@@ -5632,6 +5636,10 @@ fn handle_bridge_event_into(
             Ok(BridgeEventStats::default())
         }
     }
+}
+
+fn should_log_stale_bridge_event(event: &ssh_bridge::BridgeEvent) -> bool {
+    !matches!(event, ssh_bridge::BridgeEvent::RemoteData { .. })
 }
 
 fn bridge_event_id(event: &ssh_bridge::BridgeEvent) -> tcp_core::FlowId {
@@ -10555,6 +10563,84 @@ mod tests {
         assert!(outcome.closed_flows.is_empty());
         assert_eq!(outcome.remote_backlog_overflows, 0);
         assert_eq!(outcome.stale_bridge_events, 1);
+    }
+
+    #[test]
+    fn stale_remote_data_storm_after_flow_removal_is_bounded() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        manager
+            .remove_flow(flow)
+            .expect("remove flow before stale storm");
+
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+        let mut closed_flows = Vec::with_capacity(8);
+        let closed_capacity = closed_flows.capacity();
+        let payload = Bytes::from(vec![0x5a; 16 * 1024]);
+        let mut stale_events = 0_u64;
+        let mut overflows = 0_u64;
+
+        for tick in 0..2048 {
+            let stats = handle_bridge_event_into(
+                ssh_bridge::BridgeEvent::RemoteData {
+                    id,
+                    bytes: payload.clone(),
+                },
+                &mut manager,
+                &mut backlogs,
+                SmolInstant::from_millis(tick),
+                &mut closed_flows,
+            )
+            .expect("stale remote-data event should not fail");
+            stale_events = stale_events.saturating_add(stats.stale_bridge_events);
+            overflows = overflows.saturating_add(stats.remote_backlog_overflows);
+
+            assert!(closed_flows.is_empty());
+            assert_eq!(closed_flows.capacity(), closed_capacity);
+            assert_eq!(backlogs.active_flow_count(), 0);
+            assert_eq!(backlogs.total_bytes(), 0);
+        }
+
+        assert_eq!(stale_events, 2048);
+        assert_eq!(overflows, 0);
+    }
+
+    #[test]
+    fn stale_remote_data_events_are_counted_without_per_chunk_log() {
+        let flow = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+        );
+        let id = tcp_core::FlowId::new(flow, 7);
+
+        assert!(!should_log_stale_bridge_event(
+            &ssh_bridge::BridgeEvent::RemoteData {
+                id,
+                bytes: Bytes::from_static(b"stale")
+            }
+        ));
+        assert!(should_log_stale_bridge_event(
+            &ssh_bridge::BridgeEvent::Closed { id }
+        ));
     }
 
     #[test]

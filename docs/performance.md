@@ -292,7 +292,8 @@ sole public default requires evidence that it remains better than compatibility
 mode on the same machines:
 
 - rootless bridge benchmarks pass for both transports at 1, 8, 32, 64, and 256
-  synthetic flows with 64 KiB and 1 MiB response bodies
+  synthetic flows with 64 KiB and 1 MiB response bodies; the high-fanout stress
+  gate defaults to both `agent` and `direct-tcpip` at 256 x 1 MiB
 - rootless framed-agent UDP benchmarks pass at 64, 512, and 1200 byte responses
   with pipeline depths 1, 32, and 128
 - agent throughput is at least as good as direct-tcpip at high concurrency, or
@@ -348,6 +349,11 @@ Performance work must preserve these invariants:
   temporary flow lists
 - bridge event handling uses caller-owned closed-flow scratch storage so
   high-rate remote-data events do not allocate temporary closed-flow vectors
+- `stale_remote_data_storm_after_flow_removal_is_bounded` proves stale
+  remote-data storms after flow removal do not refill remote backlog storage,
+  emit closed-flow work, or trip backlog overflow accounting
+- stale `RemoteData` chunks are counted without per-chunk logging; stale
+  close/eof/failure/open transitions still log for diagnosis
 - generic UDP request payloads are parsed into `Bytes` once from the reusable
   TUN read buffer, then moved directly into the per-association agent queue
   without a second payload allocation

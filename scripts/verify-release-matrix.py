@@ -239,6 +239,9 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "flow_manager_cleanup_enumeration_into_reuses_output_vectors",
     "remote_backlogs_flush_all_into_reuses_scratch_vectors",
     "bridge_event_handler_into_reuses_closed_flow_scratch_vector",
+    "should_log_stale_bridge_event",
+    "stale_remote_data_storm_after_flow_removal_is_bounded",
+    "stale_remote_data_events_are_counted_without_per_chunk_log",
     "remote_close_defers_flow_close_for_late_remote_data",
     "remote_backlog_pauses_bridge_events_at_high_watermark",
     "pub payload: Bytes",
@@ -439,6 +442,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         BRIDGE_BENCH,
         'TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORTS:-agent direct-tcpip}"',
+    ),
+    (
+        REPO / "scripts" / "stress-bridge-lab.sh",
+        'TRANSPORTS="${RUSTLE_STRESS_BRIDGE_TRANSPORTS:-agent direct-tcpip}"',
     ),
     (
         VERIFY_LOCAL,
