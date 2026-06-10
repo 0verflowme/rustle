@@ -73,8 +73,10 @@ Full-tunnel shorthand is accepted:
 sudo rustle -r alice@example.com 0/0
 ```
 
-Rustle verifies SSH host keys by default through OpenSSH `known_hosts`. For
-temporary development labs only, use `--insecure-accept-host-key`.
+Rustle verifies SSH host keys by default through OpenSSH `known_hosts`. To
+record a new trusted host on first connection while still rejecting later key
+changes, use `--accept-new-host-key`. For temporary development labs only, use
+`--insecure-accept-host-key`.
 
 ## Development
 

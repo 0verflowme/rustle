@@ -113,6 +113,13 @@ Required before tagging a release:
   CI still covers the required OS matrix and smoke gates.
 - CI passes on Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64,
   and Windows arm64.
+- SSH host-key UX checks pass:
+  `host_key_verifier_accept_new_records_missing_host_key`,
+  `host_key_verifier_accept_new_rejects_changed_known_host`, and
+  `compact_cli_rejects_conflicting_host_key_modes` must prove that
+  `--accept-new-host-key` records only unknown hosts while preserving hard
+  failures for changed keys and staying mutually exclusive with
+  `--insecure-accept-host-key`.
 - Remote bootstrap unit coverage passes for POSIX and Windows command
   generation, including PowerShell platform parsing, upload command selection,
   cross-platform sidecar candidate selection, Windows cleanup command shape, and

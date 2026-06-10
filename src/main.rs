@@ -146,6 +146,13 @@ struct SshArgs {
     #[arg(long = "insecure-accept-host-key")]
     insecure_accept_host_key: bool,
 
+    /// Trust and record a new SSH host key, but still reject changed known keys.
+    #[arg(
+        long = "accept-new-host-key",
+        conflicts_with = "insecure_accept_host_key"
+    )]
+    accept_new_host_key: bool,
+
     /// OpenSSH known_hosts file to use for host-key verification.
     #[arg(long = "known-hosts")]
     known_hosts: Option<PathBuf>,
@@ -6671,6 +6678,7 @@ struct PreparedSshConnection {
     password: Option<String>,
     known_hosts: Option<PathBuf>,
     insecure_accept_host_key: bool,
+    accept_new_host_key: bool,
     connect_timeout: Duration,
 }
 
@@ -6808,6 +6816,9 @@ fn prepare_ssh_connection(args: &SshArgs) -> Result<PreparedSshConnection> {
     let Some(remote) = args.ssh_server.as_deref() else {
         bail!("missing SSH remote; use -r user@host");
     };
+    if args.insecure_accept_host_key && args.accept_new_host_key {
+        bail!("--accept-new-host-key cannot be combined with --insecure-accept-host-key");
+    }
     let target = parse_ssh_target(remote, args.ssh_user.as_deref())?;
     let password = match &args.password {
         Some(Some(value)) => Some(value.clone()),
@@ -6827,6 +6838,7 @@ fn prepare_ssh_connection(args: &SshArgs) -> Result<PreparedSshConnection> {
         password,
         known_hosts: args.known_hosts.clone(),
         insecure_accept_host_key: args.insecure_accept_host_key,
+        accept_new_host_key: args.accept_new_host_key,
         connect_timeout: ssh_connect_timeout(args.ssh_connect_timeout_secs)?,
     })
 }
@@ -6838,6 +6850,7 @@ async fn connect_prepared_ssh(prepared: &PreparedSshConnection) -> Result<Handle
         target.port,
         prepared.known_hosts.clone(),
         prepared.insecure_accept_host_key,
+        prepared.accept_new_host_key,
     );
     let config = Arc::new(Config {
         inactivity_timeout: Some(Duration::from_secs(30)),
@@ -7083,15 +7096,23 @@ struct HostKeyVerifier {
     port: u16,
     known_hosts: Option<PathBuf>,
     insecure_accept: bool,
+    accept_new: bool,
 }
 
 impl HostKeyVerifier {
-    fn new(host: String, port: u16, known_hosts: Option<PathBuf>, insecure_accept: bool) -> Self {
+    fn new(
+        host: String,
+        port: u16,
+        known_hosts: Option<PathBuf>,
+        insecure_accept: bool,
+        accept_new: bool,
+    ) -> Self {
         Self {
             host,
             port,
             known_hosts,
             insecure_accept,
+            accept_new,
         }
     }
 
@@ -7106,8 +7127,16 @@ impl HostKeyVerifier {
         }
 
         let path = self.known_hosts_path()?;
-        let input = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read known_hosts file {}", path.display()))?;
+        let input = match std::fs::read_to_string(&path) {
+            Ok(input) => input,
+            Err(err) if self.accept_new && err.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read known_hosts file {}", path.display()))
+            }
+        };
         let candidates = self.host_match_candidates();
         let mut host_matched = false;
         let mut key_mismatch = false;
@@ -7155,11 +7184,38 @@ impl HostKeyVerifier {
             );
         }
 
+        if self.accept_new {
+            self.append_known_host(&path, server_public_key)?;
+            eprintln!(
+                "ssh: recorded new host key for {} in {} ({})",
+                self.known_hosts_hostport(),
+                path.display(),
+                fingerprint
+            );
+            return Ok(true);
+        }
+
         bail!(
-            "SSH host {} is not in {}; add it with ssh-keyscan or use --insecure-accept-host-key for a controlled lab",
+            "SSH host {} is not in {}; verify the fingerprint {}, then add it with ssh-keyscan, use --accept-new-host-key to trust and record this first key, or use --insecure-accept-host-key only for a controlled lab",
             self.known_hosts_hostport(),
-            path.display()
+            path.display(),
+            fingerprint
         )
+    }
+
+    fn append_known_host(&self, path: &Path, server_public_key: &PublicKey) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                create_known_hosts_parent_dir(parent)?;
+            }
+        }
+
+        let key = server_public_key
+            .to_openssh()
+            .context("failed to encode SSH server public key")?;
+        let entry = format!("{} {}\n", self.known_hosts_hostport(), key);
+        append_known_hosts_entry(path, &entry)
+            .with_context(|| format!("failed to append host key to {}", path.display()))
     }
 
     fn known_hosts_path(&self) -> Result<PathBuf> {
@@ -7201,6 +7257,80 @@ fn default_known_hosts_path() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
         .map(|home| home.join(".ssh").join("known_hosts"))
+}
+
+fn create_known_hosts_parent_dir(path: &Path) -> Result<()> {
+    let existed = path.exists();
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("failed to create known_hosts directory {}", path.display()))?;
+    if existed {
+        Ok(())
+    } else {
+        set_known_hosts_parent_permissions(path)
+    }
+}
+
+#[cfg(unix)]
+fn set_known_hosts_parent_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_known_hosts_parent_permissions(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn append_known_hosts_entry(path: &Path, entry: &str) -> Result<()> {
+    let needs_separator = known_hosts_needs_leading_newline(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    if needs_separator {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(entry.as_bytes())?;
+    file.sync_all()?;
+    set_known_hosts_file_permissions(path)
+}
+
+fn known_hosts_needs_leading_newline(path: &Path) -> Result<bool> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    use std::io::{Read, Seek};
+    file.seek(std::io::SeekFrom::End(-1))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)?;
+    Ok(byte[0] != b'\n')
+}
+
+#[cfg(unix)]
+fn set_known_hosts_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_known_hosts_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn known_hosts_entry_matches(patterns: &HostPatterns, candidates: &[String]) -> bool {
@@ -8951,6 +9081,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_cli_accepts_accept_new_host_key_flag() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--accept-new-host-key",
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with accept-new host key flag");
+
+        assert!(cli.compact.ssh.accept_new_host_key);
+        assert!(!cli.compact.ssh.insecure_accept_host_key);
+    }
+
+    #[test]
+    fn compact_cli_rejects_conflicting_host_key_modes() {
+        let err = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--accept-new-host-key",
+            "--insecure-accept-host-key",
+            "10.0.0.0/8",
+        ])
+        .expect_err("host key modes must conflict");
+
+        assert!(err.to_string().contains("insecure-accept-host-key"));
+    }
+
+    #[test]
     fn compact_cli_accepts_hidden_ssh_sessions_override() {
         let cli = Cli::try_parse_from([
             "rustle",
@@ -9513,8 +9673,13 @@ mod tests {
     #[test]
     fn host_key_verifier_accepts_matching_known_hosts_entry() {
         let path = write_temp_known_hosts(&format!("test.example.com {TEST_ED25519_KEY}\n"));
-        let verifier =
-            HostKeyVerifier::new("test.example.com".to_owned(), 22, Some(path.clone()), false);
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
         let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
 
         assert!(verifier.verify(&key).unwrap());
@@ -9524,8 +9689,13 @@ mod tests {
     #[test]
     fn host_key_verifier_rejects_mismatched_known_hosts_entry() {
         let path = write_temp_known_hosts(&format!("test.example.com {TEST_ED25519_KEY}\n"));
-        let verifier =
-            HostKeyVerifier::new("test.example.com".to_owned(), 22, Some(path.clone()), false);
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
         let key = OTHER_ED25519_KEY.parse::<PublicKey>().unwrap();
 
         let err = verifier.verify(&key).expect_err("mismatch must fail");
@@ -9541,6 +9711,7 @@ mod tests {
             2222,
             Some(path.clone()),
             false,
+            false,
         );
         let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
 
@@ -9552,12 +9723,145 @@ mod tests {
     fn host_key_verifier_rejects_revoked_key() {
         let path =
             write_temp_known_hosts(&format!("@revoked test.example.com {TEST_ED25519_KEY}\n"));
-        let verifier =
-            HostKeyVerifier::new("test.example.com".to_owned(), 22, Some(path.clone()), false);
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
         let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
 
         let err = verifier.verify(&key).expect_err("revoked key must fail");
         assert!(err.to_string().contains("revoked"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn host_key_verifier_accept_new_records_missing_host_key() {
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let root = env::temp_dir().join(format!(
+            "rustle-known-hosts-accept-new-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        let temp = TempTree { path: root };
+        let path = temp.path.join(".ssh").join("known_hosts");
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            true,
+        );
+        let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        assert!(verifier.verify(&key).unwrap());
+        let recorded = std::fs::read_to_string(&path).expect("known_hosts was created");
+        assert_eq!(recorded, format!("test.example.com {TEST_ED25519_KEY}\n"));
+
+        let strict = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
+        assert!(strict.verify(&key).unwrap());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .expect("known_hosts parent metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("known_hosts metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn host_key_verifier_accept_new_preserves_existing_line_without_newline() {
+        let path = write_temp_known_hosts(&format!("other.example.com {OTHER_ED25519_KEY}"));
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            true,
+        );
+        let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        assert!(verifier.verify(&key).unwrap());
+        let recorded = std::fs::read_to_string(&path).expect("known_hosts was updated");
+        assert_eq!(
+            recorded,
+            format!("other.example.com {OTHER_ED25519_KEY}\ntest.example.com {TEST_ED25519_KEY}\n")
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn host_key_verifier_accept_new_rejects_changed_known_host() {
+        let path = write_temp_known_hosts(&format!("test.example.com {TEST_ED25519_KEY}\n"));
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            true,
+        );
+        let key = OTHER_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        let err = verifier
+            .verify(&key)
+            .expect_err("accept-new must reject changed keys");
+        assert!(err.to_string().contains("mismatch"));
+        let recorded = std::fs::read_to_string(&path).expect("known_hosts still readable");
+        assert!(!recorded.contains(OTHER_ED25519_KEY));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn host_key_verifier_unknown_host_error_mentions_accept_new() {
+        let path = write_temp_known_hosts("");
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
+        let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        let err = verifier
+            .verify(&key)
+            .expect_err("unknown host must fail in strict mode");
+        let message = err.to_string();
+        assert!(message.contains("--accept-new-host-key"));
+        assert!(message.contains("--insecure-accept-host-key"));
+        assert!(message.contains("SHA256:"));
         std::fs::remove_file(path).ok();
     }
 

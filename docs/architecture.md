@@ -304,8 +304,11 @@ failure, timeout, or route/device shutdown.
   before adding the TUN routes.
 - SSH server identity must be explicit. Rustle verifies host keys against an
   OpenSSH known_hosts file by default, supports hashed host entries and revoked
-  keys, and requires a deliberate `--insecure-accept-host-key` flag for lab-only
-  bypasses.
+  keys, supports `--accept-new-host-key` for OpenSSH-style trust-on-first-use
+  recording of unknown hosts, and requires a deliberate
+  `--insecure-accept-host-key` flag for lab-only bypasses. Accept-new mode
+  appends only missing host entries; changed or revoked known keys remain hard
+  failures.
 - SSH control connection attempts are bounded by a connection timeout. A dead
   or unroutable SSH host must fail with an explicit SSH-connect diagnostic
   before target routes are installed.
@@ -538,7 +541,8 @@ Current runtime progress:
   routing without changing the compact production CLI.
 - SSH connection setup verifies host keys through known_hosts by default. The
   verifier covers plain entries, non-default port entries, hashed hostnames,
-  wildcard/negated patterns, and revoked-key rejection.
+  wildcard/negated patterns, revoked-key rejection, and accept-new host-key
+  onboarding that records unknown hosts without accepting changed keys.
 
 ## Design Preference
 
