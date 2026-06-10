@@ -98,6 +98,7 @@ verify_run smoke_wait_for_uploaded_agent_cleanup
 if [[ "$RUN_ROOTLESS" == "1" ]]; then
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-bridge-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-lab.sh"
+  verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-sidecars.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-udp-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-bridge-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-reconnect-lab.sh"

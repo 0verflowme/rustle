@@ -20,6 +20,8 @@ LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
+AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
+AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 
 
 def rust_source_text() -> str:
@@ -202,6 +204,7 @@ REQUIRED_CI_SNIPPETS = [
     "scripts/smoke-windows-tun.ps1",
     "bash scripts/smoke-bridge-lab.sh",
     "bash scripts/smoke-agent-lab.sh",
+    "bash scripts/smoke-agent-sidecars.sh",
     "bash scripts/smoke-agent-udp-lab.sh",
     "bash scripts/smoke-agent-bridge-lab.sh",
     "bash scripts/smoke-agent-reconnect-lab.sh",
@@ -218,6 +221,11 @@ REQUIRED_CI_SNIPPETS = [
 REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "automatic remote-agent bootstrap",
     "rustle-x86_64-unknown-linux-musl/rustle",
+    "scripts/prepare-agent-sidecars.sh",
+    "scripts/smoke-agent-sidecars.sh",
+    "RUSTLE_AGENT_RELEASE_TAG",
+    "RUSTLE_AGENT_ARCHIVE_DIR",
+    "rustle-agent-linux-x86_64",
     "RUSTLE_AGENT_DIR",
     "cross-platform sidecar candidate selection",
     "CI operating-system matrix",
@@ -248,6 +256,28 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "content-addressed path under the user",
     "DLL SHA-256",
     "identical already-materialized DLLs are reused",
+]
+
+REQUIRED_AGENT_SIDECAR_SNIPPETS = [
+    "RUSTLE_AGENT_RELEASE_TAG",
+    "RUSTLE_AGENT_RELEASE_REPO",
+    "RUSTLE_AGENT_ARCHIVE_DIR",
+    "RUSTLE_AGENT_TARGETS",
+    "RUSTLE_AGENT_REQUIRE_ALL",
+    "RUSTLE_AGENT_SKIP_CHECKSUMS",
+    "SHA256SUMS",
+    "create_alias_if_missing",
+    "rustle-agent-${platform}",
+    "x86_64-unknown-linux-musl",
+    "aarch64-pc-windows-msvc",
+]
+
+REQUIRED_AGENT_SIDECAR_SMOKE_SNIPPETS = [
+    "RUSTLE_AGENT_FORCE=1",
+    "grep -q 'musl-sidecar'",
+    "rustle-agent-linux-x86_64",
+    "rustle-agent-windows-aarch64.exe",
+    "SHA256SUMS",
 ]
 
 REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
@@ -403,6 +433,8 @@ def main() -> None:
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
+    agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
+    agent_sidecar_smoke = AGENT_SIDECAR_SMOKE.read_text(encoding="utf-8")
 
     matrix = parse_matrix(workflow)
     if matrix != EXPECTED:
@@ -505,6 +537,28 @@ def main() -> None:
     ]
     if missing_smoke_lib:
         fail(f"scripts/smoke-lib.sh is missing required snippets: {missing_smoke_lib!r}")
+
+    missing_agent_sidecars = [
+        snippet
+        for snippet in REQUIRED_AGENT_SIDECAR_SNIPPETS
+        if snippet not in agent_sidecars
+    ]
+    if missing_agent_sidecars:
+        fail(
+            "scripts/prepare-agent-sidecars.sh is missing required snippets: "
+            f"{missing_agent_sidecars!r}"
+        )
+
+    missing_agent_sidecar_smoke = [
+        snippet
+        for snippet in REQUIRED_AGENT_SIDECAR_SMOKE_SNIPPETS
+        if snippet not in agent_sidecar_smoke
+    ]
+    if missing_agent_sidecar_smoke:
+        fail(
+            "scripts/smoke-agent-sidecars.sh is missing required snippets: "
+            f"{missing_agent_sidecar_smoke!r}"
+        )
 
     missing_performance_notes = [
         snippet

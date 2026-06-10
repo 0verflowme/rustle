@@ -29,6 +29,21 @@ if the remote probe reports Linux x64 and `rustle agent` is not already
 installed remotely, Rustle uploads that sidecar instead of falling back to
 `direct-tcpip`.
 
+To prepare a local sidecar store from published artifacts:
+
+```sh
+RUSTLE_AGENT_RELEASE_TAG=vX.Y.Z \
+RUSTLE_AGENT_DIR="$HOME/.cache/rustle/agents" \
+scripts/prepare-agent-sidecars.sh
+```
+
+The same helper can prepare sidecars from a local release directory with
+`RUSTLE_AGENT_ARCHIVE_DIR=dist`. It verifies `SHA256SUMS` when present, prepares
+all eight release targets by default, accepts a smaller `RUSTLE_AGENT_TARGETS`
+set for diagnostics, and creates both exact-triple aliases and short platform
+aliases such as `rustle-agent-linux-x86_64`. Linux platform aliases preserve the
+static musl sidecar preference when both musl and GNU archives are available.
+
 ## Platform Contract
 
 Rustle's core tunnel model is the same on every supported OS:
@@ -102,6 +117,9 @@ Required before tagging a release:
   generation, including PowerShell platform parsing, upload command selection,
   cross-platform sidecar candidate selection, Windows cleanup command shape, and
   the POSIX multi-lane staged-helper cleanup execution proof.
+- `scripts/smoke-agent-sidecars.sh` passes, proving release archives can be
+  verified, extracted into `RUSTLE_AGENT_DIR`, and exposed through the same
+  exact-triple and short platform aliases used by automatic agent bootstrap.
 - `agent_initial_startup_keeps_successful_extra_lanes_after_extra_failure`
   passes, proving a transient extra-lane startup failure does not discard other
   successful lanes from the initial framed-agent pool.

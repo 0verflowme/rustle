@@ -50,6 +50,19 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Rootless agent sidecar preparation smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-sidecars.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent sidecar smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
       - name: Windows smoke script syntax
         if: runner.os == 'Windows'
         shell: pwsh
