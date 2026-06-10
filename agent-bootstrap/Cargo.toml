@@ -1,0 +1,9 @@
+[package]
+name = "rustle-agent-bootstrap"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+bytes = "1.10"
+tokio = { version = "1.45", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

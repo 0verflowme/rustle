@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/smoke-lib.sh"
+
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-agent-reconnect-smoke.XXXXXX")"
+
+cleanup() {
+  smoke_stop_pid "${SMOKE_HTTP_PID:-}"
+  smoke_stop_pid "${SMOKE_SSHD_PID:-}"
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
+HELPER="${TMPDIR}/flaky-agent.sh"
+MARKER="${TMPDIR}/flaky-agent.used"
+BRIDGE_CONNECTIONS="${RUSTLE_SMOKE_AGENT_RECONNECT_CONNECTIONS:-2}"
+export RUSTLE_SMOKE_HTTP_BODY_BYTES="${RUSTLE_SMOKE_HTTP_BODY_BYTES:-65536}"
+
+cat >"$HELPER" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+marker="$1"
+rustle_bin="$2"
+mtu="${3:-1300}"
+
+if [[ ! -f "$marker" ]]; then
+  : >"$marker"
+  python3 - "$mtu" <<'PY'
+import struct
+import sys
+
+mtu = int(sys.argv[1])
+sys.stdin.buffer.read(40)
+payload = struct.pack(">HHIQ", 1, mtu, 65536, 15)
+header = (
+    b"RLA1"
+    + bytes([1, 0])
+    + struct.pack(">H", 0)
+    + struct.pack(">Q", 0)
+    + struct.pack(">I", 0)
+    + struct.pack(">I", len(payload))
+)
+sys.stdout.buffer.write(header + payload)
+sys.stdout.buffer.flush()
+PY
+  exit 0
+fi
+
+exec "$rustle_bin" agent
+SH
+chmod +x "$HELPER"
+
+quote_arg() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+AGENT_COMMAND="$(quote_arg "$HELPER") $(quote_arg "$MARKER") $(quote_arg "$RUSTLE_BIN_RESOLVED") 1300"
+
+smoke_start_sshd "$TMPDIR"
+smoke_start_http_server "$TMPDIR"
+
+REQUEST=$'GET / HTTP/1.1\r\nHost: rustle-agent-reconnect-smoke\r\nConnection: close\r\n\r\n'
+OUT="${TMPDIR}/agent-reconnect.out"
+ERR="${TMPDIR}/agent-reconnect.err"
+
+smoke_info "running agent reconnect bridge-lab through local sshd on port ${SMOKE_SSHD_PORT}"
+set +e
+"$RUSTLE_BIN_RESOLVED" \
+  bridge-lab \
+  -r "${SMOKE_SSH_USER}@127.0.0.1:${SMOKE_SSHD_PORT}" \
+  -i "$SMOKE_CLIENT_KEY" \
+  --known-hosts "$SMOKE_KNOWN_HOSTS" \
+  --destination "127.0.0.1:${SMOKE_HTTP_PORT}" \
+  --request "$REQUEST" \
+  --connections "$BRIDGE_CONNECTIONS" \
+  --bridge-transport agent \
+  --agent-sessions 1 \
+  --agent-command "$AGENT_COMMAND" \
+  >"$OUT" 2>"$ERR"
+status=$?
+set -e
+
+if [[ "$status" -ne 0 ]]; then
+  sed 's/^/rustle stderr: /' "$ERR" >&2 || true
+  sed 's/^/rustle stdout: /' "$OUT" >&2 || true
+  smoke_die "agent reconnect bridge-lab exited with status ${status}"
+fi
+
+if ! grep -q 'agent: reconnecting after transport failure' "$ERR"; then
+  sed 's/^/rustle stderr: /' "$ERR" >&2 || true
+  sed 's/^/rustle stdout: /' "$OUT" >&2 || true
+  smoke_die "agent reconnect smoke did not observe a reconnect"
+fi
+
+received_markers="$( (grep -ao 'rustle-smoke-ok' "$OUT" || true) | wc -l | tr -d '[:space:]')"
+if [[ "$received_markers" != "$BRIDGE_CONNECTIONS" ]]; then
+  sed 's/^/rustle stderr: /' "$ERR" >&2 || true
+  sed 's/^/rustle stdout: /' "$OUT" >&2 || true
+  smoke_die "agent reconnect smoke received ${received_markers} expected markers, wanted ${BRIDGE_CONNECTIONS}"
+fi
+
+smoke_info "agent reconnect bridge-lab smoke passed with ${BRIDGE_CONNECTIONS} connections"

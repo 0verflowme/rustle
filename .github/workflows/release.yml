@@ -1,0 +1,258 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  matrix-check:
+    name: Release matrix
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify release matrix
+        run: python3 scripts/verify-release-matrix.py
+
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: matrix-check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            package: rustle-x86_64-unknown-linux-gnu
+            archive: rustle-x86_64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            package: rustle-x86_64-unknown-linux-musl
+            archive: rustle-x86_64-unknown-linux-musl.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: rustle-aarch64-unknown-linux-gnu
+            archive: rustle-aarch64-unknown-linux-gnu.tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            package: rustle-aarch64-unknown-linux-musl
+            archive: rustle-aarch64-unknown-linux-musl.tar.gz
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            package: rustle-x86_64-apple-darwin
+            archive: rustle-x86_64-apple-darwin.tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            package: rustle-aarch64-apple-darwin
+            archive: rustle-aarch64-apple-darwin.tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: rustle-x86_64-pc-windows-msvc
+            archive: rustle-x86_64-pc-windows-msvc.zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package: rustle-aarch64-pc-windows-msvc
+            archive: rustle-aarch64-pc-windows-msvc.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'unknown-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+              ;;
+            aarch64-unknown-linux-musl)
+              echo "CC_aarch64_unknown_linux_musl=musl-gcc" >> "$GITHUB_ENV"
+              echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> "$GITHUB_ENV"
+              ;;
+          esac
+
+      - name: Prepare embedded Wintun
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          WINTUN_X64_DLL_B64: ${{ secrets.RUSTLE_WINDOWS_WINTUN_DLL_B64 }}
+          WINTUN_ARM64_DLL_B64: ${{ secrets.RUSTLE_WINDOWS_ARM64_WINTUN_DLL_B64 }}
+        run: |
+          if ($env:TARGET -eq "aarch64-pc-windows-msvc") {
+            $wintun = $env:WINTUN_ARM64_DLL_B64
+            $secretName = "RUSTLE_WINDOWS_ARM64_WINTUN_DLL_B64"
+          } else {
+            $wintun = $env:WINTUN_X64_DLL_B64
+            $secretName = "RUSTLE_WINDOWS_WINTUN_DLL_B64"
+          }
+          if ([string]::IsNullOrWhiteSpace($wintun)) {
+            throw "$secretName is required for release Windows archives so rustle.exe can self-extract Wintun at runtime."
+          }
+          New-Item -ItemType Directory -Force -Path "build-input" | Out-Null
+          $path = Join-Path (Resolve-Path "build-input") "wintun.dll"
+          [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($wintun))
+          "RUSTLE_EMBED_WINTUN_DLL=$path" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Configured embedded Wintun for $env:TARGET release build."
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.package }}"
+          cp "target/${{ matrix.target }}/release/rustle" "dist/${{ matrix.package }}/"
+          cp README.md "dist/${{ matrix.package }}/"
+          cp docs/architecture.md "dist/${{ matrix.package }}/ARCHITECTURE.md"
+          cp docs/release.md "dist/${{ matrix.package }}/RELEASE.md"
+          tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.package }}"
+
+      - name: Verify Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -tzf "dist/${{ matrix.archive }}" | sort > "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/rustle" "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/README.md" "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/ARCHITECTURE.md" "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/RELEASE.md" "dist/${{ matrix.package }}.contents"
+          rm -rf verify
+          mkdir -p verify
+          tar -xzf "dist/${{ matrix.archive }}" -C verify
+          test -x "verify/${{ matrix.package }}/rustle"
+          test -f "verify/${{ matrix.package }}/README.md"
+          test -f "verify/${{ matrix.package }}/ARCHITECTURE.md"
+          test -f "verify/${{ matrix.package }}/RELEASE.md"
+          "verify/${{ matrix.package }}/rustle" --help >/dev/null
+          if [[ "${{ matrix.target }}" == *"unknown-linux-musl" ]]; then
+            ldd_output="$(ldd "verify/${{ matrix.package }}/rustle" 2>&1 || true)"
+            if ! grep -Eq 'not a dynamic executable|statically linked' <<<"$ldd_output"; then
+              echo "$ldd_output"
+              echo "musl release binary appears dynamically linked"
+              exit 1
+            fi
+          fi
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "dist/${{ matrix.package }}" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rustle.exe" "dist/${{ matrix.package }}/"
+          Copy-Item "README.md" "dist/${{ matrix.package }}/"
+          Copy-Item "docs/architecture.md" "dist/${{ matrix.package }}/ARCHITECTURE.md"
+          Copy-Item "docs/release.md" "dist/${{ matrix.package }}/RELEASE.md"
+          Compress-Archive -Path "dist/${{ matrix.package }}" -DestinationPath "dist/${{ matrix.archive }}"
+
+      - name: Verify Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "verify" | Out-Null
+          Expand-Archive -Path "dist/${{ matrix.archive }}" -DestinationPath "verify"
+          $package = "verify/${{ matrix.package }}"
+          if (!(Test-Path "$package/rustle.exe")) { throw "missing rustle.exe" }
+          if (!(Test-Path "$package/README.md")) { throw "missing README.md" }
+          if (!(Test-Path "$package/ARCHITECTURE.md")) { throw "missing ARCHITECTURE.md" }
+          if (!(Test-Path "$package/RELEASE.md")) { throw "missing RELEASE.md" }
+          $expected = @("ARCHITECTURE.md", "README.md", "RELEASE.md", "rustle.exe")
+          $actual = Get-ChildItem -LiteralPath $package -File | ForEach-Object Name | Sort-Object
+          if (@($actual).Count -ne $expected.Count) {
+            throw "unexpected Windows archive file count: $($actual -join ', ')"
+          }
+          for ($i = 0; $i -lt $expected.Count; $i++) {
+            if ($actual[$i] -ne $expected[$i]) {
+              throw "unexpected Windows archive contents: $($actual -join ', ')"
+            }
+          }
+          if (Get-ChildItem -LiteralPath $package -Recurse -File -Filter "wintun.dll") {
+            throw "Windows release archive must not ship wintun.dll beside rustle.exe; it must be embedded"
+          }
+          & "$package/rustle.exe" --help | Out-Null
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.package }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  checksums:
+    name: Checksums
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_archives=8
+          mapfile -d '' archives < <(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | sort -z)
+          if [[ "${#archives[@]}" -ne "$expected_archives" ]]; then
+            printf 'expected %d release archives, found %d:\n' "$expected_archives" "${#archives[@]}"
+            printf '  %s\n' "${archives[@]}"
+            exit 1
+          fi
+          printf '%s\0' "${archives[@]}" | xargs -0 sha256sum > SHA256SUMS
+          if [[ "$(wc -l < SHA256SUMS | tr -d ' ')" -ne "$expected_archives" ]]; then
+            cat SHA256SUMS
+            echo "checksum manifest does not contain $expected_archives entries"
+            exit 1
+          fi
+          cat SHA256SUMS
+
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustle-checksums
+          path: SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_archives=8
+          mapfile -d '' archives < <(find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 | sort -z)
+          if [[ "${#archives[@]}" -ne "$expected_archives" ]]; then
+            printf 'expected %d release archives, found %d:\n' "$expected_archives" "${#archives[@]}"
+            printf '  %s\n' "${archives[@]}"
+            exit 1
+          fi
+          files=("${archives[@]}" "SHA256SUMS")
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "Rustle release $GITHUB_REF_NAME"
+          fi

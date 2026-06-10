@@ -1,0 +1,210 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-14
+          - windows-latest
+          - windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify release matrix
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/verify-release-matrix.py
+
+      - name: Install Linux smoke dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl openssh-client openssh-server iproute2 python3
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Windows smoke script syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path "scripts/smoke-windows-tun.ps1"), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List *
+            exit 1
+          }
+
+      - name: Rootless bridge smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-bridge-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "bridge smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Rootless agent TCP smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent TCP smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Rootless agent UDP smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-udp-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent UDP smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Rootless agent bridge smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-bridge-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent bridge smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Rootless agent reconnect smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-reconnect-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent reconnect smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Rootless agent active-failure smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-agent-active-failure-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent active-failure smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Linux TUN DNS smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-tun-dns.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "TUN DNS smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Linux TUN DNS smoke over agent
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RUSTLE_SMOKE_BRIDGE_TRANSPORT: agent
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-tun-dns.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent TUN DNS smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Linux netns TCP smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-linux-netns-tcp.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "netns TCP smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Linux netns TCP smoke over agent
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RUSTLE_NETNS_BRIDGE_TRANSPORT: agent
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-linux-netns-tcp.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent netns TCP smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Linux netns UDP smoke over agent
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-linux-netns-udp.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent netns UDP smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"

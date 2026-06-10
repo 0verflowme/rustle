@@ -1,0 +1,34 @@
+[package]
+name = "rustle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+bytes = "1.10"
+clap = { version = "4.5", features = ["derive"] }
+ipnet = "2.10"
+rpassword = "7.3"
+ring = "0.17"
+russh = { version = "0.61.2", default-features = false, features = [
+    "ring",
+    "rsa",
+] }
+ssh-key = { version = "=0.7.0-rc.10", default-features = false, features = [
+    "std",
+    "ed25519",
+    "p256",
+    "p384",
+    "p521",
+    "encryption",
+    "ppk",
+    "sha1",
+] }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+    "std",
+    "medium-ip",
+    "proto-ipv4",
+    "socket-tcp",
+] }
+tokio = { version = "1.45", features = ["full"] }
+tun-rs = { version = "2", features = ["async"] }
