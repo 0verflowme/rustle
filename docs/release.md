@@ -274,6 +274,12 @@ Required before tagging a release:
   `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` must also
   pass so the generated upload wrapper is proven to keep one staged helper alive
   across concurrent initial agent lanes and remove it after the last lane exits.
+- Uploaded-agent integrity checks are covered before release:
+  `uploaded_agent_sha256_command_uses_remote_hash_tools`,
+  `windows_uploaded_agent_sha256_command_uses_get_file_hash`,
+  `uploaded_agent_cleanup_command_quotes_path_and_refs`, and
+  `sha256_file_hex_hashes_local_file` must pass so the upload fallback verifies
+  the staged helper before execution and removes unverified bytes on failure.
 
 Native Windows and Linux TUN verification must still run on real privileged
 hosts before a release is promoted as field-ready for those platforms.

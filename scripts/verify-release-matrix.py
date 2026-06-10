@@ -165,6 +165,16 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "agent_bridge_repairs_lane_after_active_stream_transport_failure",
     "agent_writer_clears_reused_buffers_between_bursts",
     "transport_writer_clears_reused_buffers_between_bursts",
+    "verify_uploaded_agent_binary",
+    "cleanup_uploaded_agent_binary",
+    "uploaded_agent_sha256_command",
+    "uploaded_posix_agent_sha256_command",
+    "uploaded_windows_agent_sha256_command",
+    "sha256_file_hex",
+    "uploaded_agent_sha256_command_uses_remote_hash_tools",
+    "windows_uploaded_agent_sha256_command_uses_get_file_hash",
+    "uploaded_agent_cleanup_command_quotes_path_and_refs",
+    "sha256_file_hex_hashes_local_file",
     "embedded_wintun_path_is_content_and_arch_addressed",
     "sha256_hex(bytes)",
     "ingest_packet_into",
@@ -268,6 +278,9 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "content-addressed path under the user",
     "DLL SHA-256",
     "identical already-materialized DLLs are reused",
+    "Uploaded-agent integrity checks",
+    "uploaded_agent_sha256_command_uses_remote_hash_tools",
+    "sha256_file_hex_hashes_local_file",
 ]
 
 REQUIRED_AGENT_SIDECAR_SNIPPETS = [
@@ -320,6 +333,9 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
     "snapshots resolver settings",
     "resolves through the system resolver",
     "requires exact resolver restoration",
+    "comparing the local SHA-256 digest with a remote hash",
+    "removes the staged helper and refuses to",
+    "PowerShell `Get-FileHash`",
 ]
 
 REQUIRED_LIVE_BENCH_SNIPPETS = [

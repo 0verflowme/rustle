@@ -62,9 +62,12 @@ Rustle keeps three transport choices, but only one is the normal path:
   the local package directory, such as `rustle-x86_64-unknown-linux-musl/rustle`,
   for cross-platform remotes. `RUSTLE_AGENT_DIR` adds a hidden deployment search
   directory for managed sidecar stores. The uploaded helper is staged to a
-  temporary remote path over a separate SSH session channel, used as `agent` for
-  every initial agent lane, and removed after the last lane using the
-  OS-specific staged-helper cleanup wrapper. After the first effective command is
+  temporary remote path over a separate SSH session channel, verified by
+  comparing the local SHA-256 digest with a remote hash of the staged file, used
+  as `agent` for every initial agent lane, and removed after the last lane using
+  the OS-specific staged-helper cleanup wrapper. If the remote hash command
+  fails or the digest differs, Rustle removes the staged helper and refuses to
+  execute it. After the first effective command is
   known, additional startup lanes open in bounded concurrent batches; a failed
   extra lane is logged without discarding other successful lanes from the same
   startup wave. Missing startup lanes get one bounded retry before Rustle accepts
@@ -363,6 +366,11 @@ failure, timeout, or route/device shutdown.
   background. For the compact default auto-lane path, only the primary lane is
   required before the tunnel can start; remaining recommended lanes use the same
   background repair path as missing startup lanes.
+  Uploaded helpers are hashed before execution: POSIX remotes use
+  `sha256sum`, `shasum -a 256`, or `openssl dgst -sha256 -r`; Windows remotes
+  use PowerShell `Get-FileHash`. Verification failure triggers best-effort
+  removal of the staged helper and its refs directory instead of executing
+  unverified bytes.
   POSIX remotes use a shell upload/execution wrapper, while Windows remotes use
   PowerShell for platform probing, binary upload, execution, and cleanup.
   `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` executes
