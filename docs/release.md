@@ -237,6 +237,12 @@ Required before tagging a release:
   framed agent path. Linux CI attempts this smoke when `/dev/net/tun` is
   available; a CI skip due to runner TUN limitations is not release evidence by
   itself.
+- `RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent
+  scripts/smoke-tun-dns.sh` passes on at least one privileged macOS or Linux
+  host, proving resolver takeover points the OS at the Rustle virtual DNS
+  endpoint while the tunnel is active, a normal system resolver lookup succeeds
+  through that path, and the original resolver settings are restored on
+  shutdown.
 - `scripts/smoke-linux-netns-tcp.sh` passes on a privileged Linux host with
   network namespace support. This is the self-contained full-path TCP proof:
   full-tunnel split routes plus SSH control-route protection -> TUN -> smoltcp

@@ -37,6 +37,68 @@ TUN_IP="${RUSTLE_SMOKE_TUN_IP:-10.255.255.1}"
 TUN_PREFIX="${RUSTLE_SMOKE_TUN_PREFIX:-24}"
 VIRTUAL_DNS_IP="${RUSTLE_SMOKE_VIRTUAL_DNS_IP:-10.255.255.53}"
 CONFIGURE_DNS="${RUSTLE_SMOKE_CONFIGURE_DNS:-0}"
+DNS_BEFORE=""
+
+case "$CONFIGURE_DNS" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_SMOKE_CONFIGURE_DNS must be 0 or 1" ;;
+esac
+
+if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  case "$(uname -s)" in
+    Darwin) smoke_require networksetup ;;
+    Linux) smoke_require resolvectl ;;
+  esac
+fi
+
+dns_snapshot() {
+  case "$(uname -s)" in
+    Darwin)
+      local services service
+      services="$(networksetup -listallnetworkservices | awk '
+        NF && $0 !~ /^An asterisk/ && $0 !~ /^\*/ { print }
+      ')"
+      while IFS= read -r service; do
+        [[ -n "$service" ]] || continue
+        printf 'service:%s\n' "$service"
+        networksetup -getdnsservers "$service" 2>&1 | sed 's/^/  /'
+      done <<<"$services"
+      ;;
+    Linux)
+      SYSTEMD_PAGER=cat resolvectl status 2>&1 || true
+      ;;
+  esac
+}
+
+dns_settings_use_virtual_resolver() {
+  local if_name="$1"
+  case "$(uname -s)" in
+    Darwin)
+      local services service servers
+      services="$(networksetup -listallnetworkservices | awk '
+        NF && $0 !~ /^An asterisk/ && $0 !~ /^\*/ { print }
+      ')"
+      while IFS= read -r service; do
+        [[ -n "$service" ]] || continue
+        servers="$(networksetup -getdnsservers "$service" 2>&1 | sed '/^$/d')"
+        if [[ "$servers" != "$VIRTUAL_DNS_IP" ]]; then
+          printf 'service %s DNS servers are not %s:\n%s\n' \
+            "$service" "$VIRTUAL_DNS_IP" "$servers" >&2
+          return 1
+        fi
+      done <<<"$services"
+      ;;
+    Linux)
+      local status
+      status="$(SYSTEMD_PAGER=cat resolvectl status "$if_name" 2>&1 || true)"
+      if ! grep -Fq "$VIRTUAL_DNS_IP" <<<"$status" || ! grep -Fq '~.' <<<"$status"; then
+        printf 'resolvectl status for %s did not contain %s and route-only domain ~.:\n%s\n' \
+          "$if_name" "$VIRTUAL_DNS_IP" "$status" >&2
+        return 1
+      fi
+      ;;
+  esac
+}
 
 delete_target_route_best_effort() {
   case "$(uname -s)" in
@@ -101,6 +163,10 @@ RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
 smoke_start_sshd "$TMPDIR"
 smoke_start_dns_tcp_server "$TMPDIR"
 
+if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  DNS_BEFORE="$(dns_snapshot)"
+fi
+
 RUSTLE_LOG="${TMPDIR}/rustle-tun.log"
 CMD=(
   "$RUSTLE_BIN_RESOLVED"
@@ -139,10 +205,27 @@ if ! smoke_wait_for_log 'tun: created' "$RUSTLE_LOG" 10; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
   smoke_die "Rustle did not create a TUN device"
 fi
+TUN_IF_NAME="$(sed -n 's/^tun: created \([^ ]*\) .*/\1/p' "$RUSTLE_LOG" | tail -n 1)"
+if [[ -z "$TUN_IF_NAME" ]]; then
+  sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
+  smoke_die "could not determine Rustle TUN interface name"
+fi
 
 if ! smoke_wait_for_log "route: added ${TARGET_CIDR}" "$RUSTLE_LOG" 10; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
   smoke_die "Rustle did not add the target route"
+fi
+
+if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  if ! smoke_wait_for_log "dns: configured host resolver to use virtual DNS ${VIRTUAL_DNS_IP}" \
+    "$RUSTLE_LOG" 10; then
+    sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
+    smoke_die "Rustle did not report DNS resolver takeover"
+  fi
+  if ! dns_settings_use_virtual_resolver "$TUN_IF_NAME"; then
+    sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
+    smoke_die "system DNS settings did not point at Rustle virtual resolver"
+  fi
 fi
 
 smoke_info "sending UDP DNS query to ${VIRTUAL_DNS_IP}:53"
@@ -180,7 +263,29 @@ if bytes([203, 0, 113, 7]) not in response:
 print("dns smoke response ok")
 PY
 
+if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  smoke_info "resolving through the system resolver after DNS takeover"
+  "$(smoke_python)" - <<'PY'
+import socket
+
+expected = "203.0.113.7"
+resolved = socket.gethostbyname("rustle-smoke.invalid")
+if resolved != expected:
+    raise SystemExit(f"system resolver returned {resolved}, expected {expected}")
+print("system resolver DNS smoke response ok")
+PY
+fi
+
 stop_rustle
+
+if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  DNS_AFTER="$(dns_snapshot)"
+  if [[ "$DNS_AFTER" != "$DNS_BEFORE" ]]; then
+    printf 'DNS snapshot before Rustle:\n%s\n' "$DNS_BEFORE" >&2
+    printf 'DNS snapshot after Rustle:\n%s\n' "$DNS_AFTER" >&2
+    smoke_die "system DNS settings did not return to their original state"
+  fi
+fi
 
 FINAL_STATS="$(grep 'stats: final' "$RUSTLE_LOG" | tail -n 1 || true)"
 if [[ -z "$FINAL_STATS" ]]; then

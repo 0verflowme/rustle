@@ -554,6 +554,12 @@ Before a release build is considered shippable:
 - The privileged TUN DNS smoke must pass for both direct/auto transport and
   `RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent`, proving DNS interception through the
   framed agent path as well as compatibility mode.
+- The same TUN DNS smoke must also pass with `RUSTLE_SMOKE_CONFIGURE_DNS=1` on
+  at least one macOS or Linux host before DNS takeover is treated as release
+  evidence; that mode snapshots resolver settings, verifies the virtual
+  resolver is active while Rustle runs, resolves through the system resolver
+  instead of only a direct UDP probe, and requires exact resolver restoration
+  after shutdown.
 - A native elevated Windows TUN smoke must prove Wintun discovery, TUN creation,
   route add/delete, packet capture, and route-table restoration.
   `scripts/smoke-windows-tun.ps1` is the Windows operator proof.

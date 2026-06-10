@@ -20,6 +20,7 @@ LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
+TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
 AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
 AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 
@@ -260,6 +261,10 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "bridge_event_handler_into_reuses_closed_flow_scratch_vector",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
+    "RUSTLE_SMOKE_CONFIGURE_DNS=1",
+    "resolver takeover points the OS at the Rustle virtual DNS",
+    "normal system resolver lookup succeeds",
+    "original resolver settings are restored",
     "content-addressed path under the user",
     "DLL SHA-256",
     "identical already-materialized DLLs are reused",
@@ -311,6 +316,10 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
     "backlog, expiry, and cleanup scans",
     "Bridge event handling writes closed-flow results into caller-owned scratch",
     "Agent mode keeps default IPv4 DNS as UDP datagrams over `OpenUdp`",
+    "RUSTLE_SMOKE_CONFIGURE_DNS=1",
+    "snapshots resolver settings",
+    "resolves through the system resolver",
+    "requires exact resolver restoration",
 ]
 
 REQUIRED_LIVE_BENCH_SNIPPETS = [
@@ -340,6 +349,19 @@ REQUIRED_SMOKE_LIB_SNIPPETS = [
     "route: added 128.0.0.0/1",
 ]
 
+REQUIRED_TUN_DNS_SMOKE_SNIPPETS = [
+    "RUSTLE_SMOKE_CONFIGURE_DNS",
+    "dns_snapshot",
+    "dns_settings_use_virtual_resolver",
+    "dns: configured host resolver to use virtual DNS",
+    "system DNS settings did not point at Rustle virtual resolver",
+    "system DNS settings did not return to their original state",
+    "socket.gethostbyname",
+    "system resolver DNS smoke response ok",
+    "resolvectl status",
+    "networksetup -getdnsservers",
+]
+
 REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
     "hard gate",
@@ -349,6 +371,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "1 MiB / 10 MiB / 100 MiB",
     "split default routes",
     "intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`",
+    "RUSTLE_SMOKE_CONFIGURE_DNS=1",
+    "DNS resolver takeover, normal system resolver delivery through Rustle",
     "compact command already defaults to the framed agent transport",
     "compact auto-lane path starts after the primary agent lane",
     "explicit `--agent-sessions`",
@@ -447,6 +471,7 @@ def main() -> None:
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
+    tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
     agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
     agent_sidecar_smoke = AGENT_SIDECAR_SMOKE.read_text(encoding="utf-8")
 
@@ -551,6 +576,17 @@ def main() -> None:
     ]
     if missing_smoke_lib:
         fail(f"scripts/smoke-lib.sh is missing required snippets: {missing_smoke_lib!r}")
+
+    missing_tun_dns_smoke = [
+        snippet
+        for snippet in REQUIRED_TUN_DNS_SMOKE_SNIPPETS
+        if snippet not in tun_dns_smoke
+    ]
+    if missing_tun_dns_smoke:
+        fail(
+            "scripts/smoke-tun-dns.sh is missing required snippets: "
+            f"{missing_tun_dns_smoke!r}"
+        )
 
     missing_agent_sidecars = [
         snippet

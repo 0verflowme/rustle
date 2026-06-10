@@ -307,6 +307,10 @@ mode on the same machines:
   privileged Linux host before generic UDP is treated as field-ready
 - intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`; only
   direct-tcpip compatibility and hostname DNS remotes use DNS-over-TCP
+- `RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent
+  scripts/smoke-tun-dns.sh` passes on a privileged macOS or Linux host, proving
+  DNS resolver takeover, normal system resolver delivery through Rustle, and
+  exact resolver restoration
 - Linux network-namespace TCP smoke passes with
   `RUSTLE_NETNS_BRIDGE_TRANSPORT=agent`
 - live tunnel benchmark rows exist for `direct-tcpip`, `agent`, and sshuttle on
