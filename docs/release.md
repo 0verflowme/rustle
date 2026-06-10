@@ -101,10 +101,10 @@ scripts/verify-local.sh
 For release-candidate evidence, run it on privileged Linux with
 `RUSTLE_VERIFY_REQUIRE_PRIVILEGED=1`, and run it with `RUSTLE_VERIFY_LIVE=1`
 after setting the documented live smoke and benchmark environment variables.
-The live verifier runs `smoke-live-tunnel.sh` for both `direct-tcpip` and
-`agent` by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when intentionally
-narrowing that matrix for diagnostics. Skips are useful diagnostics, but they
-are not release evidence for the skipped platform or path.
+The live verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
+`direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
+intentionally narrowing that matrix for diagnostics. Skips are useful
+diagnostics, but they are not release evidence for the skipped platform or path.
 
 Required before tagging a release:
 

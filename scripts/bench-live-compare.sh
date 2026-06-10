@@ -79,7 +79,7 @@ if [[ -z "$RUSTLE_TRANSPORTS" ]]; then
   RUSTLE_TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORT:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-}}"
 fi
 if [[ -z "$RUSTLE_TRANSPORTS" ]]; then
-  RUSTLE_TRANSPORTS="direct-tcpip agent"
+  RUSTLE_TRANSPORTS="agent direct-tcpip"
 fi
 for transport in $RUSTLE_TRANSPORTS; do
   case "$transport" in

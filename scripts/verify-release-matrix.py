@@ -19,6 +19,8 @@ PERFORMANCE_NOTES = REPO / "docs" / "performance.md"
 LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
+BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
+VERIFY_LOCAL = REPO / "scripts" / "verify-local.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
 TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
 AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
@@ -274,6 +276,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "RUSTLE_AGENT_DIR",
     "cross-platform sidecar candidate selection",
     "CI operating-system matrix",
+    "primary `agent` first",
     "SSH host-key UX checks",
     "host_key_verifier_accept_new_records_missing_host_key",
     "host_key_verifier_accept_new_rejects_changed_known_host",
@@ -396,6 +399,7 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
 ]
 
 REQUIRED_LIVE_BENCH_SNIPPETS = [
+    'RUSTLE_TRANSPORTS="agent direct-tcpip"',
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
     "RUSTLE_BENCH_EXPECT_BYTES",
     "smoke_wait_for_rustle_target_route_logs",
@@ -403,6 +407,21 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "sshuttle",
     "agent/sshuttle",
     "--password-file",
+]
+
+REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
+    (
+        BRIDGE_BENCH,
+        'TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORTS:-agent direct-tcpip}"',
+    ),
+    (
+        VERIFY_LOCAL,
+        'LIVE_TRANSPORTS="${RUSTLE_VERIFY_LIVE_TRANSPORTS:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-agent direct-tcpip}}"',
+    ),
+    (
+        VERIFY_LOCAL,
+        'RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip"',
+    ),
 ]
 
 REQUIRED_LIVE_FIXTURE_SNIPPETS = [
@@ -441,6 +460,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
     "hard gate",
     "rustle-agent",
+    "primary `agent` transport",
+    "agent` first and `direct-tcpip` second",
     "same SSH server, target URL, request",
     "bench-live-fixture.sh",
     "1 MiB / 10 MiB / 100 MiB",
@@ -627,6 +648,18 @@ def main() -> None:
             "scripts/bench-live-compare.sh is missing required snippets: "
             f"{missing_live_bench!r}"
         )
+
+    missing_agent_primary_scripts = [
+        (path, snippet)
+        for path, snippet in REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS
+        if snippet not in path.read_text(encoding="utf-8")
+    ]
+    if missing_agent_primary_scripts:
+        details = [
+            f"{path.relative_to(REPO)} missing {snippet!r}"
+            for path, snippet in missing_agent_primary_scripts
+        ]
+        fail("agent-primary script defaults drifted: " + "; ".join(details))
 
     missing_live_fixture = [
         snippet

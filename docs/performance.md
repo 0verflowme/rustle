@@ -26,9 +26,9 @@ scripts/bench-bridge-lab.sh
 ```
 
 The script starts a temporary local `sshd`, starts a local HTTP server, then runs
-`rustle bridge-lab --summary` across a connection matrix. It benchmarks both
-the compatibility `direct-tcpip` bridge and the framed `agent` bridge unless
-narrowed with `RUSTLE_BENCH_BRIDGE_TRANSPORTS`. Output is tab-separated:
+`rustle bridge-lab --summary` across a connection matrix. It benchmarks the
+framed `agent` bridge first and the compatibility `direct-tcpip` bridge second
+unless narrowed with `RUSTLE_BENCH_BRIDGE_TRANSPORTS`. Output is tab-separated:
 
 ```text
 transport  body_bytes  connections  run  elapsed_ms  response_bytes  throughput_mib_s
@@ -39,7 +39,7 @@ Tune the matrix with environment variables:
 ```sh
 RUSTLE_BENCH_BODY_BYTES="65536 1048576" \
 RUSTLE_BENCH_CONNECTIONS="1 8 32 64" \
-RUSTLE_BENCH_BRIDGE_TRANSPORTS="auto direct-tcpip agent" \
+RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip auto" \
 RUSTLE_BENCH_AGENT_SESSIONS=2 \
 RUSTLE_BENCH_RUNS=5 \
 RUSTLE_BENCH_WARMUP_RUNS=1 \
@@ -157,12 +157,12 @@ Output is tab-separated:
 tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  bytes  throughput_mib_s  req_s  avg_cpu_pct  max_cpu_pct  ssh_opened  ssh_failed  agent_reconnect_attempts  agent_reconnect_ok  agent_reconnect_failed  backlog_overflow
 ```
 
-By default the live harness benchmarks Rustle with both `direct-tcpip` and
-`agent`, producing `rustle-direct-tcpip` and `rustle-agent` rows. To pin the
-transport matrix explicitly, use:
+By default the live harness benchmarks Rustle with the primary `agent` transport
+first, then the `direct-tcpip` compatibility path, producing `rustle-agent` and
+`rustle-direct-tcpip` rows. To pin the transport matrix explicitly, use:
 
 ```sh
-RUSTLE_BENCH_RUSTLE_TRANSPORTS="direct-tcpip agent" \
+RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent direct-tcpip" \
 RUSTLE_BENCH_AGENT_COMMAND="/opt/rustle/rustle agent" \
 RUSTLE_BENCH_AGENT_SESSIONS=2 \
 scripts/bench-live-compare.sh
@@ -276,9 +276,9 @@ scripts/verify-local.sh
 ```
 
 Set `RUSTLE_VERIFY_LIVE=1` to include the live remote smoke and benchmark in
-the same run. Live smoke runs `direct-tcpip` and `agent` by default before the
-benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the smoke matrix when
-debugging one transport.
+the same run. Live smoke runs `agent` first and `direct-tcpip` second by
+default before the benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the
+smoke matrix when debugging one transport.
 
 ## Agent Promotion Criteria
 
