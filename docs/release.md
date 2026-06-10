@@ -268,9 +268,13 @@ Required before tagging a release:
 - `RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent
   scripts/smoke-tun-dns.sh` passes on at least one privileged macOS or Linux
   host, proving resolver takeover points the OS at the Rustle virtual DNS
-  endpoint while the tunnel is active, a normal system resolver lookup succeeds
-  through that path, and the original resolver settings are restored on
-  shutdown.
+  endpoint on Linux or the Rustle loopback DNS proxy on macOS while the tunnel
+  is active, a normal system resolver lookup succeeds through that path, and
+  the original resolver settings are restored on shutdown. Override
+  `RUSTLE_SMOKE_DNS_NAME` only when a lab needs a different delegated-looking
+  test name. On macOS, the smoke treats a VPN or managed profile that keeps the
+  global `scutil --dns` resolver away from Rustle as a release-blocking failure,
+  even if scoped `networksetup` service resolvers were updated.
 - `scripts/smoke-linux-netns-tcp.sh` passes on a privileged Linux host with
   network namespace support. This is the self-contained full-path TCP proof:
   full-tunnel split routes plus SSH control-route protection -> TUN -> smoltcp

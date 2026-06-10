@@ -33,11 +33,17 @@ RUSTLE_CHILD_PID_FILE="${TMPDIR}/rustle.pid"
 
 TARGET_CIDR="${RUSTLE_SMOKE_TARGET_CIDR:-198.51.100.77/32}"
 TARGET_IP="${TARGET_CIDR%/*}"
-TUN_IP="${RUSTLE_SMOKE_TUN_IP:-10.255.255.1}"
+TUN_IP="${RUSTLE_SMOKE_TUN_IP:-198.18.255.1}"
 TUN_PREFIX="${RUSTLE_SMOKE_TUN_PREFIX:-24}"
-VIRTUAL_DNS_IP="${RUSTLE_SMOKE_VIRTUAL_DNS_IP:-10.255.255.53}"
+VIRTUAL_DNS_IP="${RUSTLE_SMOKE_VIRTUAL_DNS_IP:-198.18.255.53}"
+case "$(uname -s)" in
+  Darwin) SYSTEM_DNS_IP="${RUSTLE_SMOKE_SYSTEM_DNS_IP:-127.0.0.1}" ;;
+  *) SYSTEM_DNS_IP="${RUSTLE_SMOKE_SYSTEM_DNS_IP:-$VIRTUAL_DNS_IP}" ;;
+esac
 CONFIGURE_DNS="${RUSTLE_SMOKE_CONFIGURE_DNS:-0}"
+DNS_NAME="${RUSTLE_SMOKE_DNS_NAME:-rustle-smoke.example.com}"
 DNS_BEFORE=""
+VIRTUAL_DNS_ROUTE_ADDED=0
 
 case "$CONFIGURE_DNS" in
   0 | 1) ;;
@@ -70,7 +76,7 @@ dns_snapshot() {
   esac
 }
 
-dns_settings_use_virtual_resolver() {
+dns_settings_use_expected_resolver() {
   local if_name="$1"
   case "$(uname -s)" in
     Darwin)
@@ -81,9 +87,9 @@ dns_settings_use_virtual_resolver() {
       while IFS= read -r service; do
         [[ -n "$service" ]] || continue
         servers="$(networksetup -getdnsservers "$service" 2>&1 | sed '/^$/d')"
-        if [[ "$servers" != "$VIRTUAL_DNS_IP" ]]; then
+        if [[ "$servers" != "$SYSTEM_DNS_IP" ]]; then
           printf 'service %s DNS servers are not %s:\n%s\n' \
-            "$service" "$VIRTUAL_DNS_IP" "$servers" >&2
+            "$service" "$SYSTEM_DNS_IP" "$servers" >&2
           return 1
         fi
       done <<<"$services"
@@ -91,12 +97,51 @@ dns_settings_use_virtual_resolver() {
     Linux)
       local status
       status="$(SYSTEMD_PAGER=cat resolvectl status "$if_name" 2>&1 || true)"
-      if ! grep -Fq "$VIRTUAL_DNS_IP" <<<"$status" || ! grep -Fq '~.' <<<"$status"; then
+      if ! grep -Fq "$SYSTEM_DNS_IP" <<<"$status" || ! grep -Fq '~.' <<<"$status"; then
         printf 'resolvectl status for %s did not contain %s and route-only domain ~.:\n%s\n' \
-          "$if_name" "$VIRTUAL_DNS_IP" "$status" >&2
+          "$if_name" "$SYSTEM_DNS_IP" "$status" >&2
         return 1
       fi
       ;;
+  esac
+}
+
+runtime_dns_uses_expected_resolver() {
+  case "$(uname -s)" in
+    Darwin)
+      local config global_config
+      config="$(scutil --dns 2>&1 || true)"
+      global_config="${config%%DNS configuration (for scoped queries)*}"
+      grep -Fq "nameserver[0] : ${SYSTEM_DNS_IP}" <<<"$global_config"
+      ;;
+    Linux)
+      dns_settings_use_expected_resolver "$1"
+      ;;
+  esac
+}
+
+wait_for_runtime_dns() {
+  local if_name="$1"
+  for ((i = 0; i < 50; i++)); do
+    if runtime_dns_uses_expected_resolver "$if_name"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  case "$(uname -s)" in
+    Darwin) scutil --dns >&2 || true ;;
+    Linux) SYSTEMD_PAGER=cat resolvectl status "$if_name" >&2 || true ;;
+  esac
+  return 1
+}
+
+flush_system_dns_cache_best_effort() {
+  case "$(uname -s)" in
+    Darwin)
+      dscacheutil -flushcache >/dev/null 2>&1 || true
+      "${SUDO_CMD[@]}" killall -HUP mDNSResponder >/dev/null 2>&1 || true
+      ;;
+    Linux) ;;
   esac
 }
 
@@ -109,6 +154,36 @@ delete_target_route_best_effort() {
       "${SUDO_CMD[@]}" ip route del "$TARGET_CIDR" >/dev/null 2>&1 || true
       ;;
   esac
+}
+
+delete_virtual_dns_route_best_effort() {
+  [[ "$VIRTUAL_DNS_ROUTE_ADDED" == "1" ]] || return 0
+  case "$(uname -s)" in
+    Darwin)
+      "${SUDO_CMD[@]}" route -n delete -host "$VIRTUAL_DNS_IP" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      "${SUDO_CMD[@]}" ip route del "${VIRTUAL_DNS_IP}/32" >/dev/null 2>&1 || true
+      ;;
+  esac
+  VIRTUAL_DNS_ROUTE_ADDED=0
+}
+
+add_virtual_dns_route() {
+  local if_name="$1"
+  case "$(uname -s)" in
+    Darwin)
+      if ! "${SUDO_CMD[@]}" route -n add -host "$VIRTUAL_DNS_IP" -interface "$if_name" >/dev/null 2>&1; then
+        "${SUDO_CMD[@]}" route -n change -host "$VIRTUAL_DNS_IP" -interface "$if_name" >/dev/null 2>&1 \
+          || smoke_die "failed to route virtual DNS ${VIRTUAL_DNS_IP} through ${if_name}"
+      fi
+      ;;
+    Linux)
+      "${SUDO_CMD[@]}" ip route replace "${VIRTUAL_DNS_IP}/32" dev "$if_name" \
+        || smoke_die "failed to route virtual DNS ${VIRTUAL_DNS_IP} through ${if_name}"
+      ;;
+  esac
+  VIRTUAL_DNS_ROUTE_ADDED=1
 }
 
 stop_rustle() {
@@ -150,13 +225,19 @@ stop_rustle() {
 }
 
 cleanup() {
+  local status="${1:-0}"
   stop_rustle
+  delete_virtual_dns_route_best_effort
   delete_target_route_best_effort
   smoke_stop_pid "${SMOKE_DNS_PID:-}"
   smoke_stop_pid "${SMOKE_SSHD_PID:-}"
-  rm -rf "$TMPDIR"
+  if [[ "$status" -ne 0 || "${RUSTLE_SMOKE_KEEP_LOGS:-0}" == "1" ]]; then
+    smoke_info "kept TUN DNS smoke logs in ${TMPDIR}"
+  else
+    rm -rf "$TMPDIR"
+  fi
 }
-trap cleanup EXIT
+trap 'cleanup $?' EXIT
 
 RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
 
@@ -210,6 +291,7 @@ if [[ -z "$TUN_IF_NAME" ]]; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
   smoke_die "could not determine Rustle TUN interface name"
 fi
+add_virtual_dns_route "$TUN_IF_NAME"
 
 if ! smoke_wait_for_log "route: added ${TARGET_CIDR}" "$RUSTLE_LOG" 10; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
@@ -217,26 +299,32 @@ if ! smoke_wait_for_log "route: added ${TARGET_CIDR}" "$RUSTLE_LOG" 10; then
 fi
 
 if [[ "$CONFIGURE_DNS" == "1" ]]; then
-  if ! smoke_wait_for_log "dns: configured host resolver to use virtual DNS ${VIRTUAL_DNS_IP}" \
+  if ! smoke_wait_for_log "dns: configured host resolver to use DNS ${SYSTEM_DNS_IP}" \
     "$RUSTLE_LOG" 10; then
     sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
     smoke_die "Rustle did not report DNS resolver takeover"
   fi
-  if ! dns_settings_use_virtual_resolver "$TUN_IF_NAME"; then
+  if ! dns_settings_use_expected_resolver "$TUN_IF_NAME"; then
     sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
-    smoke_die "system DNS settings did not point at Rustle virtual resolver"
+    smoke_die "system DNS settings did not point at the expected Rustle resolver"
+  fi
+  flush_system_dns_cache_best_effort
+  if ! wait_for_runtime_dns "$TUN_IF_NAME"; then
+    sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
+    smoke_die "runtime DNS resolver did not pick up the expected Rustle resolver"
   fi
 fi
 
-smoke_info "sending UDP DNS query to ${VIRTUAL_DNS_IP}:53"
-"$(smoke_python)" - "$VIRTUAL_DNS_IP" <<'PY'
+smoke_info "sending UDP DNS query for ${DNS_NAME} to ${VIRTUAL_DNS_IP}:53"
+"$(smoke_python)" - "$VIRTUAL_DNS_IP" "$DNS_NAME" <<'PY'
 import socket
 import struct
 import sys
 
 server = sys.argv[1]
+name = sys.argv[2]
 query_id = 0x5255
-labels = b"".join(bytes([len(part)]) + part.encode("ascii") for part in "rustle-smoke.invalid".split("."))
+labels = b"".join(bytes([len(part)]) + part.encode("ascii") for part in name.rstrip(".").split("."))
 question = labels + b"\x00" + b"\x00\x01" + b"\x00\x01"
 query = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + question
 
@@ -263,15 +351,22 @@ if bytes([203, 0, 113, 7]) not in response:
 print("dns smoke response ok")
 PY
 
+if ! smoke_wait_for_log 'dns: forwarding UDP query' "$RUSTLE_LOG" 10; then
+  sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
+  smoke_die "Rustle did not log the TUN DNS query"
+fi
+
 if [[ "$CONFIGURE_DNS" == "1" ]]; then
   smoke_info "resolving through the system resolver after DNS takeover"
-  "$(smoke_python)" - <<'PY'
+  "$(smoke_python)" - "$DNS_NAME" <<'PY'
 import socket
+import sys
 
+name = sys.argv[1]
 expected = "203.0.113.7"
-resolved = socket.gethostbyname("rustle-smoke.invalid")
+resolved = socket.gethostbyname(name)
 if resolved != expected:
-    raise SystemExit(f"system resolver returned {resolved}, expected {expected}")
+    raise SystemExit(f"system resolver returned {resolved} for {name}, expected {expected}")
 print("system resolver DNS smoke response ok")
 PY
 fi

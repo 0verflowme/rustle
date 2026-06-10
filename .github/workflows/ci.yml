@@ -166,9 +166,11 @@ jobs:
           fi
           exit "$status"
 
-      - name: Linux TUN DNS smoke
+      - name: Linux TUN DNS smoke over direct-tcpip
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          RUSTLE_SMOKE_BRIDGE_TRANSPORT: direct-tcpip
         run: |
           set -euo pipefail
           status=0
@@ -190,6 +192,36 @@ jobs:
           bash scripts/smoke-tun-dns.sh || status=$?
           if [[ "$status" -eq 77 ]]; then
             echo "agent TUN DNS smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: macOS TUN DNS smoke over direct-tcpip
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RUSTLE_SMOKE_BRIDGE_TRANSPORT: direct-tcpip
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-tun-dns.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "macOS TUN DNS smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: macOS TUN DNS smoke over agent
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RUSTLE_SMOKE_BRIDGE_TRANSPORT: agent
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-tun-dns.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent macOS TUN DNS smoke skipped on this runner"
             exit 0
           fi
           exit "$status"

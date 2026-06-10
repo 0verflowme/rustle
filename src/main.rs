@@ -23,7 +23,8 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use ssh_key::known_hosts::{HostPatterns, KnownHosts, Marker};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tun_rs::DeviceBuilder;
 
 #[allow(dead_code)]
@@ -1801,14 +1802,26 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         None => None,
     };
     let routes = add_target_routes(&target_routes, &if_name, if_index, args.tun_ip)?;
-    let dns_guard = if args.configure_dns {
-        let dns_ip = virtual_dns_ip(args.tun_ip, args.tun_prefix)?;
-        let guard = platform::configure_system_dns(&if_name, dns_ip)
+    let (dns_guard, local_dns_proxy) = if args.configure_dns {
+        let virtual_dns_ip = virtual_dns_ip(args.tun_ip, args.tun_prefix)?;
+        let system_dns_ip = platform::system_dns_server_ip(virtual_dns_ip);
+        let local_dns_proxy = if system_dns_ip.is_loopback() {
+            Some(
+                start_local_dns_proxy(system_dns_ip, dns_transport.clone(), dns_remote.clone())
+                    .await
+                    .with_context(|| {
+                        format!("failed to start local DNS proxy on {system_dns_ip}:53")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let guard = platform::configure_system_dns(&if_name, system_dns_ip)
             .with_context(|| format!("failed to configure system DNS for {if_name}"))?;
-        eprintln!("dns: configured host resolver to use virtual DNS {dns_ip}");
-        Some(guard)
+        eprintln!("dns: configured host resolver to use DNS {system_dns_ip}");
+        (Some(guard), local_dns_proxy)
     } else {
-        None
+        (None, None)
     };
     let route_parts = target_route_parts(&target_routes);
 
@@ -1823,6 +1836,7 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     let result =
         run_tunnel_loop(dev, flow_manager, bridge_runtime, dns_transport, dns_remote).await;
     drop(dns_guard);
+    drop(local_dns_proxy);
     drop(routes);
     drop(control_route);
     result
@@ -3184,6 +3198,83 @@ impl DnsInflight {
             self.completed = self.completed.saturating_add(1);
         }
     }
+}
+
+struct LocalDnsProxy {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for LocalDnsProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn start_local_dns_proxy(
+    bind_ip: Ipv4Addr,
+    transport: DnsTransport,
+    remote: Destination,
+) -> Result<LocalDnsProxy> {
+    let socket = Arc::new(
+        UdpSocket::bind((bind_ip, dns::DNS_PORT))
+            .await
+            .with_context(|| format!("failed to bind local DNS proxy on {bind_ip}:53"))?,
+    );
+    let permits = Arc::new(Semaphore::new(MAX_IN_FLIGHT_DNS_QUERIES));
+    eprintln!("dns: local resolver proxy listening on {bind_ip}:53");
+
+    let task = tokio::spawn(async move {
+        let mut buf = vec![0_u8; 4096];
+        loop {
+            let (len, peer) = match socket.recv_from(&mut buf).await {
+                Ok(received) => received,
+                Err(err) => {
+                    eprintln!("dns: local resolver proxy receive failed: {err:#}");
+                    break;
+                }
+            };
+            let query = Bytes::copy_from_slice(&buf[..len]);
+            let permit = match Arc::clone(&permits).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    eprintln!(
+                        "dns: local resolver proxy dropping query from {peer} because the in-flight cap is reached"
+                    );
+                    if let Some(response) = dns::build_dns_servfail_response(query.as_ref()) {
+                        let _ = socket.send_to(&response, peer).await;
+                    }
+                    continue;
+                }
+            };
+
+            let socket = Arc::clone(&socket);
+            let transport = transport.clone();
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                eprintln!(
+                    "dns: forwarding local resolver query from {peer} over SSH to {}:{}",
+                    remote.host, remote.port
+                );
+                let response =
+                    match query_dns_over_transport(transport, &remote, query.as_ref()).await {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("dns: local resolver proxy query failed for {peer}: {err:#}");
+                            match dns::build_dns_servfail_response(query.as_ref()) {
+                                Some(response) => Bytes::from(response),
+                                None => return,
+                            }
+                        }
+                    };
+                if let Err(err) = socket.send_to(response.as_ref(), peer).await {
+                    eprintln!("dns: local resolver proxy response to {peer} failed: {err:#}");
+                }
+            });
+        }
+    });
+
+    Ok(LocalDnsProxy { task })
 }
 
 #[derive(Clone)]

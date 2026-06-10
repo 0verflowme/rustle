@@ -535,9 +535,16 @@ Current runtime progress:
   datagrams as synthesized reverse UDP packets to the TUN device, and closes
   idle associations. The direct-tcpip fallback path logs and drops generic UDP
   because standard SSH direct forwarding is TCP only.
-- `--dns` configures the host resolver to use the virtual DNS IP. The platform
-  layer owns setup and restore commands: macOS uses `networksetup`, Linux uses
-  `resolvectl`, and Windows uses `netsh`.
+- `--dns` configures the host resolver to use the virtual DNS IP on Linux and
+  Windows. On macOS, `networksetup` creates service-scoped resolvers that do not
+  reliably route virtual TUN DNS addresses through utun, so Rustle configures
+  the system resolver to `127.0.0.1` and runs a bounded local UDP/53 proxy that
+  forwards through the same SSH DNS transport. The platform layer owns setup and
+  restore commands: macOS uses `networksetup`, Linux uses `resolvectl`, and
+  Windows uses `netsh`. A VPN or managed profile can still keep macOS' global
+  resolver pointed elsewhere; the DNS takeover smoke checks the global
+  `scutil --dns` section separately from scoped service resolvers and fails with
+  that resolver state when the OS does not actually use Rustle for default DNS.
 - `ssh_bridge::tests::fake_bridge_round_trips_flow_manager_stream_bytes` proves
   the bridge architecture without root or a real SSH server.
 - `bridge-lab` proves the same FlowManager plus real `russh` direct-tcpip bridge
@@ -587,7 +594,10 @@ Before a release build is considered shippable:
   evidence; that mode snapshots resolver settings, verifies the virtual
   resolver is active while Rustle runs, resolves through the system resolver
   instead of only a direct UDP probe, and requires exact resolver restoration
-  after shutdown.
+  after shutdown. The resolver probe uses a normal delegated-looking name by
+  default so platforms that short-circuit special-use TLDs still exercise the
+  configured DNS server path. On macOS this also proves the loopback DNS proxy
+  used for service-scoped system resolver traffic.
 - A native elevated Windows TUN smoke must prove Wintun discovery, TUN creation,
   route add/delete, packet capture, and route-table restoration.
   `scripts/smoke-windows-tun.ps1` is the Windows operator proof.

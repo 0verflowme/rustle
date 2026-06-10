@@ -50,6 +50,14 @@ pub fn configure_system_dns(if_name: &str, dns_ip: Ipv4Addr) -> Result<DnsConfig
     configure_system_dns_for_platform(if_name, dns_ip)
 }
 
+pub fn system_dns_server_ip(virtual_dns_ip: Ipv4Addr) -> Ipv4Addr {
+    if cfg!(target_os = "macos") {
+        Ipv4Addr::LOCALHOST
+    } else {
+        virtual_dns_ip
+    }
+}
+
 pub fn preflight_system_dns() -> Result<()> {
     preflight_system_dns_for_platform()
 }
@@ -898,6 +906,18 @@ USB 10/100/1000 LAN
                 ["-setdnsservers", "Wi-Fi", "1.1.1.1", "8.8.8.8"]
             )
         );
+    }
+
+    #[test]
+    fn system_dns_server_ip_uses_loopback_only_on_macos() {
+        let virtual_dns = Ipv4Addr::new(10, 255, 255, 53);
+        let expected = if cfg!(target_os = "macos") {
+            Ipv4Addr::LOCALHOST
+        } else {
+            virtual_dns
+        };
+
+        assert_eq!(system_dns_server_ip(virtual_dns), expected);
     }
 
     #[test]
