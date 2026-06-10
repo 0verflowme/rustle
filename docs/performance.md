@@ -278,7 +278,8 @@ scripts/verify-local.sh
 Set `RUSTLE_VERIFY_LIVE=1` to include the live remote smoke and benchmark in
 the same run. Live smoke runs `agent` first and `direct-tcpip` second by
 default before the benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the
-smoke matrix when debugging one transport.
+smoke matrix when debugging one transport. Add `RUSTLE_VERIFY_LIVE_FIXTURE=1`
+to include the controlled large-response fixture in the live verifier run.
 
 ## Agent Promotion Criteria
 

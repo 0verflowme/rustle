@@ -108,7 +108,9 @@ For release-candidate evidence, run it on privileged Linux with
 after setting the documented live smoke and benchmark environment variables.
 The live verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
-intentionally narrowing that matrix for diagnostics. Skips are useful
+intentionally narrowing that matrix for diagnostics. Set
+`RUSTLE_VERIFY_LIVE_FIXTURE=1` on release performance runs to prove the
+controlled 1 MiB / 10 MiB / 100 MiB live fixture path as well. Skips are useful
 diagnostics, but they are not release evidence for the skipped platform or path.
 
 Required before tagging a release:

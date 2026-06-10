@@ -10,6 +10,7 @@ REQUIRE_PRIVILEGED="${RUSTLE_VERIFY_REQUIRE_PRIVILEGED:-0}"
 RUN_BENCH="${RUSTLE_VERIFY_BENCH:-1}"
 RUN_STRESS="${RUSTLE_VERIFY_STRESS:-1}"
 RUN_LIVE="${RUSTLE_VERIFY_LIVE:-0}"
+RUN_LIVE_FIXTURE="${RUSTLE_VERIFY_LIVE_FIXTURE:-0}"
 LIVE_TRANSPORTS="${RUSTLE_VERIFY_LIVE_TRANSPORTS:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-agent direct-tcpip}}"
 
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
@@ -158,6 +159,9 @@ if [[ "$RUN_LIVE" == "1" ]]; then
     verify_run env RUSTLE_LIVE_BRIDGE_TRANSPORT="$transport" "${SCRIPT_DIR}/smoke-live-tunnel.sh"
   done
   verify_run "${SCRIPT_DIR}/bench-live-compare.sh"
+  if [[ "$RUN_LIVE_FIXTURE" == "1" ]]; then
+    verify_run "${SCRIPT_DIR}/bench-live-fixture.sh"
+  fi
 else
   skips=$((skips + 1))
   verify_info "live remote/sshuttle comparison skipped; set RUSTLE_VERIFY_LIVE=1 with RUSTLE_LIVE_* and RUSTLE_BENCH_* env"
