@@ -78,6 +78,11 @@ record a new trusted host on first connection while still rejecting later key
 changes, use `--accept-new-host-key`. For temporary development labs only, use
 `--insecure-accept-host-key`.
 
+For password authentication, prefer `--password` with no value for an
+interactive prompt, or `--password-file /path/to/private-file` for automation.
+Avoid inline `--password=...` values because local process listings and shell
+history can expose them.
+
 ## Development
 
 Run the main checks:

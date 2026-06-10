@@ -173,6 +173,12 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "host_key_verifier_accept_new_rejects_changed_known_host",
     "host_key_verifier_accept_new_preserves_existing_line_without_newline",
     "compact_cli_rejects_conflicting_host_key_modes",
+    "password_file: Option<PathBuf>",
+    "--password-file",
+    "resolve_ssh_password",
+    "ssh_password_file_option_reads_password_without_argv_secret",
+    "compact_cli_rejects_conflicting_password_sources",
+    "inline --password values may be visible",
     "DEFAULT_AGENT_COMMAND",
     "effective_agent_command",
     "--agent-path",
@@ -273,6 +279,10 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "host_key_verifier_accept_new_rejects_changed_known_host",
     "compact_cli_rejects_conflicting_host_key_modes",
     "`--accept-new-host-key` records only unknown hosts",
+    "SSH password handling checks",
+    "ssh_password_file_option_reads_password_without_argv_secret",
+    "compact_cli_rejects_conflicting_password_sources",
+    "`--password-file` without putting secrets in argv",
     "Remote agent command handling checks",
     "effective_agent_command_quotes_literal_agent_path",
     "compact_cli_accepts_hidden_agent_path_switch",
@@ -392,6 +402,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "rustle-agent",
     "sshuttle",
     "agent/sshuttle",
+    "--password-file",
 ]
 
 REQUIRED_LIVE_FIXTURE_SNIPPETS = [
@@ -403,6 +414,7 @@ REQUIRED_LIVE_FIXTURE_SNIPPETS = [
 
 REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "smoke_wait_for_rustle_target_route_logs",
+    "--password-file",
 ]
 
 REQUIRED_SMOKE_LIB_SNIPPETS = [
@@ -450,6 +462,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "generic UDP request payloads are parsed into `Bytes` once",
     "generic UDP response events keep agent `Data` frame payloads as `Bytes`",
     "DNS response events keep remote resolver payloads as `Bytes`",
+    "Rustle receives the password through its `--password-file` option",
+    "Bare `--password` still supports the legacy",
     "known-failed primary lanes must not add reconnect latency",
     "least-loaded healthy lane elsewhere in the pool",
     "fallback alternate scans do not allocate sorted lane snapshots",

@@ -197,10 +197,12 @@ RUSTLE_BENCH_TOOLS="rustle sshuttle" \
 scripts/bench-live-compare.sh
 ```
 
-Rustle receives the password through its private `RUSTLE_SSH_PASSWORD_FILE`
-environment path. sshuttle uses `sshpass -f` with a private temp file when
+Rustle receives the password through its `--password-file` option backed by a
+private temp file. sshuttle uses `sshpass -f` with a private temp file when
 `RUSTLE_BENCH_SSHUTTLE_PASSWORD=1` is set. The harness removes password files
-during cleanup.
+during cleanup. Bare `--password` still supports the legacy
+`RUSTLE_SSH_PASSWORD_FILE` environment path for compatibility with older local
+scripts.
 
 For compatibility with older local scripts, the live Rustle benchmark also
 accepts a single transport through `RUSTLE_BENCH_BRIDGE_TRANSPORT`:

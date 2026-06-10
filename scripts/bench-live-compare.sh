@@ -349,8 +349,7 @@ start_rustle() {
     password_file="${run_dir}/ssh-password"
     write_password_file "$password_file" "$RUSTLE_PASSWORD_VALUE"
     CURRENT_PASSWORD_FILE="$password_file"
-    cmd+=(--password)
-    cmd_env+=("RUSTLE_SSH_PASSWORD_FILE=${password_file}")
+    cmd+=(--password-file "$password_file")
   fi
   if [[ -n "$transport" ]]; then
     cmd+=(--bridge-transport "$transport")

@@ -269,16 +269,14 @@ if [[ "${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}" == "1" ]]; then
 fi
 if [[ -n "${RUSTLE_LIVE_PASSWORD_VALUE:-}" ]]; then
   write_password_file "$RUSTLE_LIVE_PASSWORD_VALUE"
-  CMD+=(--password)
-  CMD_ENV+=("RUSTLE_SSH_PASSWORD_FILE=${RUSTLE_PASSWORD_FILE}")
+  CMD+=(--password-file "$RUSTLE_PASSWORD_FILE")
 elif [[ "${RUSTLE_LIVE_PASSWORD:-0}" == "1" ]]; then
   printf 'SSH password: ' >&2
   IFS= read -r -s password_value
   printf '\n' >&2
   write_password_file "$password_value"
   unset password_value
-  CMD+=(--password)
-  CMD_ENV+=("RUSTLE_SSH_PASSWORD_FILE=${RUSTLE_PASSWORD_FILE}")
+  CMD+=(--password-file "$RUSTLE_PASSWORD_FILE")
 fi
 if [[ "${RUSTLE_LIVE_DNS:-0}" == "1" ]]; then
   CMD+=(--dns)

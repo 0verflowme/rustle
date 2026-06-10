@@ -140,8 +140,22 @@ struct SshArgs {
     identity: Option<PathBuf>,
 
     /// Use password authentication. If no value is supplied, prompt interactively.
-    #[arg(short = 'p', long = "password", num_args = 0..=1, require_equals = true)]
+    #[arg(
+        short = 'p',
+        long = "password",
+        num_args = 0..=1,
+        require_equals = true,
+        conflicts_with = "password_file"
+    )]
     password: Option<Option<String>>,
+
+    /// Read the SSH password from a local file instead of argv or a prompt.
+    #[arg(
+        long = "password-file",
+        value_name = "PATH",
+        conflicts_with = "password"
+    )]
+    password_file: Option<PathBuf>,
 
     /// Skip host-key verification. Intended for controlled development labs only.
     #[arg(long = "insecure-accept-host-key")]
@@ -6872,17 +6886,7 @@ fn prepare_ssh_connection(args: &SshArgs) -> Result<PreparedSshConnection> {
         bail!("--accept-new-host-key cannot be combined with --insecure-accept-host-key");
     }
     let target = parse_ssh_target(remote, args.ssh_user.as_deref())?;
-    let password = match &args.password {
-        Some(Some(value)) => Some(value.clone()),
-        Some(None) => match read_password_file_from_env()? {
-            Some(value) => Some(value),
-            None => Some(
-                rpassword::prompt_password("SSH password: ")
-                    .context("failed to read password from terminal")?,
-            ),
-        },
-        None => None,
-    };
+    let password = resolve_ssh_password(args)?;
 
     Ok(PreparedSshConnection {
         target,
@@ -6893,6 +6897,30 @@ fn prepare_ssh_connection(args: &SshArgs) -> Result<PreparedSshConnection> {
         accept_new_host_key: args.accept_new_host_key,
         connect_timeout: ssh_connect_timeout(args.ssh_connect_timeout_secs)?,
     })
+}
+
+fn resolve_ssh_password(args: &SshArgs) -> Result<Option<String>> {
+    if args.password.is_some() && args.password_file.is_some() {
+        bail!("--password-file cannot be combined with --password");
+    }
+    match (&args.password, &args.password_file) {
+        (_, Some(path)) => read_password_file(path).map(Some),
+        (Some(Some(value)), None) => {
+            eprintln!(
+                "ssh: warning: inline --password values may be visible to other local users; prefer --password-file or an interactive prompt"
+            );
+            Ok(Some(value.clone()))
+        }
+        (Some(None), None) => {
+            let password = match read_password_file_from_env()? {
+                Some(value) => value,
+                None => rpassword::prompt_password("SSH password: ")
+                    .context("failed to read password from terminal")?,
+            };
+            Ok(Some(password))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 async fn connect_prepared_ssh(prepared: &PreparedSshConnection) -> Result<Handle<Client>> {
@@ -7697,6 +7725,38 @@ mod tests {
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(password, " secret value ");
+    }
+
+    #[test]
+    fn ssh_password_file_option_reads_password_without_argv_secret() {
+        let path = env::temp_dir().join(format!(
+            "rustle-password-file-option-test-{}-{}",
+            std::process::id(),
+            StdInstant::now().elapsed().as_nanos()
+        ));
+        std::fs::write(&path, "file secret\r\n").unwrap();
+
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--password-file",
+            path.to_str().expect("password path is UTF-8"),
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with password file");
+
+        assert_eq!(cli.compact.ssh.password, None);
+        assert_eq!(
+            cli.compact.ssh.password_file.as_deref(),
+            Some(path.as_path())
+        );
+        assert_eq!(
+            resolve_ssh_password(&cli.compact.ssh).expect("read password file"),
+            Some("file secret".to_owned())
+        );
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -9371,6 +9431,22 @@ mod tests {
     }
 
     #[test]
+    fn compact_cli_rejects_conflicting_password_sources() {
+        let err = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--password",
+            "--password-file",
+            "/tmp/rustle-password",
+            "10.0.0.0/8",
+        ])
+        .expect_err("password sources must conflict");
+
+        assert!(err.to_string().contains("password-file"));
+    }
+
+    #[test]
     fn compact_cli_accepts_hidden_tun_overrides() {
         let cli = Cli::try_parse_from([
             "rustle",
@@ -9592,6 +9668,7 @@ mod tests {
 
         assert!(help.contains("CIDR"));
         assert!(help.contains("--remote"));
+        assert!(help.contains("--password-file"));
         assert!(help.contains("--dns"));
         assert!(help.contains("--dns-remote"));
         assert!(!help.contains("--tun-ip"));

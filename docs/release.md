@@ -120,6 +120,11 @@ Required before tagging a release:
   `--accept-new-host-key` records only unknown hosts while preserving hard
   failures for changed keys and staying mutually exclusive with
   `--insecure-accept-host-key`.
+- SSH password handling checks pass:
+  `ssh_password_file_option_reads_password_without_argv_secret` and
+  `compact_cli_rejects_conflicting_password_sources` must prove automation can
+  use `--password-file` without putting secrets in argv and that it cannot be
+  combined with inline or prompt-based `--password`.
 - Remote agent command handling checks pass:
   `effective_agent_command_quotes_literal_agent_path`,
   `compact_cli_accepts_hidden_agent_path_switch`, and
