@@ -79,8 +79,8 @@ const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
 const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str = "uname -s 2>/dev/null; uname -m 2>/dev/null";
 const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
-const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; d=${TMPDIR:-/tmp}; p=\"$d/rustle-agent-$$\"; rm -f \"$p\"; cat > \"$p\"; chmod 700 \"$p\"; printf '%s\\n' \"$p\"";
-const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $d=$env:TEMP; if ([string]::IsNullOrWhiteSpace($d)) { $d=$env:TMP }; if ([string]::IsNullOrWhiteSpace($d)) { $d=[IO.Path]::GetTempPath() }; $p=Join-Path -Path $d -ChildPath ('rustle-agent-{0}.exe' -f $PID); Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; $stdin=[Console]::OpenStandardInput(); $out=[IO.File]::Open($p,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); try { $stdin.CopyTo($out) } finally { $out.Dispose(); $stdin.Dispose() }; [Console]::Out.WriteLine($p)\"";
+const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
+const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $d=$env:TEMP; if ([string]::IsNullOrWhiteSpace($d)) { $d=$env:TMP }; if ([string]::IsNullOrWhiteSpace($d)) { $d=[IO.Path]::GetTempPath() }; $dir=Join-Path -Path $d -ChildPath ('rustle-agent-{0}-{1}' -f $PID,[Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dir -Force | Out-Null; $p=Join-Path -Path $dir -ChildPath 'rustle-agent.exe'; $stdin=[Console]::OpenStandardInput(); try { $out=[IO.File]::Open($p,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); try { $stdin.CopyTo($out) } finally { $out.Dispose(); $stdin.Dispose() } } catch { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; throw }; [Console]::Out.WriteLine($p)\"";
 const RUSTLE_AGENT_DIR_ENV: &str = "RUSTLE_AGENT_DIR";
 
 #[derive(Debug, Parser)]
@@ -990,14 +990,14 @@ fn uploaded_agent_command(remote_path: &str, platform: RemotePlatform) -> String
 fn uploaded_posix_agent_command(remote_path: &str) -> String {
     let quoted_path = shell_quote(remote_path);
     format!(
-        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; rmdir \"$refdir\" 2>/dev/null && rm -f \"$tmp\"; }}; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" agent; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
+        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup_parent() {{ parent=${{tmp%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac; }}; cleanup() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi; }}; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" agent; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
     )
 }
 
 fn uploaded_windows_agent_command(remote_path: &str) -> String {
     let quoted_path = powershell_quote(remote_path);
     format!(
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $tmp={quoted_path}; $refdir=$tmp+'.refs'; $marker=Join-Path -Path $refdir -ChildPath $PID; New-Item -ItemType Directory -Force -LiteralPath $refdir | Out-Null; New-Item -ItemType File -Force -LiteralPath $marker | Out-Null; function Cleanup {{ Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $refdir) {{ Get-ChildItem -LiteralPath $refdir -ErrorAction SilentlyContinue | ForEach-Object {{ $id=0; if ([int]::TryParse($_.Name,[ref]$id)) {{ if (-not (Get-Process -Id $id -ErrorAction SilentlyContinue)) {{ Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }} }} }}; try {{ Remove-Item -LiteralPath $refdir -Force -ErrorAction Stop; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }} catch {{}} }} }}; try {{ & $tmp agent; $status=$LASTEXITCODE }} finally {{ Cleanup }}; exit $status\""
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $tmp={quoted_path}; $refdir=$tmp+'.refs'; $marker=Join-Path -Path $refdir -ChildPath $PID; New-Item -ItemType Directory -Force -LiteralPath $refdir | Out-Null; New-Item -ItemType File -Force -LiteralPath $marker | Out-Null; function CleanupParent {{ $parent=[IO.Path]::GetDirectoryName($tmp); if ($parent -and ([IO.Path]::GetFileName($parent) -like 'rustle-agent-*')) {{ Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue }} }}; function Cleanup {{ Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $refdir) {{ Get-ChildItem -LiteralPath $refdir -ErrorAction SilentlyContinue | ForEach-Object {{ $id=0; if ([int]::TryParse($_.Name,[ref]$id)) {{ if (-not (Get-Process -Id $id -ErrorAction SilentlyContinue)) {{ Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }} }} }}; try {{ Remove-Item -LiteralPath $refdir -Force -ErrorAction Stop; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; CleanupParent }} catch {{}} }} }}; try {{ & $tmp agent; $status=$LASTEXITCODE }} finally {{ Cleanup }}; exit $status\""
     )
 }
 
@@ -1118,13 +1118,15 @@ fn uploaded_agent_cleanup_command(remote_path: &str, platform: RemotePlatform) -
 
 fn uploaded_posix_agent_cleanup_command(remote_path: &str) -> String {
     let quoted_path = shell_quote(remote_path);
-    format!("rm -f {quoted_path}; rm -rf {quoted_path}.refs")
+    format!(
+        "p={quoted_path}; rm -f \"$p\"; rm -rf \"$p.refs\"; parent=${{p%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac"
+    )
 }
 
 fn uploaded_windows_agent_cleanup_command(remote_path: &str) -> String {
     let quoted_path = powershell_quote(remote_path);
     format!(
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $p={quoted_path}; Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath ($p+'.refs') -Recurse -Force -ErrorAction SilentlyContinue\""
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $p={quoted_path}; Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath ($p+'.refs') -Recurse -Force -ErrorAction SilentlyContinue; $parent=[IO.Path]::GetDirectoryName($p); if ($parent -and ([IO.Path]::GetFileName($parent) -like 'rustle-agent-*')) {{ Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue }}\""
     )
 }
 
@@ -8271,7 +8273,10 @@ mod tests {
         assert!(command.contains("for stale in \"$refdir\"/*"));
         assert!(command.contains("kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\""));
         assert!(command.contains("while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup"));
-        assert!(command.contains("rmdir \"$refdir\" 2>/dev/null && rm -f \"$tmp\""));
+        assert!(command.contains("cleanup_parent()"));
+        assert!(command.contains("case \"$base\" in rustle-agent.*)"));
+        assert!(command
+            .contains("if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi"));
     }
 
     #[test]
@@ -8287,10 +8292,14 @@ mod tests {
         assert!(command.contains("$refdir=$tmp+'.refs'"));
         assert!(command.contains("$marker=Join-Path -Path $refdir -ChildPath $PID"));
         assert!(command.contains("New-Item -ItemType Directory -Force -LiteralPath $refdir"));
+        assert!(command.contains("function CleanupParent"));
+        assert!(command.contains("[IO.Path]::GetDirectoryName($tmp)"));
+        assert!(command.contains("[IO.Path]::GetFileName($parent) -like 'rustle-agent-*'"));
         assert!(command.contains("Remove-Item -LiteralPath $marker -Force"));
         assert!(command.contains("Get-Process -Id $id -ErrorAction SilentlyContinue"));
         assert!(command.contains("Remove-Item -LiteralPath $refdir -Force"));
         assert!(command.contains("Remove-Item -LiteralPath $tmp -Force"));
+        assert!(command.contains("CleanupParent"));
         assert!(command.contains("& $tmp agent"));
         assert_eq!(
             remote_agent_upload_command(platform),
@@ -8307,6 +8316,113 @@ mod tests {
             }),
             POSIX_REMOTE_AGENT_UPLOAD_COMMAND
         );
+    }
+
+    #[test]
+    fn remote_agent_upload_commands_stage_in_private_temp_dirs() {
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("umask 077"));
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("mktemp -d"));
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("rustle-agent.XXXXXX"));
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("chmod 700 \"$dir\""));
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("p=\"$dir/rustle-agent\""));
+        assert!(POSIX_REMOTE_AGENT_UPLOAD_COMMAND.contains("trap cleanup EXIT HUP INT TERM"));
+
+        assert!(WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND.contains("[Guid]::NewGuid()"));
+        assert!(WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND.contains("New-Item -ItemType Directory"));
+        assert!(WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND.contains("'rustle-agent.exe'"));
+        assert!(WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND.contains("[IO.FileMode]::CreateNew"));
+        assert!(
+            WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND.contains("Remove-Item -LiteralPath $dir -Recurse")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_remote_agent_upload_command_creates_private_executable_file() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let root = env::temp_dir().join(format!(
+            "rustle-upload-temp-test-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        std::fs::create_dir(&root).expect("create upload temp root");
+        let temp = TempTree { path: root };
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(POSIX_REMOTE_AGENT_UPLOAD_COMMAND)
+            .env("TMPDIR", &temp.path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn POSIX upload command");
+        child
+            .stdin
+            .as_mut()
+            .expect("upload command stdin")
+            .write_all(b"agent")
+            .expect("write upload command stdin");
+        let output = child.wait_with_output().expect("wait for upload command");
+        assert!(
+            output.status.success(),
+            "upload command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let remote_path = PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("upload path is UTF-8")
+                .trim(),
+        );
+        assert_eq!(remote_path.file_name().unwrap(), "rustle-agent");
+        assert!(remote_path.starts_with(&temp.path));
+        let parent = remote_path.parent().expect("uploaded file has parent");
+        assert!(parent
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("rustle-agent."));
+        assert_eq!(
+            std::fs::metadata(parent)
+                .expect("private upload dir exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&remote_path)
+                .expect("uploaded helper exists")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::read(&remote_path).expect("read uploaded helper"),
+            b"agent"
+        );
+
+        let cleanup = Command::new("sh")
+            .arg("-c")
+            .arg(uploaded_posix_agent_cleanup_command(
+                remote_path.to_str().expect("upload path is UTF-8"),
+            ))
+            .status()
+            .expect("run cleanup command");
+        assert!(cleanup.success(), "cleanup command failed");
+        assert!(!parent.exists(), "private upload dir should be removed");
     }
 
     #[test]
@@ -8356,7 +8472,7 @@ mod tests {
         );
         assert_eq!(
             posix,
-            "rm -f '/tmp/rustle'\\''agent'; rm -rf '/tmp/rustle'\\''agent'.refs"
+            "p='/tmp/rustle'\\''agent'; rm -f \"$p\"; rm -rf \"$p.refs\"; parent=${p%/*}; base=${parent##*/}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac"
         );
 
         let windows = uploaded_agent_cleanup_command(
@@ -8369,6 +8485,9 @@ mod tests {
         assert!(windows.contains("$p='C:\\Temp\\rustle''agent.exe'"));
         assert!(windows.contains("Remove-Item -LiteralPath $p -Force"));
         assert!(windows.contains("Remove-Item -LiteralPath ($p+'.refs') -Recurse -Force"));
+        assert!(windows.contains("[IO.Path]::GetDirectoryName($p)"));
+        assert!(windows.contains("[IO.Path]::GetFileName($parent) -like 'rustle-agent-*'"));
+        assert!(windows.contains("Remove-Item -LiteralPath $parent -Recurse -Force"));
     }
 
     #[test]

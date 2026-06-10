@@ -274,6 +274,11 @@ Required before tagging a release:
   `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` must also
   pass so the generated upload wrapper is proven to keep one staged helper alive
   across concurrent initial agent lanes and remove it after the last lane exits.
+- Uploaded-agent temp staging checks are covered before release:
+  `remote_agent_upload_commands_stage_in_private_temp_dirs` and
+  `posix_remote_agent_upload_command_creates_private_executable_file` must pass
+  so the upload fallback stages helpers in private directories with executable
+  owner-only permissions and removes those directories during cleanup.
 - Uploaded-agent integrity checks are covered before release:
   `uploaded_agent_sha256_command_uses_remote_hash_tools`,
   `windows_uploaded_agent_sha256_command_uses_get_file_hash`,
