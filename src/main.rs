@@ -77,6 +77,7 @@ const SSH_PASSWORD_FILE_ENV: &str = "RUSTLE_SSH_PASSWORD_FILE";
 const AGENT_INITIAL_CONNECT_BATCH: usize = 4;
 const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
+const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
 const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str = "uname -s 2>/dev/null; uname -m 2>/dev/null";
 const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
 const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
@@ -217,9 +218,13 @@ struct CompactTunnelArgs {
     )]
     bridge_transport: BridgeTransportKind,
 
-    /// Remote command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", default_value = "rustle agent", hide = true)]
-    agent_command: String,
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
+    agent_path: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -313,9 +318,13 @@ struct TunnelArgs {
     )]
     bridge_transport: BridgeTransportKind,
 
-    /// Remote command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", default_value = "rustle agent", hide = true)]
-    agent_command: String,
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
+    agent_path: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -360,9 +369,13 @@ struct BridgeLabArgs {
     )]
     bridge_transport: BridgeTransportKind,
 
-    /// Remote command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", default_value = "rustle agent", hide = true)]
-    agent_command: String,
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
+    agent_path: Option<String>,
 
     /// Print a compact benchmark summary instead of response bodies.
     #[arg(long = "summary", hide = true)]
@@ -400,9 +413,13 @@ struct AgentLabArgs {
     #[arg(short = 'd', long = "destination")]
     destination: String,
 
-    /// Remote command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", default_value = "rustle agent")]
-    agent_command: String,
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", conflicts_with = "agent_command")]
+    agent_path: Option<String>,
 
     /// Raw request payload to send through the agent stream.
     #[arg(long = "request")]
@@ -422,9 +439,13 @@ struct AgentUdpLabArgs {
     #[arg(short = 'd', long = "destination")]
     destination: String,
 
-    /// Remote command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", default_value = "rustle agent")]
-    agent_command: String,
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", conflicts_with = "agent_command")]
+    agent_path: Option<String>,
 
     /// Raw UDP datagram payload to send through the agent stream.
     #[arg(long = "request", default_value = "rustle-agent-udp-ping")]
@@ -486,8 +507,9 @@ async fn run_agent_lab_inner(args: AgentLabArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_http_request(&destination.host));
 
-    let connector =
-        SshAgentBridgeConnector::new(args.ssh.clone(), args.agent_command.clone(), args.mtu);
+    let agent_command =
+        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu);
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport
@@ -574,8 +596,9 @@ async fn run_agent_udp_lab_inner(args: AgentUdpLabArgs) -> Result<()> {
     }
 
     let destination = parse_ipv4_destination(&args.destination)?;
-    let connector =
-        SshAgentBridgeConnector::new(args.ssh.clone(), args.agent_command.clone(), args.mtu);
+    let agent_command =
+        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu);
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport
@@ -1370,6 +1393,30 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn effective_agent_command(
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<String> {
+    match (agent_command, agent_path) {
+        (Some(_), Some(_)) => {
+            bail!("--agent-command cannot be combined with --agent-path");
+        }
+        (Some(command), None) => {
+            if command.trim().is_empty() {
+                bail!("--agent-command must not be empty");
+            }
+            Ok(command.to_owned())
+        }
+        (None, Some(path)) => {
+            if path.trim().is_empty() {
+                bail!("--agent-path must not be empty");
+            }
+            Ok(format!("{} agent", shell_quote(path)))
+        }
+        (None, None) => Ok(DEFAULT_AGENT_COMMAND.to_owned()),
+    }
+}
+
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -1630,6 +1677,7 @@ async fn run_compact_tunnel(args: CompactTunnelArgs) -> Result<()> {
         agent_sessions: args.agent_sessions,
         bridge_transport: args.bridge_transport,
         agent_command: args.agent_command,
+        agent_path: args.agent_path,
     })
     .await
 }
@@ -1672,6 +1720,8 @@ async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
 
 async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;
+    let agent_command =
+        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
     let target_routes = expand_target_routes(&args.targets)?;
     let dns_remote = parse_destination(&args.dns_remote)
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
@@ -1701,7 +1751,7 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     let (bridge_runtime, dns_transport) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
-        &args.agent_command,
+        &agent_command,
         args.mtu,
         Some(&dns_remote),
         BridgeRuntimeOptions {
@@ -1829,10 +1879,12 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         .request
         .clone()
         .unwrap_or_else(|| default_http_request(&destination.host));
+    let agent_command =
+        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
     let (bridge_runtime, _) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
-        &args.agent_command,
+        &agent_command,
         DEFAULT_MTU,
         None,
         BridgeRuntimeOptions {
@@ -8370,6 +8422,27 @@ mod tests {
     }
 
     #[test]
+    fn effective_agent_command_quotes_literal_agent_path() {
+        assert_eq!(
+            effective_agent_command(None, None).expect("default agent command"),
+            DEFAULT_AGENT_COMMAND
+        );
+        assert_eq!(
+            effective_agent_command(Some("/tmp/rustle agent"), None)
+                .expect("raw command stays raw"),
+            "/tmp/rustle agent"
+        );
+        assert_eq!(
+            effective_agent_command(None, Some("/tmp/rustle dir/rustle'bin"))
+                .expect("path command is quoted"),
+            "'/tmp/rustle dir/rustle'\\''bin' agent"
+        );
+        assert!(effective_agent_command(Some(" "), None).is_err());
+        assert!(effective_agent_command(None, Some(" ")).is_err());
+        assert!(effective_agent_command(Some("rustle agent"), Some("/tmp/rustle")).is_err());
+    }
+
+    #[test]
     fn powershell_quote_uses_single_quote_safe_form() {
         assert_eq!(
             powershell_quote("C:\\Temp\\rustle.exe"),
@@ -9166,11 +9239,65 @@ mod tests {
 
         assert!(cli.command.is_none());
         assert_eq!(cli.compact.bridge_transport, BridgeTransportKind::Agent);
-        assert_eq!(cli.compact.agent_command, "/tmp/rustle agent");
+        assert_eq!(
+            cli.compact.agent_command.as_deref(),
+            Some("/tmp/rustle agent")
+        );
+        assert!(cli.compact.agent_path.is_none());
         assert_eq!(
             cli.compact.targets,
             vec!["10.0.0.0/8".parse::<Ipv4Net>().unwrap()]
         );
+    }
+
+    #[test]
+    fn compact_cli_accepts_hidden_agent_path_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--bridge-transport",
+            "agent",
+            "--agent-path",
+            "/tmp/rustle dir/rustle'bin",
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with hidden agent path");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.compact.bridge_transport, BridgeTransportKind::Agent);
+        assert!(cli.compact.agent_command.is_none());
+        assert_eq!(
+            cli.compact.agent_path.as_deref(),
+            Some("/tmp/rustle dir/rustle'bin")
+        );
+        assert_eq!(
+            effective_agent_command(
+                cli.compact.agent_command.as_deref(),
+                cli.compact.agent_path.as_deref()
+            )
+            .expect("agent path becomes effective command"),
+            "'/tmp/rustle dir/rustle'\\''bin' agent"
+        );
+    }
+
+    #[test]
+    fn compact_cli_rejects_conflicting_agent_command_modes() {
+        let err = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--bridge-transport",
+            "agent",
+            "--agent-command",
+            "/tmp/rustle agent",
+            "--agent-path",
+            "/tmp/rustle",
+            "10.0.0.0/8",
+        ])
+        .expect_err("agent command modes must conflict");
+
+        assert!(err.to_string().contains("agent-path"));
     }
 
     #[test]
@@ -9373,7 +9500,8 @@ mod tests {
             panic!("expected bridge-lab subcommand");
         };
         assert_eq!(args.bridge_transport, BridgeTransportKind::Agent);
-        assert_eq!(args.agent_command, "/tmp/rustle agent");
+        assert_eq!(args.agent_command.as_deref(), Some("/tmp/rustle agent"));
+        assert!(args.agent_path.is_none());
     }
 
     #[test]
@@ -9395,9 +9523,31 @@ mod tests {
         let Some(CommandKind::AgentLab(args)) = cli.command else {
             panic!("expected agent-lab subcommand");
         };
-        assert_eq!(args.agent_command, "/tmp/rustle agent");
+        assert_eq!(args.agent_command.as_deref(), Some("/tmp/rustle agent"));
+        assert!(args.agent_path.is_none());
         assert_eq!(args.destination, "127.0.0.1:8080");
         assert_eq!(args.mtu, 1200);
+    }
+
+    #[test]
+    fn agent_lab_accepts_agent_path_option() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "agent-lab",
+            "-r",
+            "alice@example.com",
+            "--destination",
+            "127.0.0.1:8080",
+            "--agent-path",
+            "/opt/rustle dir/rustle",
+        ])
+        .expect("agent-lab with agent path option");
+
+        let Some(CommandKind::AgentLab(args)) = cli.command else {
+            panic!("expected agent-lab subcommand");
+        };
+        assert!(args.agent_command.is_none());
+        assert_eq!(args.agent_path.as_deref(), Some("/opt/rustle dir/rustle"));
     }
 
     #[test]
@@ -9426,7 +9576,8 @@ mod tests {
         let Some(CommandKind::AgentUdpLab(args)) = cli.command else {
             panic!("expected agent-udp-lab subcommand");
         };
-        assert_eq!(args.agent_command, "/tmp/rustle agent");
+        assert_eq!(args.agent_command.as_deref(), Some("/tmp/rustle agent"));
+        assert!(args.agent_path.is_none());
         assert_eq!(args.destination, "127.0.0.1:5353");
         assert_eq!(args.request, "ping");
         assert_eq!(args.messages, 4);
@@ -9451,6 +9602,7 @@ mod tests {
         assert!(!help.contains("--agent-sessions"));
         assert!(!help.contains("--bridge-transport"));
         assert!(!help.contains("--agent-command"));
+        assert!(!help.contains("--agent-path"));
         assert!(!help.contains("direct-tcpip"));
         assert!(!help.contains("tun-capture"));
         assert!(!help.contains("bridge-lab"));
@@ -9508,7 +9660,32 @@ mod tests {
             panic!("expected tunnel subcommand");
         };
         assert_eq!(args.bridge_transport, BridgeTransportKind::Agent);
-        assert_eq!(args.agent_command, "/tmp/rustle agent");
+        assert_eq!(args.agent_command.as_deref(), Some("/tmp/rustle agent"));
+        assert!(args.agent_path.is_none());
+    }
+
+    #[test]
+    fn tunnel_subcommand_accepts_hidden_agent_path_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--bridge-transport",
+            "agent",
+            "--agent-path",
+            "/opt/rustle dir/rustle",
+        ])
+        .expect("tunnel CLI with hidden agent path");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::Agent);
+        assert!(args.agent_command.is_none());
+        assert_eq!(args.agent_path.as_deref(), Some("/opt/rustle dir/rustle"));
     }
 
     #[test]

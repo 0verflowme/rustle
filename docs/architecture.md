@@ -75,6 +75,10 @@ Rustle keeps three transport choices, but only one is the normal path:
   when no startup transport was established, so background repair can fill the
   missing capacity later. Startup logs report `established/desired` exec
   transports, so degraded pool capacity is visible without another CLI flag.
+  Custom remote agent startup keeps raw shell and path-based forms separate:
+  `--agent-command` is the explicit raw SSH exec command escape hatch, while
+  `--agent-path` shell-quotes a literal remote executable path and appends the
+  fixed `agent` subcommand.
   Periodic and final stats keep reporting desired, available, missing, failed,
   quarantined, and repairing lane counts, so degradation stays visible after
   startup scrollback is gone. Agent mode can open multiple
@@ -543,6 +547,10 @@ Current runtime progress:
   verifier covers plain entries, non-default port entries, hashed hostnames,
   wildcard/negated patterns, revoked-key rejection, and accept-new host-key
   onboarding that records unknown hosts without accepting changed keys.
+- Remote agent startup command handling keeps unsafe and safe forms distinct.
+  Hidden lab `--agent-command` remains a raw SSH exec command for complex
+  harnesses, while hidden `--agent-path` quotes one literal executable path and
+  appends the fixed `agent` argument.
 
 ## Design Preference
 

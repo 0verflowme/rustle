@@ -120,6 +120,12 @@ Required before tagging a release:
   `--accept-new-host-key` records only unknown hosts while preserving hard
   failures for changed keys and staying mutually exclusive with
   `--insecure-accept-host-key`.
+- Remote agent command handling checks pass:
+  `effective_agent_command_quotes_literal_agent_path`,
+  `compact_cli_accepts_hidden_agent_path_switch`, and
+  `compact_cli_rejects_conflicting_agent_command_modes` must prove that raw
+  `--agent-command` stays explicit while `--agent-path` quotes a literal remote
+  executable path before appending the fixed `agent` subcommand.
 - Remote bootstrap unit coverage passes for POSIX and Windows command
   generation, including PowerShell platform parsing, upload command selection,
   cross-platform sidecar candidate selection, Windows cleanup command shape, and
