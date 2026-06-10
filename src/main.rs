@@ -377,6 +377,13 @@ enum BridgeTransportKind {
     Agent,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BridgeRuntimeOptions {
+    ssh_sessions: usize,
+    agent_sessions: usize,
+    fast_start_auto_agent_lanes: bool,
+}
+
 #[derive(Debug, Parser)]
 struct AgentLabArgs {
     #[command(flatten)]
@@ -800,8 +807,38 @@ async fn connect_agent_bridge_transports_from_connector(
     Ok(transports)
 }
 
+async fn connect_auto_agent_bridge_transports_from_connector(
+    connector: &dyn AgentBridgeConnector,
+    desired_sessions: usize,
+) -> Result<Vec<AgentBridgeTransport>> {
+    let desired_sessions = resolve_agent_session_count(desired_sessions);
+    validate_agent_session_count(desired_sessions)?;
+
+    let first = connector.connect_primary().await?;
+    eprintln!("{}", format_agent_fast_start_message(1, desired_sessions));
+    Ok(vec![first])
+}
+
 fn format_agent_established_message(established: usize, desired: usize) -> String {
     format!("agent: established {established}/{desired} exec transport(s)")
+}
+
+fn format_agent_fast_start_message(established: usize, desired: usize) -> String {
+    let message = format_agent_established_message(established, desired);
+    let warming = desired.saturating_sub(established);
+    if warming == 0 {
+        message
+    } else {
+        format!("{message}; warming {warming} remaining exec transport(s) in background")
+    }
+}
+
+fn should_fast_start_agent_lanes(
+    fast_start_auto_lanes: bool,
+    requested_sessions: usize,
+    desired_sessions: usize,
+) -> bool {
+    fast_start_auto_lanes && requested_sessions == AUTO_AGENT_SESSIONS && desired_sessions > 1
 }
 
 async fn connect_additional_agent_bridge_transport_batch(
@@ -1250,26 +1287,37 @@ async fn connect_bridge_runtime(
     requested: BridgeTransportKind,
     agent_command: &str,
     mtu: u16,
-    ssh_sessions: usize,
-    agent_sessions: usize,
     dns_remote: Option<&Destination>,
+    options: BridgeRuntimeOptions,
 ) -> Result<(BridgeRuntime, DnsTransport)> {
     match requested {
         BridgeTransportKind::DirectTcpip => {
-            let ssh = connect_ssh_pool(ssh, ssh_sessions).await?;
+            let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
             Ok((
                 BridgeRuntime::DirectTcpip(ssh.clone()),
                 DnsTransport::DirectTcpip(ssh),
             ))
         }
         BridgeTransportKind::Agent => {
-            let desired_agent_sessions = resolve_agent_session_count(agent_sessions);
+            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(SshAgentBridgeConnector::new(
                 ssh.clone(),
                 agent_command.to_owned(),
                 mtu,
             ));
-            let agent = connector.connect_initial(desired_agent_sessions).await?;
+            let agent = if should_fast_start_agent_lanes(
+                options.fast_start_auto_agent_lanes,
+                options.agent_sessions,
+                desired_agent_sessions,
+            ) {
+                connect_auto_agent_bridge_transports_from_connector(
+                    connector.as_ref(),
+                    desired_agent_sessions,
+                )
+                .await?
+            } else {
+                connector.connect_initial(desired_agent_sessions).await?
+            };
             ensure_agent_dns_remote_supported(&agent, dns_remote)?;
             let agent = ReconnectingAgentBridge::new_with_desired_lanes(
                 connector,
@@ -1280,19 +1328,32 @@ async fn connect_bridge_runtime(
             Ok((BridgeRuntime::Agent(agent), dns_transport))
         }
         BridgeTransportKind::Auto => {
-            let desired_agent_sessions = resolve_agent_session_count(agent_sessions);
+            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(SshAgentBridgeConnector::new(
                 ssh.clone(),
                 agent_command.to_owned(),
                 mtu,
             ));
-            match connector.connect_initial(desired_agent_sessions).await {
+            let agent_result = if should_fast_start_agent_lanes(
+                options.fast_start_auto_agent_lanes,
+                options.agent_sessions,
+                desired_agent_sessions,
+            ) {
+                connect_auto_agent_bridge_transports_from_connector(
+                    connector.as_ref(),
+                    desired_agent_sessions,
+                )
+                .await
+            } else {
+                connector.connect_initial(desired_agent_sessions).await
+            };
+            match agent_result {
                 Ok(agent) => {
                     if let Err(err) = ensure_agent_dns_remote_supported(&agent, dns_remote) {
                         eprintln!(
                             "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
                         );
-                        let ssh = connect_ssh_pool(ssh, ssh_sessions).await?;
+                        let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
                         return Ok((
                             BridgeRuntime::DirectTcpip(ssh.clone()),
                             DnsTransport::DirectTcpip(ssh),
@@ -1311,7 +1372,7 @@ async fn connect_bridge_runtime(
                     eprintln!(
                         "transport: auto could not start agent ({err:#}); falling back to direct-tcpip"
                     );
-                    let ssh = connect_ssh_pool(ssh, ssh_sessions).await?;
+                    let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
                     Ok((
                         BridgeRuntime::DirectTcpip(ssh.clone()),
                         DnsTransport::DirectTcpip(ssh),
@@ -1507,9 +1568,12 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         args.bridge_transport,
         &args.agent_command,
         args.mtu,
-        args.ssh_sessions,
-        args.agent_sessions,
         Some(&dns_remote),
+        BridgeRuntimeOptions {
+            ssh_sessions: args.ssh_sessions,
+            agent_sessions: args.agent_sessions,
+            fast_start_auto_agent_lanes: true,
+        },
     )
     .await?;
     let control_route = match ssh_control_ip {
@@ -1635,9 +1699,12 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         args.bridge_transport,
         &args.agent_command,
         DEFAULT_MTU,
-        args.ssh_sessions,
-        args.agent_sessions,
         None,
+        BridgeRuntimeOptions {
+            ssh_sessions: args.ssh_sessions,
+            agent_sessions: args.agent_sessions,
+            fast_start_auto_agent_lanes: false,
+        },
     )
     .await?;
 
@@ -8009,6 +8076,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_agent_sessions_fast_start_when_multiple_lanes_are_recommended() {
+        assert!(!should_fast_start_agent_lanes(true, AUTO_AGENT_SESSIONS, 1));
+        assert!(should_fast_start_agent_lanes(true, AUTO_AGENT_SESSIONS, 2));
+        assert!(
+            !should_fast_start_agent_lanes(false, AUTO_AGENT_SESSIONS, 2),
+            "bridge-lab and other steady-state harnesses can opt out"
+        );
+        assert!(
+            !should_fast_start_agent_lanes(true, 2, 2),
+            "explicit --agent-sessions must keep full startup gating"
+        );
+        assert_eq!(
+            format_agent_fast_start_message(1, 4),
+            "agent: established 1/4 exec transport(s); warming 3 remaining exec transport(s) in background"
+        );
+        assert_eq!(
+            format_agent_fast_start_message(1, 1),
+            "agent: established 1/1 exec transport(s)"
+        );
+    }
+
+    #[test]
     fn agent_established_message_reports_degraded_lane_pool() {
         assert_eq!(
             format_agent_established_message(3, 4),
@@ -10609,6 +10698,76 @@ mod tests {
         );
 
         drop(transports);
+        for agent in [first_agent, second_agent, third_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_agent_startup_returns_after_primary_and_warms_extra_lanes() {
+        let (first_transport, first_agent) = test_agent_transport().await;
+        let (second_transport, second_agent) = test_agent_transport().await;
+        let (third_transport, third_agent) = test_agent_transport().await;
+        let connector = QueuedAgentConnector::new(
+            "rustle agent",
+            vec![AgentBridgeTransport {
+                carrier: AgentBridgeCarrier::Detached,
+                transport: first_transport,
+                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
+            }],
+            vec![
+                AgentBridgeTransport {
+                    carrier: AgentBridgeCarrier::Detached,
+                    transport: second_transport,
+                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
+                },
+                AgentBridgeTransport {
+                    carrier: AgentBridgeCarrier::Detached,
+                    transport: third_transport,
+                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
+                },
+            ],
+        );
+
+        let transports = connect_auto_agent_bridge_transports_from_connector(connector.as_ref(), 3)
+            .await
+            .expect("auto startup connects primary lane");
+        assert_eq!(transports.len(), 1);
+        assert!(
+            connector.command_requests().is_empty(),
+            "auto startup must not wait for extra lane commands before returning"
+        );
+
+        let bridge =
+            ReconnectingAgentBridge::new_with_desired_lanes(connector.clone(), transports, 3);
+        wait_for_reconnect_snapshot(
+            &bridge,
+            AgentReconnectSnapshot {
+                attempts: 2,
+                successes: 2,
+                failures: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            connector.command_requests(),
+            vec![
+                "/tmp/rustle-uploaded agent".to_owned(),
+                "/tmp/rustle-uploaded agent".to_owned(),
+            ]
+        );
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(snapshot.lanes_total, 3);
+        assert_eq!(snapshot.lanes_desired, 3);
+        assert_eq!(snapshot.lanes_available, 3);
+        assert_eq!(snapshot.lanes_missing, 0);
+        assert_eq!(snapshot.lanes_repairing, 0);
+
+        drop(bridge);
         for agent in [first_agent, second_agent, third_agent] {
             tokio::time::timeout(std::time::Duration::from_secs(1), agent)
                 .await

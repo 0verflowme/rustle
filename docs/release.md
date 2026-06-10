@@ -129,6 +129,9 @@ Required before tagging a release:
 - `agent_bridge_repairs_missing_startup_lane_in_background` passes, proving a
   desired lane that is still missing after startup remains repairable and can be
   filled after the bridge is already running.
+- `auto_agent_startup_returns_after_primary_and_warms_extra_lanes` passes,
+  proving the compact default auto-lane path starts after the primary agent lane
+  and warms remaining recommended lanes through background repair.
 - `background_repair_retries_missing_lane_after_quarantine` passes, proving
   background repair retries a missing desired lane after bounded quarantine
   backoff without waiting for later user traffic to select that lane.

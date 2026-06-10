@@ -71,6 +71,12 @@ This benchmark is useful for bridge regressions because it exercises:
 - one-lane versus multi-lane framed agent behavior with
   `RUSTLE_BENCH_AGENT_SESSIONS`
 
+`bridge-lab` disables the compact tunnel's auto-lane fast-start optimization and
+waits for the requested or recommended agent lane pool before starting synthetic
+clients. That keeps this benchmark focused on steady-state bridge throughput;
+the real tunnel path still starts after the primary auto-selected agent lane and
+warms remaining lanes in background to reduce first-request latency.
+
 It does not exercise host route injection, TUN driver behavior, DNS takeover, or
 generic UDP datagram behavior.
 
@@ -349,11 +355,16 @@ Performance work must preserve these invariants:
 - agent streams can be hashed across multiple SSH exec lanes; lane count is
   auto-selected as capped `ceil(sqrt(local CPU parallelism))` by default and
   remains a hidden/internal tuning knob so the public command stays compact
+- the compact auto-lane path starts after the primary agent lane and warms the
+  remaining recommended lanes in background, while explicit `--agent-sessions`
+  requests keep the full initial startup gate
+- rootless `bridge-lab` keeps full lane warmup for steady-state throughput and
+  stress evidence instead of timing the compact tunnel fast-start path
 - each agent exec lane must be a fresh SSH connection with one exec channel, not
   another exec channel multiplexed over the same SSH carrier, so lane
   parallelism can reduce SSH TCP head-of-line blocking
-- initial extra agent lanes must start in bounded batches and preserve every
-  successful lane even if another extra lane fails
+- explicit initial extra agent lanes must start in bounded batches and preserve
+  every successful lane even if another extra lane fails
 - missing startup lanes must get one bounded retry before a degraded agent pool
   is accepted, and missing desired lane slots must remain repairable afterward
 - startup logs must report `established/desired` agent exec transports so

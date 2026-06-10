@@ -84,8 +84,12 @@ Rustle keeps three transport choices, but only one is the normal path:
   Rustle chooses `ceil(sqrt(local CPU parallelism))`, capped to four exec
   transports. That default keeps the compact path restrained on small hosts
   while giving larger machines more parallel SSH exec capacity without exposing
-  a public tuning knob. Larger lane counts remain available through the hidden
-  `--agent-sessions` override for unusual high-latency or high-bandwidth links.
+  a public tuning knob. The compact auto-lane path starts after the primary
+  agent lane is established, then warms the remaining recommended lanes in
+  background so first-request latency does not wait for every extra SSH exec
+  transport. Larger lane counts remain available through the hidden
+  `--agent-sessions` override for unusual high-latency or high-bandwidth links;
+  explicit lane counts keep the full initial startup gate.
   Stream assignment uses a deterministic two-candidate choice: the primary hash
   keeps flow spread stable, but a healthier, less-loaded secondary lane can take
   new opens during bursts.
@@ -352,10 +356,13 @@ failure, timeout, or route/device shutdown.
 - Agent bootstrap is staged once for initial multi-lane startup. A missing
   remote `rustle agent` command does not cause one local-binary upload per lane;
   lanes coordinate cleanup through per-lane markers beside the staged helper.
-  Additional initial lanes open in bounded batches, and one failed extra lane
-  must not prevent other successful extra lanes from entering the pool. Missing
-  lanes get one bounded retry before Rustle accepts a degraded startup pool, and
-  those missing desired slots remain repairable in the background.
+  Additional explicit initial lanes open in bounded batches, and one failed
+  extra lane must not prevent other successful extra lanes from entering the
+  pool. Missing lanes get one bounded retry before Rustle accepts a degraded
+  startup pool, and those missing desired slots remain repairable in the
+  background. For the compact default auto-lane path, only the primary lane is
+  required before the tunnel can start; remaining recommended lanes use the same
+  background repair path as missing startup lanes.
   POSIX remotes use a shell upload/execution wrapper, while Windows remotes use
   PowerShell for platform probing, binary upload, execution, and cleanup.
   `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` executes
