@@ -261,6 +261,7 @@ downloaded bytes.
 ```sh
 RUSTLE_FIXTURE_REMOTE=alice@ssh.example.com \
 RUSTLE_FIXTURE_HOST=192.168.190.45 \
+RUSTLE_AGENT_DIR="$HOME/.cache/rustle/agents" \
 RUSTLE_BENCH_REQUESTS=8 \
 RUSTLE_BENCH_CONCURRENCY=4 \
 RUSTLE_BENCH_RUSTLE_TRANSPORTS=agent \
@@ -279,6 +280,12 @@ code is compatible with Python 2.7 and Python 3; set
 `python3`. Fixture runs set `RUSTLE_BENCH_READY_METHOD=HEAD` so sshuttle
 readiness probes verify reachability without downloading the full large
 response before the measured GET request.
+
+For agent-mode live benchmarks from a different local platform than the remote,
+prepare a sidecar store with `scripts/prepare-agent-sidecars.sh` and export
+`RUSTLE_AGENT_DIR` before running the smoke or benchmark. The live smoke and
+benchmark launchers preserve that variable through `sudo` so Rustle can upload
+the matching sidecar after route setup.
 
 For password-auth labs, the fixture SSH command can reuse
 `RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with

@@ -246,6 +246,9 @@ RUSTLE_LOG="${TMPDIR}/rustle-live.log"
 RESPONSE_DIR="${TMPDIR}/responses"
 mkdir -p "$RESPONSE_DIR"
 CMD_ENV=()
+if [[ -n "${RUSTLE_AGENT_DIR:-}" ]]; then
+  CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")
+fi
 
 write_password_file() {
   local password_value="$1"

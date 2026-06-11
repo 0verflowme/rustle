@@ -371,6 +371,8 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "scripts/verify-windows-tun-smoke.py",
     "fallback route cleanup",
     "replacement for this elevated native run",
+    "preserve `RUSTLE_AGENT_DIR` through",
+    "sidecar store that automatic upload bootstrap uses",
     "Uploaded-agent temp staging checks",
     "remote_agent_upload_commands_stage_in_private_temp_dirs",
     "posix_remote_agent_upload_command_creates_private_executable_file",
@@ -476,6 +478,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "--password-file",
     "smoke_resolve_rustle_bench_bin",
     '"${#cmd_env[@]}" -gt 0',
+    'cmd_env+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
     "RUSTLE_BENCH_READY_METHOD",
     "probe_args+=(--head)",
 ]
@@ -599,6 +602,7 @@ REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS = [
 REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "smoke_wait_for_rustle_target_route_logs",
     "--password-file",
+    'CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
 ]
 
 REQUIRED_SMOKE_LIB_SNIPPETS = [
@@ -681,6 +685,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "same SSH server, target URL, request",
     "bench-live-fixture.sh",
     "1 MiB / 10 MiB / 100 MiB",
+    'RUSTLE_AGENT_DIR="$HOME/.cache/rustle/agents"',
+    "preserve that variable through `sudo`",
     "split default routes",
     "intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",

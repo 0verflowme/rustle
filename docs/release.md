@@ -48,6 +48,9 @@ set for diagnostics, and creates both exact-triple aliases and short platform
 aliases such as `rustle-agent-linux-x86_64`, `rustle-agent-macos-aarch64`, and
 `rustle-agent-windows-x86_64.exe`. Linux platform aliases preserve the static
 musl sidecar preference when both musl and GNU archives are available.
+The live smoke and benchmark launchers preserve `RUSTLE_AGENT_DIR` through
+their privileged `sudo` wrapper so agent-mode release proof can use the same
+sidecar store that automatic upload bootstrap uses in production.
 
 ## Platform Contract
 

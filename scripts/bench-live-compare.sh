@@ -336,6 +336,9 @@ start_rustle() {
   local cmd_env=()
   local cmd=("$RUSTLE_BIN_RESOLVED" -r "$REMOTE")
 
+  if [[ -n "${RUSTLE_AGENT_DIR:-}" ]]; then
+    cmd_env+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")
+  fi
   if [[ -n "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}" ]]; then
     cmd+=(-i "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}")
   fi
