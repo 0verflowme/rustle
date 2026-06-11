@@ -2536,15 +2536,7 @@ async fn run_tunnel_loop(
                             &mut stats,
                         );
                     } else {
-                        eprintln!(
-                            "udp: dropping datagram {}:{} -> {}:{} because direct-tcpip transport does not support generic UDP",
-                            request.src_ip,
-                            request.src_port,
-                            request.dst_ip,
-                            request.dst_port,
-                        );
-                        stats.udp_dropped = stats.udp_dropped.saturating_add(1);
-                        stats.record_udp_response(false);
+                        drop_unsupported_direct_udp(&request, &mut stats);
                     }
                     continue;
                 }
@@ -3425,6 +3417,15 @@ fn admit_udp_datagram(
             stats.record_udp_response(false);
         }
     }
+}
+
+fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
+    eprintln!(
+        "udp: dropping datagram {}:{} -> {}:{} because direct-tcpip transport does not support generic UDP",
+        request.src_ip, request.src_port, request.dst_ip, request.dst_port,
+    );
+    stats.udp_dropped = stats.udp_dropped.saturating_add(1);
+    stats.record_udp_response(false);
 }
 
 fn spawn_udp_association(
@@ -7904,6 +7905,25 @@ mod tests {
             .expect("agent exits")
             .expect("agent join")
             .expect("agent run");
+    }
+
+    #[test]
+    fn direct_tcpip_generic_udp_drop_is_counted_without_admission() {
+        let mut stats = TunnelStats::new();
+        let request = dns::UdpPacket {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+            payload: Bytes::from_static(b"generic-udp"),
+        };
+
+        drop_unsupported_direct_udp(&request, &mut stats);
+
+        assert_eq!(stats.udp_forwarded, 0);
+        assert_eq!(stats.udp_dropped, 1);
+        assert_eq!(stats.udp_ok, 0);
+        assert_eq!(stats.udp_failed, 1);
     }
 
     #[test]

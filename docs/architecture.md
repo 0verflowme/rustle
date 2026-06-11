@@ -41,8 +41,9 @@ non-DNS IPv4/UDP packets before the TCP engine, keys them by source/destination
 tuple, and keeps a bounded agent `OpenUdp` association per active tuple.
 Datagrams move as `Data` frames, remote response datagrams are synthesized as
 reverse UDP packets back to the TUN device, and idle associations close
-deterministically. Direct fallback drops generic UDP explicitly and logs that
-the active transport does not support it.
+deterministically. Direct fallback drops generic UDP explicitly, accounts the
+drop without admitting UDP association state, and logs that the active transport
+does not support it.
 
 ## Transport Architecture
 
@@ -419,6 +420,9 @@ failure, timeout, or route/device shutdown.
   parsed request payload directly into the per-association agent queue, and the
   association reader moves `frame.payload` directly into the response event
   queue instead of copying either direction into a temporary `Vec<u8>`.
+  `udp_association_idle_timeout_emits_close_for_accounting` proves idle
+  associations emit the close event used to remove association state and release
+  the active UDP association budget.
 - DNS response events also carry remote resolver payloads as `Bytes`. Agent UDP
   DNS moves the agent `frame.payload` directly, and DNS-over-TCP paths slice the
   accumulated length-prefixed frame without copying the extracted response into
@@ -533,8 +537,10 @@ Current runtime progress:
   The loop admits each tuple into a bounded UDP association table, reuses one
   agent UDP stream for multiple datagrams on the same tuple, writes response
   datagrams as synthesized reverse UDP packets to the TUN device, and closes
-  idle associations. The direct-tcpip fallback path logs and drops generic UDP
-  because standard SSH direct forwarding is TCP only.
+  idle associations through the same close-event path that frees the association
+  table entry and active-association budget. The direct-tcpip fallback path logs
+  and drops generic UDP without admitting association state because standard SSH
+  direct forwarding is TCP only.
 - `--dns` configures the host resolver to use the virtual DNS IP on Linux and
   Windows. On macOS, `networksetup` creates service-scoped resolvers that do not
   reliably route virtual TUN DNS addresses through utun, so Rustle configures

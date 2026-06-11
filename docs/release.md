@@ -264,6 +264,9 @@ Required before tagging a release:
 - `udp_admission_moves_parsed_payload_bytes_into_association_queue` passes,
   proving generic UDP request admission moves the parsed `Bytes` payload into
   the per-association agent queue without copying it into another owned buffer.
+- `direct_tcpip_generic_udp_drop_is_counted_without_admission` passes, proving
+  direct-tcpip compatibility mode drops generic UDP intentionally and accounts
+  that drop without admitting UDP association state.
 - `udp_response_event_keeps_agent_payload_as_bytes` passes, proving generic UDP
   response events preserve the agent `Bytes` payload until TUN packet synthesis
   instead of copying every response into a temporary vector.

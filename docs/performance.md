@@ -379,6 +379,8 @@ Performance work must preserve these invariants:
 - generic UDP request payloads are parsed into `Bytes` once from the reusable
   TUN read buffer, then moved directly into the per-association agent queue
   without a second payload allocation
+- direct-tcpip compatibility mode drops generic UDP intentionally and accounts
+  the drop without admitting UDP association state
 - generic UDP response events keep agent `Data` frame payloads as `Bytes` until
   TUN packet synthesis instead of copying each response into a temporary
   `Vec<u8>`
