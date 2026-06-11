@@ -337,7 +337,9 @@ mode on the same machines:
   matching disabled, so active-stream reset and multi-lane pool recovery are
   proven without making the pool gate race post-completion log delivery
 - agent UDP unit tests pass, and `scripts/smoke-linux-netns-udp.sh` passes on a
-  privileged Linux host before generic UDP is treated as field-ready
+  privileged Linux host before generic UDP is treated as field-ready; that smoke
+  shortens `--udp-idle-timeout-ms`, waits for idle cleanup, and requires final
+  UDP stats to report zero active associations
 - intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`; only
   direct-tcpip compatibility and hostname DNS remotes use DNS-over-TCP
 - macOS system resolver takeover uses a bounded loopback DNS proxy because

@@ -52,10 +52,25 @@ SSH_PORT="${RUSTLE_NETNS_UDP_SSH_PORT:-2223}"
 TARGET_IP="${RUSTLE_NETNS_UDP_TARGET_IP:-10.77.1.5}"
 TARGET_CIDR="${RUSTLE_NETNS_UDP_TARGET_CIDR:-${TARGET_IP}/32}"
 UDP_PORT="${RUSTLE_NETNS_UDP_PORT:-18181}"
+UDP_IDLE_TIMEOUT_MS="${RUSTLE_NETNS_UDP_IDLE_TIMEOUT_MS:-500}"
+UDP_IDLE_GRACE_MS="${RUSTLE_NETNS_UDP_IDLE_GRACE_MS:-1500}"
 RUSTLE_PID=""
 RUSTLE_CHILD_PID_FILE="${TMPDIR}/rustle.pid"
 SSHD_PID=""
 UDP_PID=""
+
+case "$UDP_IDLE_TIMEOUT_MS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_NETNS_UDP_IDLE_TIMEOUT_MS must be a positive integer" ;;
+esac
+case "$UDP_IDLE_GRACE_MS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_NETNS_UDP_IDLE_GRACE_MS must be a positive integer" ;;
+esac
+if [[ "$UDP_IDLE_TIMEOUT_MS" -lt 1 ]]; then
+  smoke_die "RUSTLE_NETNS_UDP_IDLE_TIMEOUT_MS must be at least 1"
+fi
+if [[ "$UDP_IDLE_GRACE_MS" -le "$UDP_IDLE_TIMEOUT_MS" ]]; then
+  smoke_die "RUSTLE_NETNS_UDP_IDLE_GRACE_MS must be greater than RUSTLE_NETNS_UDP_IDLE_TIMEOUT_MS"
+fi
 
 route_snapshot() {
   if [[ "$TARGET_CIDR" == "0.0.0.0/0" ]]; then
@@ -255,6 +270,7 @@ CMD=(
   --known-hosts "$KNOWN_HOSTS"
   --bridge-transport agent
   --agent-command "${RUSTLE_NETNS_UDP_AGENT_COMMAND:-'${RUSTLE_BIN_RESOLVED}' agent}"
+  --udp-idle-timeout-ms "$UDP_IDLE_TIMEOUT_MS"
   "$TARGET_CIDR"
 )
 
@@ -318,6 +334,14 @@ if ! smoke_wait_for_log "udp: forwarding datagram .* -> ${TARGET_IP}:${UDP_PORT}
   smoke_die "Rustle did not log generic UDP forwarding"
 fi
 
+smoke_info "waiting for UDP association idle cleanup"
+"$(smoke_python)" - "$UDP_IDLE_GRACE_MS" <<'PY'
+import sys
+import time
+
+time.sleep(int(sys.argv[1]) / 1000)
+PY
+
 stop_rustle
 
 FINAL_STATS="$(grep 'stats: final' "$RUSTLE_LOG" | tail -n 1 || true)"
@@ -342,7 +366,7 @@ smoke_require_stat_at_least "UDP forwarded" "$UDP_FORWARDED" 1 "$FINAL_STATS"
 smoke_require_stat_at_least "UDP successes" "$UDP_OK" 1 "$FINAL_STATS"
 smoke_require_stat_zero "UDP failures" "$UDP_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "UDP drops" "$UDP_DROPPED" "$FINAL_STATS"
-smoke_require_stat_number "UDP active associations" "$UDP_ACTIVE" "$FINAL_STATS"
+smoke_require_stat_zero "UDP active associations" "$UDP_ACTIVE" "$FINAL_STATS"
 smoke_require_stat_zero "bridge send failures" "$BRIDGE_SEND_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "remote backlog overflows" "$BACKLOG_OVERFLOWED" "$FINAL_STATS"
 

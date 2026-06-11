@@ -314,9 +314,11 @@ Required before tagging a release:
 - `scripts/smoke-linux-netns-udp.sh` passes on a privileged Linux host, proving
   full-path generic UDP behavior through the framed agent transport: route ->
   TUN -> agent `OpenUdp` association -> remote namespace UDP target ->
-  synthesized TUN return packet. Linux CI attempts this smoke when the runner
-  supports the required namespace and TUN operations; a skip is not release
-  evidence by itself.
+  synthesized TUN return packet. The smoke uses a bounded
+  `--udp-idle-timeout-ms` override and requires final `udp=... active:0` stats,
+  proving idle association cleanup does not leak UDP state. Linux CI attempts
+  this smoke when the runner supports the required namespace and TUN operations;
+  a skip is not release evidence by itself.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. This proves Windows TUN
   creation, route add/delete, packet capture, and clean route restoration

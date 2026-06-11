@@ -49,7 +49,10 @@ const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
-const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS: u64 = 60_000;
+#[cfg(test)]
+const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
 const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
 const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;
 const MAX_IN_FLIGHT_DNS_QUERIES: usize = 128;
@@ -241,6 +244,14 @@ struct CompactTunnelArgs {
     /// Remote executable path to quote before appending the `agent` subcommand.
     #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
     agent_path: Option<String>,
+
+    /// Hidden lab override for generic UDP association idle cleanup.
+    #[arg(
+        long = "udp-idle-timeout-ms",
+        default_value_t = DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
+        hide = true
+    )]
+    udp_idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -341,6 +352,14 @@ struct TunnelArgs {
     /// Remote executable path to quote before appending the `agent` subcommand.
     #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
     agent_path: Option<String>,
+
+    /// Hidden lab override for generic UDP association idle cleanup.
+    #[arg(
+        long = "udp-idle-timeout-ms",
+        default_value_t = DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
+        hide = true
+    )]
+    udp_idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -1714,6 +1733,7 @@ async fn run_compact_tunnel(args: CompactTunnelArgs) -> Result<()> {
         bridge_transport: args.bridge_transport,
         agent_command: args.agent_command,
         agent_path: args.agent_path,
+        udp_idle_timeout_ms: args.udp_idle_timeout_ms,
     })
     .await
 }
@@ -1833,8 +1853,15 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     )
     .context("failed to initialize userspace TCP flow manager")?;
 
-    let result =
-        run_tunnel_loop(dev, flow_manager, bridge_runtime, dns_transport, dns_remote).await;
+    let result = run_tunnel_loop(
+        dev,
+        flow_manager,
+        bridge_runtime,
+        dns_transport,
+        dns_remote,
+        Duration::from_millis(args.udp_idle_timeout_ms),
+    )
+    .await;
     drop(dns_guard);
     drop(local_dns_proxy);
     drop(routes);
@@ -2316,6 +2343,9 @@ fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
     ) {
         validate_agent_session_request_count(args.agent_sessions)?;
     }
+    if args.udp_idle_timeout_ms == 0 {
+        bail!("udp-idle-timeout-ms must be at least 1");
+    }
     platform::preflight_route_management().context("route preflight failed")?;
     if args.tun_prefix > 32 {
         bail!("tun-prefix must be <= 32");
@@ -2435,6 +2465,7 @@ async fn run_tunnel_loop(
     bridge_runtime: BridgeRuntime,
     dns_transport: DnsTransport,
     dns_remote: Destination,
+    udp_association_idle_timeout: Duration,
 ) -> Result<()> {
     let mut buf = vec![0_u8; PACKET_BUF_SIZE];
     let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
@@ -2533,6 +2564,7 @@ async fn run_tunnel_loop(
                             &mut udp_associations,
                             &mut udp_inflight,
                             udp_events.clone(),
+                            udp_association_idle_timeout,
                             &mut stats,
                         );
                     } else {
@@ -3368,6 +3400,7 @@ fn admit_udp_datagram(
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     events: UdpAssociationEvents,
+    idle_timeout: Duration,
     stats: &mut TunnelStats,
 ) {
     let key = UdpFlowKey::from_packet(&request);
@@ -3385,7 +3418,13 @@ fn admit_udp_datagram(
             }
 
             let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
-            spawn_udp_association(agent, key, from_local, events.clone());
+            spawn_udp_association_with_idle_timeout(
+                agent,
+                key,
+                from_local,
+                events.clone(),
+                idle_timeout,
+            );
             entry.insert(UdpAssociation { to_remote })
         }
     };
@@ -3426,21 +3465,6 @@ fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats
     );
     stats.udp_dropped = stats.udp_dropped.saturating_add(1);
     stats.record_udp_response(false);
-}
-
-fn spawn_udp_association(
-    agent: ReconnectingAgentBridge,
-    key: UdpFlowKey,
-    from_local: mpsc::Receiver<Bytes>,
-    events: UdpAssociationEvents,
-) {
-    spawn_udp_association_with_idle_timeout(
-        agent,
-        key,
-        from_local,
-        events,
-        UDP_ASSOCIATION_IDLE_TIMEOUT,
-    );
 }
 
 fn spawn_udp_association_with_idle_timeout(
@@ -7889,6 +7913,7 @@ mod tests {
                 response_tx,
                 close_tx,
             },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
             &mut stats,
         );
 
@@ -9745,6 +9770,8 @@ mod tests {
             "1200",
             "--name",
             "rustle-test0",
+            "--udp-idle-timeout-ms",
+            "500",
             "10.0.0.0/8",
         ])
         .expect("compact CLI with hidden TUN overrides");
@@ -9754,6 +9781,7 @@ mod tests {
         assert_eq!(cli.compact.tun_prefix, 30);
         assert_eq!(cli.compact.mtu, 1200);
         assert_eq!(cli.compact.name.as_deref(), Some("rustle-test0"));
+        assert_eq!(cli.compact.udp_idle_timeout_ms, 500);
         assert_eq!(
             cli.compact.targets,
             vec!["10.0.0.0/8".parse::<Ipv4Net>().unwrap()]
@@ -9960,6 +9988,7 @@ mod tests {
         assert!(!help.contains("--tun-prefix"));
         assert!(!help.contains("--mtu"));
         assert!(!help.contains("--name"));
+        assert!(!help.contains("--udp-idle-timeout-ms"));
         assert!(!help.contains("--ssh-sessions"));
         assert!(!help.contains("--agent-sessions"));
         assert!(!help.contains("--bridge-transport"));
@@ -9985,6 +10014,8 @@ mod tests {
             "172.16.0.0/12",
             "--mtu",
             "1200",
+            "--udp-idle-timeout-ms",
+            "250",
         ])
         .expect("tunnel CLI with multiple targets");
 
@@ -9999,7 +10030,29 @@ mod tests {
             ]
         );
         assert_eq!(args.mtu, 1200);
+        assert_eq!(args.udp_idle_timeout_ms, 250);
         assert_eq!(args.bridge_transport, BridgeTransportKind::Agent);
+    }
+
+    #[test]
+    fn tunnel_subcommand_rejects_zero_udp_idle_timeout() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--udp-idle-timeout-ms",
+            "0",
+        ])
+        .expect("tunnel CLI with zero UDP idle timeout");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        let err = validate_tunnel_args(&args).expect_err("zero UDP timeout must be rejected");
+        assert!(err.to_string().contains("udp-idle-timeout-ms"));
     }
 
     #[test]

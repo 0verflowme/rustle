@@ -619,5 +619,6 @@ Before a release build is considered shippable:
 - The Linux network-namespace UDP smoke must pass for agent transport, proving
   generic UDP routing through host route injection, TUN, the framed agent
   `OpenUdp` association path, a remote UDP socket, synthesized return packet
-  delivery, final UDP stats, and route cleanup.
+  delivery, final UDP stats, cleanup to zero active UDP associations after the
+  idle timeout, and route cleanup.
 - No smoke may leave routes, Rustle processes, or DNS settings behind.

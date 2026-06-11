@@ -25,6 +25,7 @@ AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
 VERIFY_LOCAL = REPO / "scripts" / "verify-local.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
 TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
+NETNS_UDP_SMOKE = REPO / "scripts" / "smoke-linux-netns-udp.sh"
 AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
 AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 
@@ -262,6 +263,8 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "events.try_send_response(key, frame.payload)",
     "udp_response_event_keeps_agent_payload_as_bytes",
     "spawn_udp_association_with_idle_timeout",
+    "DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS",
+    "udp_idle_timeout_ms",
     "udp_association_idle_timeout_emits_close_for_accounting",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
 ]
@@ -436,6 +439,7 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
     "snapshots resolver settings",
     "resolves through the system resolver",
     "requires exact resolver restoration",
+    "zero active UDP associations",
     "`--accept-new-host-key` for OpenSSH-style trust-on-first-use",
     "Accept-new mode",
     "records unknown hosts without accepting changed keys",
@@ -611,6 +615,14 @@ REQUIRED_TUN_DNS_SMOKE_SNIPPETS = [
     "networksetup -getdnsservers",
 ]
 
+REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
+    "RUSTLE_NETNS_UDP_IDLE_TIMEOUT_MS",
+    "RUSTLE_NETNS_UDP_IDLE_GRACE_MS",
+    "--udp-idle-timeout-ms",
+    "waiting for UDP association idle cleanup",
+    'smoke_require_stat_zero "UDP active associations"',
+]
+
 REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
     "cargo build --release",
@@ -633,6 +645,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_VERIFY_DNS_TAKEOVER=1",
     "DNS resolver takeover, normal system resolver delivery through Rustle",
     "global `scutil --dns` resolver",
+    "--udp-idle-timeout-ms",
+    "zero active associations",
     "RUSTLE_VERIFY_LIVE_FIXTURE=1",
     "captures the nested benchmark TSV output",
     "body_bytes * success",
@@ -742,6 +756,7 @@ def main() -> None:
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
+    netns_udp_smoke = NETNS_UDP_SMOKE.read_text(encoding="utf-8")
     agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
     agent_sidecar_smoke = AGENT_SIDECAR_SMOKE.read_text(encoding="utf-8")
 
@@ -879,6 +894,17 @@ def main() -> None:
         fail(
             "scripts/smoke-tun-dns.sh is missing required snippets: "
             f"{missing_tun_dns_smoke!r}"
+        )
+
+    missing_netns_udp_smoke = [
+        snippet
+        for snippet in REQUIRED_NETNS_UDP_SMOKE_SNIPPETS
+        if snippet not in netns_udp_smoke
+    ]
+    if missing_netns_udp_smoke:
+        fail(
+            "scripts/smoke-linux-netns-udp.sh is missing required snippets: "
+            f"{missing_netns_udp_smoke!r}"
         )
 
     missing_agent_sidecars = [
