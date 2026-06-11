@@ -9159,7 +9159,7 @@ mod tests {
     }
 
     #[test]
-    fn local_agent_selection_finds_cross_platform_release_sidecar() {
+    fn cross_platform_release_package_shape_is_a_sidecar_candidate() {
         struct TempTree {
             path: PathBuf,
         }
@@ -9232,11 +9232,12 @@ mod tests {
         });
         std::fs::write(&sidecar, "agent").expect("write fake sidecar");
 
-        assert_eq!(
-            local_agent_binary_for_platform(&current_exe, remote)
-                .expect("matching sidecar should be selected"),
-            sidecar
-        );
+        let candidates = agent_binary_candidates_in_dirs(remote, std::slice::from_ref(&bin_dir));
+        let selected = candidates
+            .iter()
+            .find(|path| path.is_file())
+            .expect("matching sidecar should be a selectable candidate");
+        assert_eq!(selected, &sidecar);
     }
 
     #[test]

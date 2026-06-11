@@ -351,11 +351,13 @@ smoke_start_http_server() {
 import socket
 import sys
 import os
+import threading
 
 port = int(sys.argv[1])
 ready = sys.argv[2]
 marker = b"rustle-smoke-ok\n"
 body_size = int(os.environ.get("RUSTLE_SMOKE_HTTP_BODY_BYTES", str(len(marker))))
+listen_backlog = int(os.environ.get("RUSTLE_SMOKE_HTTP_BACKLOG", "1024"))
 body = marker
 if body_size > len(marker):
     body += b"x" * (body_size - len(marker))
@@ -368,27 +370,31 @@ response = (
     + body
 )
 
+def handle_connection(conn):
+    with conn:
+        conn.settimeout(5)
+        data = b""
+        try:
+            while b"\r\n\r\n" not in data and len(data) < 65536:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            conn.sendall(response)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
+
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", port))
-    sock.listen(50)
+    sock.listen(listen_backlog)
     with open(ready, "w", encoding="utf-8") as handle:
         handle.write(str(port))
 
     while True:
         conn, _ = sock.accept()
-        with conn:
-            conn.settimeout(2)
-            data = b""
-            try:
-                while b"\r\n\r\n" not in data and len(data) < 65536:
-                    chunk = conn.recv(4096)
-                    if not chunk:
-                        break
-                    data += chunk
-            except socket.timeout:
-                pass
-            conn.sendall(response)
+        thread = threading.Thread(target=handle_connection, args=(conn,), daemon=True)
+        thread.start()
 PY
   SMOKE_HTTP_PID=$!
 

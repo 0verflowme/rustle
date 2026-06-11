@@ -17,6 +17,7 @@ RELEASE_NOTES = REPO / "docs" / "release.md"
 ARCHITECTURE_NOTES = REPO / "docs" / "architecture.md"
 PERFORMANCE_NOTES = REPO / "docs" / "performance.md"
 LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
+LIVE_UDP_SMOKE = REPO / "scripts" / "smoke-live-udp.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
@@ -365,6 +366,8 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "direct_tcpip_generic_udp_drop_is_counted_without_admission",
     "udp_association_idle_timeout_emits_close_for_accounting",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
+    "scripts/smoke-live-udp.sh",
+    "real remote `sshd` and UDP",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",
     "resolver takeover points the OS at the Rustle virtual DNS",
     "normal system resolver lookup succeeds",
@@ -563,6 +566,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        'RUN_LIVE_UDP="${RUSTLE_VERIFY_LIVE_UDP:-0}"',
+    ),
+    (
+        VERIFY_LOCAL,
         "cargo build --locked --release",
     ),
     (
@@ -576,6 +583,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         "verify-live-fixture-rows.py",
+    ),
+    (
+        VERIFY_LOCAL,
+        "smoke-live-udp.sh",
     ),
     (
         VERIFY_LOCAL,
@@ -636,6 +647,24 @@ REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "smoke_wait_for_rustle_target_route_logs",
     "--password-file",
     'CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
+]
+
+REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
+    "RUSTLE_LIVE_UDP_HOST",
+    "RUSTLE_LIVE_UDP_MESSAGES",
+    "RUSTLE_LIVE_UDP_IDLE_TIMEOUT_MS",
+    "RUSTLE_LIVE_UDP_IDLE_GRACE_MS",
+    "--udp-idle-timeout-ms",
+    "rustle-live-udp-pong:",
+    "smoke_wait_for_rustle_target_route_logs",
+    'CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
+    "--password-file",
+    "udp: forwarding datagram .* -> ${FIXTURE_HOST}:${ACTUAL_PORT} over agent",
+    "waiting for UDP association idle cleanup",
+    'smoke_require_stat_at_least "UDP forwarded"',
+    'smoke_require_stat_at_least "UDP successes"',
+    'smoke_require_stat_zero "UDP active associations"',
+    "live UDP target route table did not return to its original state",
 ]
 
 REQUIRED_SMOKE_LIB_SNIPPETS = [
@@ -735,6 +764,9 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "--udp-idle-timeout-ms",
     "zero active associations",
     "RUSTLE_VERIFY_LIVE_FIXTURE=1",
+    "RUSTLE_VERIFY_LIVE_UDP=1",
+    "scripts/smoke-live-udp.sh",
+    "generic UDP live fixture",
     "captures the nested benchmark TSV output",
     "body_bytes * success",
     "compact command already defaults to the framed agent transport",
@@ -838,6 +870,7 @@ def main() -> None:
     architecture_notes = ARCHITECTURE_NOTES.read_text(encoding="utf-8")
     performance_notes = PERFORMANCE_NOTES.read_text(encoding="utf-8")
     live_smoke = LIVE_SMOKE.read_text(encoding="utf-8")
+    live_udp_smoke = LIVE_UDP_SMOKE.read_text(encoding="utf-8")
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
@@ -966,6 +999,17 @@ def main() -> None:
         fail(
             "scripts/smoke-live-tunnel.sh is missing required snippets: "
             f"{missing_live_smoke!r}"
+        )
+
+    missing_live_udp_smoke = [
+        snippet
+        for snippet in REQUIRED_LIVE_UDP_SMOKE_SNIPPETS
+        if snippet not in live_udp_smoke
+    ]
+    if missing_live_udp_smoke:
+        fail(
+            "scripts/smoke-live-udp.sh is missing required snippets: "
+            f"{missing_live_udp_smoke!r}"
         )
 
     missing_smoke_lib = [

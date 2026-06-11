@@ -342,6 +342,11 @@ Required before tagging a release:
   proving idle association cleanup does not leak UDP state. Linux CI attempts
   this smoke when the runner supports the required namespace and TUN operations;
   a skip is not release evidence by itself.
+- `scripts/smoke-live-udp.sh` passes against a real remote `sshd` and UDP
+  fixture, proving live generic UDP behavior through the framed agent transport:
+  route -> TUN -> agent `OpenUdp` association -> remote UDP socket ->
+  synthesized TUN response, with final `udp=... active:0` stats and route
+  cleanup.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. This proves Windows TUN
   creation, route add/delete, packet capture, and clean route restoration

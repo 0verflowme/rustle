@@ -12,6 +12,7 @@ RUN_BENCH="${RUSTLE_VERIFY_BENCH:-1}"
 RUN_STRESS="${RUSTLE_VERIFY_STRESS:-1}"
 RUN_LIVE="${RUSTLE_VERIFY_LIVE:-0}"
 RUN_LIVE_FIXTURE="${RUSTLE_VERIFY_LIVE_FIXTURE:-0}"
+RUN_LIVE_UDP="${RUSTLE_VERIFY_LIVE_UDP:-0}"
 LIVE_TRANSPORTS="${RUSTLE_VERIFY_LIVE_TRANSPORTS:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-agent direct-tcpip}}"
 
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
@@ -19,7 +20,7 @@ export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 passes=0
 skips=0
 
-for bool_flag in RUN_DNS_TAKEOVER RUN_LIVE_FIXTURE; do
+for bool_flag in RUN_DNS_TAKEOVER RUN_LIVE_FIXTURE RUN_LIVE_UDP; do
   case "${!bool_flag}" in
     0 | 1) ;;
     *) smoke_die "${bool_flag/RUN_/RUSTLE_VERIFY_} must be 0 or 1" ;;
@@ -198,6 +199,13 @@ if [[ "$RUN_LIVE" == "1" ]]; then
 else
   skips=$((skips + 1))
   verify_info "live remote/sshuttle comparison skipped; set RUSTLE_VERIFY_LIVE=1 with RUSTLE_LIVE_* and RUSTLE_BENCH_* env"
+fi
+
+if [[ "$RUN_LIVE_UDP" == "1" ]]; then
+  verify_run "${SCRIPT_DIR}/smoke-live-udp.sh"
+else
+  skips=$((skips + 1))
+  verify_info "live generic UDP smoke skipped; set RUSTLE_VERIFY_LIVE_UDP=1 with RUSTLE_LIVE_UDP_* env"
 fi
 
 verify_info "local verification completed: passed=${passes} skipped=${skips}"

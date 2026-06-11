@@ -134,7 +134,9 @@ This benchmark is useful for framed-agent regressions because it exercises:
 - byte-credit flow control without involving host routes or TUN driver behavior
 
 It does not exercise the full TUN UDP path. Use
-`scripts/smoke-linux-netns-udp.sh` on a privileged Linux host for that proof.
+`scripts/smoke-linux-netns-udp.sh` on a privileged Linux host for hermetic
+network-namespace proof, and use `scripts/smoke-live-udp.sh` against a real SSH
+host for live generic UDP-over-TUN proof.
 
 ## Full Tunnel Benchmark
 
@@ -317,6 +319,10 @@ the same run. Live smoke runs `agent` first and `direct-tcpip` second by
 default before the benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the
 smoke matrix when debugging one transport. Add `RUSTLE_VERIFY_LIVE_FIXTURE=1`
 to include the controlled large-response fixture in the live verifier run.
+Set `RUSTLE_VERIFY_LIVE_UDP=1` to include the generic UDP live fixture; it
+starts a remote UDP responder over SSH, sends multiple datagrams through the
+TUN route with agent `OpenUdp`, waits for idle cleanup, and requires final
+`udp=... active:0` stats.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 
@@ -353,6 +359,9 @@ mode on the same machines:
   privileged Linux host before generic UDP is treated as field-ready; that smoke
   shortens `--udp-idle-timeout-ms`, waits for idle cleanup, and requires final
   UDP stats to report zero active associations
+- `scripts/smoke-live-udp.sh` passes against a real remote `sshd` and UDP
+  fixture, proving generic UDP datagrams traverse route -> TUN -> agent
+  `OpenUdp` -> remote UDP socket -> synthesized return packet without leaks
 - intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`; only
   direct-tcpip compatibility and hostname DNS remotes use DNS-over-TCP
 - macOS system resolver takeover uses a bounded loopback DNS proxy because
