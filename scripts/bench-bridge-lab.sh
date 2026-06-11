@@ -22,6 +22,7 @@ TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORTS:-agent direct-tcpip}"
 MIN_AGENT_DIRECT_RATIO="${RUSTLE_BENCH_MIN_AGENT_DIRECT_RATIO:-}"
 RATIO_MIN_CONNECTIONS="${RUSTLE_BENCH_RATIO_MIN_CONNECTIONS:-1}"
 MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S:-}"
+MAX_ELAPSED_MS="${RUSTLE_BENCH_MAX_ELAPSED_MS:-}"
 RESULTS_TSV="${TMPDIR}/bridge-results.tsv"
 
 case "$RUNS" in
@@ -56,6 +57,14 @@ except ValueError as exc:
 if threshold <= 0:
     raise SystemExit("RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S must be greater than 0")
 PY
+fi
+if [[ -n "$MAX_ELAPSED_MS" ]]; then
+  case "$MAX_ELAPSED_MS" in
+    '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_MAX_ELAPSED_MS must be a positive integer" ;;
+  esac
+  if [[ "$MAX_ELAPSED_MS" -lt 1 ]]; then
+    smoke_die "RUSTLE_BENCH_MAX_ELAPSED_MS must be at least 1"
+  fi
 fi
 
 smoke_start_sshd "$TMPDIR"
@@ -248,6 +257,40 @@ if failures:
     raise SystemExit(
         "bridge throughput below configured floor "
         f"{minimum:.2f}MiB/s:\n" + "\n".join(failures)
+    )
+PY
+fi
+
+if [[ -n "$MAX_ELAPSED_MS" ]]; then
+  "$(smoke_python)" - "$RESULTS_TSV" "$MAX_ELAPSED_MS" <<'PY'
+import sys
+
+path = sys.argv[1]
+maximum = int(sys.argv[2])
+
+failures = []
+rows = 0
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) != 7:
+            raise SystemExit(f"invalid benchmark row: {line!r}")
+        transport, body_bytes, connections, run, elapsed, _response, _throughput = parts
+        rows += 1
+        value = int(elapsed)
+        if value > maximum:
+            failures.append(
+                f"{transport} body={body_bytes} connections={connections} run={run} "
+                f"elapsed_ms={value}"
+            )
+
+if rows == 0:
+    raise SystemExit("elapsed ceiling was requested, but benchmark produced no measured rows")
+
+if failures:
+    raise SystemExit(
+        "bridge elapsed time above configured ceiling "
+        f"{maximum}ms:\n" + "\n".join(failures)
     )
 PY
 fi

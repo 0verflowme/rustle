@@ -348,6 +348,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "target/release/rustle",
     "RUSTLE_BENCH_PROFILE=debug",
     "used as throughput evidence",
+    "RUSTLE_BENCH_MAX_ELAPSED_MS=2000",
     "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5",
     "low-concurrency path",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
@@ -480,6 +481,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
         "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S",
     ),
     (
+        BRIDGE_BENCH,
+        "RUSTLE_BENCH_MAX_ELAPSED_MS",
+    ),
+    (
         AGENT_UDP_BENCH,
         "smoke_resolve_rustle_bench_bin",
     ),
@@ -502,6 +507,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         "cargo build --locked --release",
+    ),
+    (
+        VERIFY_LOCAL,
+        "RUSTLE_BENCH_MAX_ELAPSED_MS=2000",
     ),
     (
         VERIFY_LOCAL,
@@ -589,6 +598,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "cargo build --release",
     "target/release/rustle",
     "RUSTLE_BENCH_PROFILE=debug",
+    "RUSTLE_BENCH_MAX_ELAPSED_MS",
+    "tiny-response 1-flow latency gate",
     "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S",
     "1 MiB / 1-flow gate",
     "hard gate",

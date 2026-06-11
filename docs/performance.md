@@ -60,9 +60,11 @@ RUSTLE_BENCH_RATIO_MIN_CONNECTIONS=32 \
 scripts/bench-bridge-lab.sh
 ```
 
-Use `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a low-concurrency release-mode
-floor. `scripts/verify-local.sh` uses a conservative 1 MiB / 1-flow gate so a
-debug binary or serious serial data-path regression cannot masquerade as
+Use `RUSTLE_BENCH_MAX_ELAPSED_MS` for a low-concurrency elapsed-time ceiling
+and `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a release-mode throughput floor.
+`scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
+plus a 1 MiB / 1-flow gate so a debug binary, multi-second startup
+regression, or serious serial data-path regression cannot masquerade as
 performance evidence.
 
 Those checks are intentionally coarse guardrails, not release claims. They

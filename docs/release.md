@@ -257,10 +257,12 @@ Required before tagging a release:
   binaries. The benchmark scripts resolve `target/release/rustle` by default;
   `RUSTLE_BENCH_PROFILE=debug` is only for harness diagnosis and must not be
   used as throughput evidence.
-- `scripts/verify-local.sh` includes a release-mode 1 MiB / 1-flow bridge
-  benchmark with `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, proving the
-  low-concurrency path is not accidentally measured with a debug binary or
-  regressed into serial frame stalls.
+- `scripts/verify-local.sh` includes release-mode 1-flow bridge benchmarks:
+  a tiny-response gate with `RUSTLE_BENCH_MAX_ELAPSED_MS=2000` and a 1 MiB gate
+  with `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`. Together they prove the
+  low-concurrency path is not accidentally measured with a debug binary,
+  regressed into multi-second startup latency, or regressed into serial frame
+  stalls.
 - `udp_admission_moves_parsed_payload_bytes_into_association_queue` passes,
   proving generic UDP request admission moves the parsed `Bytes` payload into
   the per-association agent queue without copying it into another owned buffer.

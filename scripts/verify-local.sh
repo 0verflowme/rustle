@@ -140,6 +140,15 @@ if [[ "$RUN_BENCH" == "1" ]]; then
   verify_run env \
     RUSTLE_BENCH_RUNS=1 \
     RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_BODY_BYTES=1024 \
+    RUSTLE_BENCH_CONNECTIONS=1 \
+    RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip" \
+    RUSTLE_BENCH_MAX_ELAPSED_MS=2000 \
+    "${SCRIPT_DIR}/bench-bridge-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
     RUSTLE_BENCH_BODY_BYTES=1048576 \
     RUSTLE_BENCH_CONNECTIONS=1 \
     RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip" \
