@@ -179,6 +179,9 @@ Required before tagging a release:
 - Embedded Wintun extraction remains content-addressed by target architecture
   and DLL SHA-256, and identical already-materialized DLLs are reused without a
   rewrite.
+- `scripts/verify-windows-tun-smoke.py` passes, proving the Windows TUN smoke
+  still checks administrator mode, /32 target validation, route add/delete logs,
+  packet capture, fallback route cleanup, and final route-table restoration.
 - `scripts/smoke-bridge-lab.sh` passes on at least one Unix host with `sshd`.
 - `scripts/smoke-agent-lab.sh` passes on at least one Unix host with `sshd`.
 - `scripts/smoke-agent-bridge-lab.sh` passes on at least one Unix host with
@@ -322,7 +325,9 @@ Required before tagging a release:
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. This proves Windows TUN
   creation, route add/delete, packet capture, and clean route restoration
-  without requiring a remote SSH server.
+  without requiring a remote SSH server. The static verifier above is not a
+  replacement for this elevated native run; it keeps the smoke script's required
+  assertions from drifting between Windows proof runs.
 - `scripts/smoke-live-tunnel.sh` passes against a real remote `sshd` and target
   URL supplied through the `RUSTLE_LIVE_*` environment variables. Release
   candidates should run it with `RUSTLE_LIVE_REQUESTS > 1` and

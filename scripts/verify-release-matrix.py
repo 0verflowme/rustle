@@ -26,6 +26,7 @@ VERIFY_LOCAL = REPO / "scripts" / "verify-local.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
 TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
 NETNS_UDP_SMOKE = REPO / "scripts" / "smoke-linux-netns-udp.sh"
+WINDOWS_TUN_SMOKE_VERIFIER = REPO / "scripts" / "verify-windows-tun-smoke.py"
 AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
 AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 
@@ -271,6 +272,7 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
 
 REQUIRED_CI_SNIPPETS = [
     "python3 scripts/verify-release-matrix.py",
+    "python3 scripts/verify-windows-tun-smoke.py",
     "cargo fmt --check",
     "cargo test",
     "cargo clippy --all-targets -- -D warnings",
@@ -366,6 +368,9 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "content-addressed path under the user",
     "DLL SHA-256",
     "identical already-materialized DLLs are reused",
+    "scripts/verify-windows-tun-smoke.py",
+    "fallback route cleanup",
+    "replacement for this elevated native run",
     "Uploaded-agent temp staging checks",
     "remote_agent_upload_commands_stage_in_private_temp_dirs",
     "posix_remote_agent_upload_command_creates_private_executable_file",
@@ -450,6 +455,9 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
     "Rustle removes the staged",
     "helper and refuses to execute it",
     "PowerShell `Get-FileHash`",
+    "scripts/verify-windows-tun-smoke.py",
+    "statically guards those required smoke",
+    "assertions on every local verifier run",
     "private Rustle-owned temporary directories",
     "`mktemp -d` under",
     "`umask 077` and `chmod 700`",
@@ -524,6 +532,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         "verify-live-fixture-rows.py",
+    ),
+    (
+        VERIFY_LOCAL,
+        "verify-windows-tun-smoke.py",
     ),
     (
         VERIFY_LOCAL,
@@ -621,6 +633,21 @@ REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
     "--udp-idle-timeout-ms",
     "waiting for UDP association idle cleanup",
     'smoke_require_stat_zero "UDP active associations"',
+]
+
+REQUIRED_WINDOWS_TUN_SMOKE_VERIFIER_SNIPPETS = [
+    "REQUIRED_SNIPPETS",
+    "[Security.Principal.WindowsBuiltInRole]::Administrator",
+    "Get-RouteSnapshot",
+    "$routeBefore = @(Get-RouteSnapshot $TargetCidr)",
+    "$routeAfter = @(Get-RouteSnapshot $TargetCidr)",
+    "route.exe DELETE $targetIp MASK 255.255.255.255 $TunIp",
+    '"tun-capture"',
+    '"--exit-after-packets", "1"',
+    "[System.Net.Sockets.TcpClient]::new()",
+    "capture: exit-after-packets reached",
+    "target route table did not return to its original state",
+    "ORDERED_SNIPPETS",
 ]
 
 REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
@@ -757,6 +784,7 @@ def main() -> None:
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
     netns_udp_smoke = NETNS_UDP_SMOKE.read_text(encoding="utf-8")
+    windows_tun_smoke_verifier = WINDOWS_TUN_SMOKE_VERIFIER.read_text(encoding="utf-8")
     agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
     agent_sidecar_smoke = AGENT_SIDECAR_SMOKE.read_text(encoding="utf-8")
 
@@ -905,6 +933,17 @@ def main() -> None:
         fail(
             "scripts/smoke-linux-netns-udp.sh is missing required snippets: "
             f"{missing_netns_udp_smoke!r}"
+        )
+
+    missing_windows_tun_smoke_verifier = [
+        snippet
+        for snippet in REQUIRED_WINDOWS_TUN_SMOKE_VERIFIER_SNIPPETS
+        if snippet not in windows_tun_smoke_verifier
+    ]
+    if missing_windows_tun_smoke_verifier:
+        fail(
+            "scripts/verify-windows-tun-smoke.py is missing required snippets: "
+            f"{missing_windows_tun_smoke_verifier!r}"
         )
 
     missing_agent_sidecars = [

@@ -93,6 +93,7 @@ verify_run cargo test
 verify_run cargo clippy --all-targets -- -D warnings
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-matrix.py"
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" --self-test
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-windows-tun-smoke.py"
 for script in "${SCRIPT_DIR}"/*.sh; do
   verify_run bash -n "$script"
 done
