@@ -255,7 +255,12 @@ address, not the SSH control address that Rustle protects with a direct host
 route. By default the script uses `${RUSTLE_FIXTURE_HOST}/32` as
 `RUSTLE_BENCH_TARGET_CIDR`; set `RUSTLE_FIXTURE_TARGET_CIDR` when the fixture
 address should be covered by a larger route. Override
-`RUSTLE_FIXTURE_BODY_BYTES` to change the body-size matrix.
+`RUSTLE_FIXTURE_BODY_BYTES` to change the body-size matrix. The remote fixture
+code is compatible with Python 2.7 and Python 3; set
+`RUSTLE_FIXTURE_PYTHON=python` for older SSH hosts that do not provide
+`python3`. Fixture runs set `RUSTLE_BENCH_READY_METHOD=HEAD` so sshuttle
+readiness probes verify reachability without downloading the full large
+response before the measured GET request.
 
 For password-auth labs, the fixture SSH command can reuse
 `RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with

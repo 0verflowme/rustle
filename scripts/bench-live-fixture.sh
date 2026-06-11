@@ -159,7 +159,7 @@ response_header = (
 filler = b"x" * 65536
 
 def serve(conn):
-    with conn:
+    try:
         conn.settimeout(5)
         data = b""
         try:
@@ -170,7 +170,10 @@ def serve(conn):
                 data += chunk
         except socket.timeout:
             pass
+        is_head = data[:5].upper() == b"HEAD "
         conn.sendall(response_header)
+        if is_head:
+            return
         if body_prefix:
             conn.sendall(body_prefix)
         remaining = filler_len
@@ -178,15 +181,23 @@ def serve(conn):
             chunk = filler[: min(len(filler), remaining)]
             conn.sendall(chunk)
             remaining -= len(chunk)
+    finally:
+        conn.close()
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((bind, port))
     sock.listen(listen_backlog)
-    print(f"READY {sock.getsockname()[1]}", flush=True)
+    sys.stdout.write("READY %d\n" % sock.getsockname()[1])
+    sys.stdout.flush()
     while True:
         conn, _peer = sock.accept()
-        threading.Thread(target=serve, args=(conn,), daemon=True).start()
+        thread = threading.Thread(target=serve, args=(conn,))
+        thread.daemon = True
+        thread.start()
+finally:
+    sock.close()
 PY
   FIXTURE_PID=$!
   wait_for_fixture_ready "$out_file" "$err_file"
@@ -221,6 +232,7 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
     RUSTLE_BENCH_URL="$fixture_url" \
     RUSTLE_BENCH_ROUTE_PROBE_IP="$FIXTURE_HOST" \
     RUSTLE_BENCH_EXPECT_BYTES="$body_bytes" \
+    RUSTLE_BENCH_READY_METHOD=HEAD \
     "${SCRIPT_DIR}/bench-live-compare.sh"
   stop_fixture
 done

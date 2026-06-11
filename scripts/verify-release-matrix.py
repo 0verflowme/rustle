@@ -436,6 +436,9 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "sshuttle",
     "agent/sshuttle",
     "--password-file",
+    '"${#cmd_env[@]}" -gt 0',
+    "RUSTLE_BENCH_READY_METHOD",
+    "probe_args+=(--head)",
 ]
 
 REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
@@ -472,6 +475,12 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
 REQUIRED_LIVE_FIXTURE_SNIPPETS = [
     "RUSTLE_FIXTURE_BODY_BYTES",
     "1048576 10485760 104857600",
+    'sys.stdout.write("READY %d\\n"',
+    'is_head = data[:5].upper() == b"HEAD "',
+    "RUSTLE_BENCH_READY_METHOD=HEAD",
+    "thread.daemon = True",
+    "conn.close()",
+    "sock.close()",
     "RUSTLE_BENCH_EXPECT_BYTES",
     "bench-live-compare.sh",
 ]

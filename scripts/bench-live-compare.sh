@@ -363,8 +363,13 @@ start_rustle() {
 
   cmd+=("$TARGET_CIDR")
 
-  "${SUDO_CMD[@]}" env "${cmd_env[@]}" sh -c 'trap - INT TERM; echo $$ > "$1"; shift; exec "$@"' \
-    sh "$child_pid_file" "${cmd[@]}" >"$log" 2>&1 &
+  if [[ "${#cmd_env[@]}" -gt 0 ]]; then
+    "${SUDO_CMD[@]}" env "${cmd_env[@]}" sh -c 'trap - INT TERM; echo $$ > "$1"; shift; exec "$@"' \
+      sh "$child_pid_file" "${cmd[@]}" >"$log" 2>&1 &
+  else
+    "${SUDO_CMD[@]}" env sh -c 'trap - INT TERM; echo $$ > "$1"; shift; exec "$@"' \
+      sh "$child_pid_file" "${cmd[@]}" >"$log" 2>&1 &
+  fi
   local wrapper_pid=$!
   RUSTLE_WRAPPER_PID="$wrapper_pid"
   RUSTLE_CHILD_PID=""
@@ -480,6 +485,12 @@ start_sshuttle() {
   if [[ "${RUSTLE_BENCH_CURL_INSECURE:-${RUSTLE_LIVE_CURL_INSECURE:-1}}" == "1" ]]; then
     probe_args+=(-k)
   fi
+  local ready_method="${RUSTLE_BENCH_READY_METHOD:-GET}"
+  case "$ready_method" in
+    GET) ;;
+    HEAD) probe_args+=(--head) ;;
+    *) smoke_die "RUSTLE_BENCH_READY_METHOD must be GET or HEAD" ;;
+  esac
   local ready_seconds="${RUSTLE_BENCH_READY_SECONDS:-30}"
   case "$ready_seconds" in
     '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_READY_SECONDS must be a positive integer" ;;
