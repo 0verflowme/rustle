@@ -251,6 +251,7 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
     RUSTLE_BENCH_TARGET_CIDR="$TARGET_CIDR" \
     RUSTLE_BENCH_URL="$fixture_url" \
     RUSTLE_BENCH_ROUTE_PROBE_IP="$FIXTURE_HOST" \
+    RUSTLE_BENCH_EXPECT=rustle-live-fixture \
     RUSTLE_BENCH_EXPECT_BYTES="$body_bytes" \
     RUSTLE_BENCH_READY_METHOD=HEAD \
     "${SCRIPT_DIR}/bench-live-compare.sh"

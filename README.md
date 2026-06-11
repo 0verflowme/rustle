@@ -21,8 +21,9 @@ transport.
 ## Status
 
 Rustle is still under active development. The agent transport is the preferred
-architecture, but high-fanout TCP lifecycle behavior is still being hardened.
-Use it for controlled testing before relying on it for production pivoting.
+architecture, and the high-fanout TCP lifecycle path is covered by a rootless
+256-flow stress gate. Live remote, DNS takeover, and cross-platform TUN proof
+are still required before treating Rustle as production-ready pivoting software.
 
 IPv6 is not part of the current MVP.
 
@@ -101,7 +102,8 @@ scripts/verify-local.sh
 ```
 
 Run the high-fanout bridge stress gate. By default this exercises 256
-concurrent 1 MiB responses over the primary agent transport:
+concurrent 1 MiB responses over the primary agent transport and the
+`direct-tcpip` compatibility path:
 
 ```sh
 scripts/stress-bridge-lab.sh

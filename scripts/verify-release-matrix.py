@@ -523,6 +523,7 @@ REQUIRED_LIVE_FIXTURE_SNIPPETS = [
     "thread.daemon = True",
     "conn.close()",
     "sock.close()",
+    "RUSTLE_BENCH_EXPECT=rustle-live-fixture",
     "RUSTLE_BENCH_EXPECT_BYTES",
     "bench-live-compare.sh",
 ]

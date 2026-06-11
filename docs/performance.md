@@ -249,7 +249,9 @@ Use `scripts/bench-live-fixture.sh` when the existing live URL returns tiny
 responses and mostly measures request latency. The fixture starts a temporary
 Python HTTP server on the SSH host, then runs `scripts/bench-live-compare.sh`
 against controlled 1 MiB / 10 MiB / 100 MiB responses. Each run sets
-`RUSTLE_BENCH_EXPECT_BYTES` so the benchmark fails if a response is truncated.
+`RUSTLE_BENCH_EXPECT_BYTES` so the benchmark fails if a response is truncated
+and `RUSTLE_BENCH_EXPECT=rustle-live-fixture` so a same-size response from the
+wrong service cannot be counted as fixture throughput.
 
 ```sh
 RUSTLE_FIXTURE_REMOTE=alice@ssh.example.com \
