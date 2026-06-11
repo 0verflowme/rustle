@@ -10,7 +10,7 @@ case "$(uname -s)" in
 esac
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  SUDO_CMD=()
+  SUDO_CMD=(env)
 else
   smoke_require sudo
   sudo -n true >/dev/null 2>&1 || smoke_die "passwordless sudo is required for netns UDP smoke"
@@ -242,10 +242,11 @@ ready = sys.argv[3]
 expected = b"rustle-netns-udp-ping"
 response = b"rustle-netns-udp-pong"
 
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
-    with open(ready, "w", encoding="utf-8") as handle:
+    with open(ready, "w") as handle:
         handle.write(str(port))
 
     while True:
@@ -254,6 +255,8 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.sendto(response, peer)
         else:
             sock.sendto(b"rustle-netns-udp-unexpected", peer)
+finally:
+    sock.close()
 PY
 UDP_PID=$!
 
@@ -317,15 +320,18 @@ port = int(sys.argv[2])
 request = b"rustle-netns-udp-ping"
 expected = b"rustle-netns-udp-pong"
 
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
     sock.settimeout(10)
     sock.sendto(request, (host, port))
     data, peer = sock.recvfrom(65535)
+finally:
+    sock.close()
 
 if data != expected:
-    raise SystemExit(f"unexpected UDP response {data!r} from {peer}")
+    raise SystemExit("unexpected UDP response %r from %r" % (data, peer))
 if peer[0] != host or peer[1] != port:
-    raise SystemExit(f"unexpected UDP response peer {peer!r}")
+    raise SystemExit("unexpected UDP response peer %r" % (peer,))
 print("udp smoke response ok")
 PY
 

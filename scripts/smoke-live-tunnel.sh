@@ -10,7 +10,7 @@ case "$(uname -s)" in
 esac
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  SUDO_CMD=()
+  SUDO_CMD=(env)
 else
   smoke_require sudo
   sudo -n true >/dev/null 2>&1 || smoke_die "passwordless sudo is required for live tunnel smoke"

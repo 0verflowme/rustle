@@ -37,9 +37,12 @@ smoke_find_free_port() {
   "$py" - <<'PY'
 import socket
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
     sock.bind(("127.0.0.1", 0))
     print(sock.getsockname()[1])
+finally:
+    sock.close()
 PY
 }
 
@@ -197,11 +200,15 @@ port = int(sys.argv[2])
 deadline = time.time() + float(sys.argv[3])
 
 while time.time() < deadline:
+    sock = None
     try:
-        with socket.create_connection((host, port), timeout=0.2):
-            sys.exit(0)
+        sock = socket.create_connection((host, port), timeout=0.2)
+        sys.exit(0)
     except OSError:
         time.sleep(0.1)
+    finally:
+        if sock is not None:
+            sock.close()
 
 sys.exit(1)
 PY
@@ -353,6 +360,15 @@ import sys
 import os
 import threading
 
+try:
+    BrokenPipeError
+except NameError:
+    BrokenPipeError = socket.error
+try:
+    ConnectionResetError
+except NameError:
+    ConnectionResetError = socket.error
+
 port = int(sys.argv[1])
 ready = sys.argv[2]
 marker = b"rustle-smoke-ok\n"
@@ -371,7 +387,7 @@ response = (
 )
 
 def handle_connection(conn):
-    with conn:
+    try:
         conn.settimeout(5)
         data = b""
         try:
@@ -383,18 +399,24 @@ def handle_connection(conn):
             conn.sendall(response)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             pass
+    finally:
+        conn.close()
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("127.0.0.1", port))
     sock.listen(listen_backlog)
-    with open(ready, "w", encoding="utf-8") as handle:
+    with open(ready, "w") as handle:
         handle.write(str(port))
 
     while True:
         conn, _ = sock.accept()
-        thread = threading.Thread(target=handle_connection, args=(conn,), daemon=True)
+        thread = threading.Thread(target=handle_connection, args=(conn,))
+        thread.setDaemon(True)
         thread.start()
+finally:
+    sock.close()
 PY
   SMOKE_HTTP_PID=$!
 
@@ -423,7 +445,7 @@ import threading
 
 port = int(sys.argv[1])
 ready = sys.argv[2]
-answer_ip = bytes([203, 0, 113, 7])
+answer_ip = b"\xcb\x00\x71\x07"
 
 def recv_exact(conn, size):
     data = b""
@@ -490,8 +512,9 @@ def serve_udp(sock):
         response = build_response(query)
         sock.sendto(response, peer)
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock, \
-     socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_sock:
+tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
     tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     tcp_sock.bind(("127.0.0.1", port))
     tcp_sock.listen(50)
@@ -499,14 +522,21 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp_sock, \
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     udp_sock.bind(("127.0.0.1", port))
 
-    with open(ready, "w", encoding="utf-8") as handle_ready:
+    with open(ready, "w") as handle_ready:
         handle_ready.write(str(port))
 
-    threading.Thread(target=serve_udp, args=(udp_sock,), daemon=True).start()
+    udp_thread = threading.Thread(target=serve_udp, args=(udp_sock,))
+    udp_thread.setDaemon(True)
+    udp_thread.start()
 
     while True:
         conn, _ = tcp_sock.accept()
-        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+        tcp_thread = threading.Thread(target=handle, args=(conn,))
+        tcp_thread.setDaemon(True)
+        tcp_thread.start()
+finally:
+    tcp_sock.close()
+    udp_sock.close()
 PY
   SMOKE_DNS_PID=$!
 

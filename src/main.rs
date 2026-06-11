@@ -2212,7 +2212,11 @@ async fn capture_packets(
             result = dev.recv(&mut buf) => {
                 let len = result.context("failed to read packet from TUN device")?;
                 captured_packets = captured_packets.saturating_add(1);
-                match parse_ipv4_metadata(&buf[..len]) {
+                let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
+                    eprintln!("packet: len={len} non_ipv4");
+                    continue;
+                };
+                match parse_ipv4_metadata(packet) {
                     Ok(packet) => {
                         eprintln!(
                             "packet: len={} total_len={} proto={} src={} dst={}",
@@ -2519,7 +2523,10 @@ async fn run_tunnel_loop(
             result = dev.recv(&mut buf) => {
                 let len = result.context("failed to read packet from TUN device")?;
                 stats.record_tun_rx(len);
-                if let Some(request) = parse_dns_request_for_tunnel(&buf[..len]) {
+                let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
+                    continue;
+                };
+                if let Some(request) = parse_dns_request_for_tunnel(packet) {
                     stats.dns_forwarded = stats.dns_forwarded.saturating_add(1);
                     eprintln!(
                         "dns: forwarding UDP query {}:{} -> {}:{} over SSH to {}:{}",
@@ -2556,7 +2563,7 @@ async fn run_tunnel_loop(
                     }
                     continue;
                 }
-                if let Some(request) = parse_udp_request_for_agent_tunnel(&buf[..len]) {
+                if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
                     if let Some(agent) = dns_transport.agent_transport() {
                         admit_udp_datagram(
                             agent,
@@ -2575,7 +2582,7 @@ async fn run_tunnel_loop(
 
                 let now = smol_now(started_at);
                 flow_manager
-                    .ingest_packet_into(now, &buf[..len], &mut outbound_packets)
+                    .ingest_packet_into(now, packet, &mut outbound_packets)
                     .context("failed to feed packet into userspace TCP engine")?;
                 let tun_write = write_packets_to_tun(&dev, &mut outbound_packets).await?;
                 stats.record_tun_write(tun_write);
@@ -2776,6 +2783,28 @@ fn parse_dns_request_for_tunnel(packet: &[u8]) -> Option<dns::UdpDnsRequest> {
             eprintln!("dns: packet parse failed: {err}");
             None
         }
+    }
+}
+
+fn tun_ipv4_packet(packet: &[u8]) -> Option<&[u8]> {
+    const LINUX_PI_IPV4: [u8; 4] = [0x00, 0x00, 0x08, 0x00];
+    const LINUX_PI_IPV6: [u8; 4] = [0x00, 0x00, 0x86, 0xdd];
+
+    match packet.first().map(|byte| byte >> 4) {
+        Some(4) => Some(packet),
+        Some(6) => None,
+        _ if packet.len() >= LINUX_PI_IPV4.len()
+            && packet[..LINUX_PI_IPV4.len()] == LINUX_PI_IPV4
+            && packet[LINUX_PI_IPV4.len()] >> 4 == 4 =>
+        {
+            Some(&packet[LINUX_PI_IPV4.len()..])
+        }
+        _ if packet.len() >= LINUX_PI_IPV6.len()
+            && packet[..LINUX_PI_IPV6.len()] == LINUX_PI_IPV6 =>
+        {
+            None
+        }
+        _ => None,
     }
 }
 
@@ -8488,6 +8517,33 @@ mod tests {
         packet[0] = 0x60;
         let err = parse_ipv4_metadata(&packet).expect_err("IPv6 must not parse as IPv4");
         assert!(err.to_string().contains("not IPv4"));
+    }
+
+    #[test]
+    fn tun_ipv4_packet_accepts_raw_ipv4() {
+        let packet = [
+            0x45, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
+        ];
+
+        assert_eq!(tun_ipv4_packet(&packet), Some(packet.as_slice()));
+    }
+
+    #[test]
+    fn tun_ipv4_packet_strips_linux_pi_ipv4_header() {
+        let packet = [
+            0x00, 0x00, 0x08, 0x00, 0x45, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1,
+            10, 0, 0, 2,
+        ];
+
+        assert_eq!(tun_ipv4_packet(&packet), Some(&packet[4..]));
+    }
+
+    #[test]
+    fn tun_ipv4_packet_ignores_non_ipv4() {
+        assert_eq!(tun_ipv4_packet(&[0x60, 0, 0, 0]), None);
+        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x86, 0xdd, 0x60]), None);
+        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x08, 0x00, 0x60]), None);
+        assert_eq!(tun_ipv4_packet(&[]), None);
     }
 
     #[test]

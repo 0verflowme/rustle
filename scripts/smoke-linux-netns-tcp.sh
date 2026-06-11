@@ -10,7 +10,7 @@ case "$(uname -s)" in
 esac
 
 if [[ "$(id -u)" -eq 0 ]]; then
-  SUDO_CMD=()
+  SUDO_CMD=(env)
 else
   smoke_require sudo
   sudo -n true >/dev/null 2>&1 || smoke_die "passwordless sudo is required for netns smoke"
@@ -244,16 +244,17 @@ response = (
     + body
 )
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((host, port))
     sock.listen(50)
-    with open(ready, "w", encoding="utf-8") as handle:
+    with open(ready, "w") as handle:
         handle.write(str(port))
 
     while True:
         conn, _ = sock.accept()
-        with conn:
+        try:
             conn.settimeout(2)
             data = b""
             try:
@@ -265,6 +266,10 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             except socket.timeout:
                 pass
             conn.sendall(response)
+        finally:
+            conn.close()
+finally:
+    sock.close()
 PY
 HTTP_PID=$!
 
