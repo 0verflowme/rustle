@@ -276,7 +276,11 @@ response before the measured GET request.
 For password-auth labs, the fixture SSH command can reuse
 `RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with
 `RUSTLE_FIXTURE_PASSWORD=1`. That path requires `sshpass` because the fixture
-itself is started with the OpenSSH client.
+itself is started with the OpenSSH client. When benchmark-specific credentials
+are not set, fixture-only auth and host-key settings are forwarded into the
+nested live benchmark run, including `RUSTLE_FIXTURE_PASSWORD_VALUE`, prompted
+`RUSTLE_FIXTURE_PASSWORD`, `RUSTLE_FIXTURE_IDENTITY`,
+`RUSTLE_FIXTURE_INSECURE_HOST_KEY`, and `RUSTLE_FIXTURE_KNOWN_HOSTS`.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is

@@ -67,6 +67,9 @@ parse_ssh_remote() {
 SSH_REMOTE_INFO="$(parse_ssh_remote "${RUSTLE_FIXTURE_SSH_REMOTE:-$REMOTE}")"
 SSH_REMOTE="$(printf '%s\n' "$SSH_REMOTE_INFO" | sed -n '1p')"
 SSH_PORT="$(printf '%s\n' "$SSH_REMOTE_INFO" | sed -n '2p')"
+FIXTURE_IDENTITY="${RUSTLE_FIXTURE_IDENTITY:-${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}}"
+FIXTURE_INSECURE_HOST_KEY="${RUSTLE_FIXTURE_INSECURE_HOST_KEY:-${RUSTLE_BENCH_INSECURE_HOST_KEY:-${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}}}"
+FIXTURE_KNOWN_HOSTS="${RUSTLE_FIXTURE_KNOWN_HOSTS:-${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}}"
 SSH_PASSWORD_VALUE="${RUSTLE_FIXTURE_PASSWORD_VALUE:-${RUSTLE_BENCH_PASSWORD_VALUE:-${RUSTLE_LIVE_PASSWORD_VALUE:-}}}"
 if [[ -z "$SSH_PASSWORD_VALUE" && "${RUSTLE_FIXTURE_PASSWORD:-0}" == "1" ]]; then
   printf 'SSH password for live fixture: ' >&2
@@ -87,13 +90,13 @@ SSH_CMD+=(-T)
 if [[ -n "$SSH_PORT" ]]; then
   SSH_CMD+=(-p "$SSH_PORT")
 fi
-if [[ -n "${RUSTLE_FIXTURE_IDENTITY:-${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}}" ]]; then
-  SSH_CMD+=(-i "${RUSTLE_FIXTURE_IDENTITY:-${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}}" -o IdentitiesOnly=yes)
+if [[ -n "$FIXTURE_IDENTITY" ]]; then
+  SSH_CMD+=(-i "$FIXTURE_IDENTITY" -o IdentitiesOnly=yes)
 fi
-if [[ "${RUSTLE_FIXTURE_INSECURE_HOST_KEY:-${RUSTLE_BENCH_INSECURE_HOST_KEY:-${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}}}" == "1" ]]; then
+if [[ "$FIXTURE_INSECURE_HOST_KEY" == "1" ]]; then
   SSH_CMD+=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
-elif [[ -n "${RUSTLE_FIXTURE_KNOWN_HOSTS:-${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}}" ]]; then
-  SSH_CMD+=(-o UserKnownHostsFile="${RUSTLE_FIXTURE_KNOWN_HOSTS:-${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}}" -o StrictHostKeyChecking=yes)
+elif [[ -n "$FIXTURE_KNOWN_HOSTS" ]]; then
+  SSH_CMD+=(-o UserKnownHostsFile="$FIXTURE_KNOWN_HOSTS" -o StrictHostKeyChecking=yes)
 fi
 if [[ -n "$SSH_PASSWORD_VALUE" ]]; then
   SSH_CMD+=(
@@ -104,6 +107,23 @@ if [[ -n "$SSH_PASSWORD_VALUE" ]]; then
   )
 fi
 SSH_CMD+=("$SSH_REMOTE")
+
+BENCH_ENV=()
+if [[ -n "$SSH_PASSWORD_VALUE" && -z "${RUSTLE_BENCH_PASSWORD_VALUE:-}" && -z "${RUSTLE_LIVE_PASSWORD_VALUE:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_PASSWORD_VALUE="$SSH_PASSWORD_VALUE")
+fi
+if [[ -n "$SSH_PASSWORD_VALUE" && -z "${RUSTLE_BENCH_SSHUTTLE_PASSWORD_VALUE:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_SSHUTTLE_PASSWORD_VALUE="$SSH_PASSWORD_VALUE")
+fi
+if [[ -n "${RUSTLE_FIXTURE_IDENTITY:-}" && -z "${RUSTLE_BENCH_IDENTITY:-}" && -z "${RUSTLE_LIVE_IDENTITY:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_IDENTITY="$RUSTLE_FIXTURE_IDENTITY")
+fi
+if [[ -n "${RUSTLE_FIXTURE_INSECURE_HOST_KEY:-}" && -z "${RUSTLE_BENCH_INSECURE_HOST_KEY:-}" && -z "${RUSTLE_LIVE_INSECURE_HOST_KEY:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_INSECURE_HOST_KEY="$RUSTLE_FIXTURE_INSECURE_HOST_KEY")
+fi
+if [[ -n "${RUSTLE_FIXTURE_KNOWN_HOSTS:-}" && -z "${RUSTLE_BENCH_KNOWN_HOSTS:-}" && -z "${RUSTLE_LIVE_KNOWN_HOSTS:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_KNOWN_HOSTS="$RUSTLE_FIXTURE_KNOWN_HOSTS")
+fi
 
 wait_for_fixture_ready() {
   local ready_file="$1"
@@ -226,7 +246,7 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
   fixture_url="http://${FIXTURE_HOST}:${actual_port}/"
   smoke_info "benchmarking live fixture body_bytes=${body_bytes} url=${fixture_url}"
 
-  env \
+  env "${BENCH_ENV[@]}" \
     RUSTLE_BENCH_REMOTE="$REMOTE" \
     RUSTLE_BENCH_TARGET_CIDR="$TARGET_CIDR" \
     RUSTLE_BENCH_URL="$fixture_url" \
