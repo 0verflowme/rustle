@@ -196,6 +196,10 @@ Required before tagging a release:
 - Windows release archives contain only `rustle.exe` plus documentation; a
   sidecar `wintun.dll` in the archive is a release failure because the driver
   bytes must be embedded.
+- Windows release verification runs `scripts/smoke-windows-tun.ps1` against the
+  extracted `rustle.exe`, proving the packaged binary can materialize embedded
+  Wintun, create a TUN, add/delete a /32 route, capture one packet, and restore
+  the route table before the archive is uploaded.
 - Embedded Wintun extraction remains content-addressed by target architecture
   and DLL SHA-256, and identical already-materialized DLLs are reused without a
   rewrite.
@@ -351,11 +355,12 @@ Required before tagging a release:
   synthesized TUN response, with final `udp=... active:0` stats and route
   cleanup.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
-  with an architecture-matching Wintun DLL available. This proves Windows TUN
-  creation, route add/delete, packet capture, and clean route restoration
-  without requiring a remote SSH server. The static verifier above is not a
-  replacement for this elevated native run; it keeps the smoke script's required
-  assertions from drifting between Windows proof runs.
+  with an architecture-matching Wintun DLL available. The release workflow runs
+  this smoke against the packaged Windows binary with embedded Wintun before
+  upload, proving Windows TUN creation, route add/delete, packet capture, and
+  clean route restoration without requiring a remote SSH server. The static
+  verifier above is not a replacement for this elevated native run; it keeps the
+  smoke script's required assertions from drifting between Windows proof runs.
 - `scripts/smoke-live-tunnel.sh` passes against a real remote `sshd` and target
   URL supplied through the `RUSTLE_LIVE_*` environment variables. Release
   candidates should run it with `RUSTLE_LIVE_REQUESTS > 1` and

@@ -190,6 +190,15 @@ jobs:
           }
           & "$package/rustle.exe" --help | Out-Null
 
+      - name: Native Windows TUN smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RUSTLE_WINDOWS_SMOKE_TIMEOUT_SECONDS: 30
+        run: |
+          $rustle = (Resolve-Path -LiteralPath "verify/${{ matrix.package }}/rustle.exe").Path
+          & .\scripts\smoke-windows-tun.ps1 -RustleBin $rustle
+
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:

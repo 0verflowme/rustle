@@ -609,8 +609,9 @@ Before a release build is considered shippable:
   used for service-scoped system resolver traffic.
 - A native elevated Windows TUN smoke must prove Wintun discovery, TUN creation,
   route add/delete, packet capture, and route-table restoration.
-  `scripts/smoke-windows-tun.ps1` is the Windows operator proof, and
-  `scripts/verify-windows-tun-smoke.py` statically guards those required smoke
+  `scripts/smoke-windows-tun.ps1` is the Windows operator proof, the release
+  workflow runs it against the packaged embedded-Wintun binary before upload,
+  and `scripts/verify-windows-tun-smoke.py` statically guards those required smoke
   assertions on every local verifier run.
 - A live remote TCP tunnel smoke must prove real routed traffic through a remote
   `sshd`. `scripts/smoke-live-tunnel.sh` is the env-driven proof for a real
