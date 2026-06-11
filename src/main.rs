@@ -10862,6 +10862,75 @@ mod tests {
     }
 
     #[test]
+    fn high_fanout_stale_remote_data_after_removal_is_bounded() {
+        const FLOWS: usize = 32;
+        const STALE_ROUNDS: usize = 64;
+
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let mut ids = Vec::with_capacity(FLOWS);
+
+        for index in 0..FLOWS {
+            let client_port = 49152 + index as u16;
+            ids.push(establish_lab_flow(
+                &mut manager,
+                client_ip,
+                destination_ip,
+                destination_port,
+                client_port,
+            ));
+        }
+
+        for id in &ids {
+            manager
+                .remove_flow(id.key)
+                .expect("remove flow before high-fanout stale storm");
+        }
+        assert_eq!(manager.active_flow_count(), 0);
+
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+        let mut closed_flows = Vec::with_capacity(FLOWS);
+        let closed_capacity = closed_flows.capacity();
+        let payload = Bytes::from(vec![0x5a; 1024]);
+        let mut stale_events = 0_u64;
+        let mut overflows = 0_u64;
+
+        for round in 0..STALE_ROUNDS {
+            for id in &ids {
+                let stats = handle_bridge_event_into(
+                    ssh_bridge::BridgeEvent::RemoteData {
+                        id: *id,
+                        bytes: payload.clone(),
+                    },
+                    &mut manager,
+                    &mut backlogs,
+                    SmolInstant::from_millis(round as i64),
+                    &mut closed_flows,
+                )
+                .expect("high-fanout stale remote-data event should not fail");
+
+                stale_events = stale_events.saturating_add(stats.stale_bridge_events);
+                overflows = overflows.saturating_add(stats.remote_backlog_overflows);
+                assert!(closed_flows.is_empty());
+                assert_eq!(closed_flows.capacity(), closed_capacity);
+                assert_eq!(backlogs.active_flow_count(), 0);
+                assert_eq!(backlogs.total_bytes(), 0);
+            }
+        }
+
+        assert_eq!(stale_events, (FLOWS * STALE_ROUNDS) as u64);
+        assert_eq!(overflows, 0);
+    }
+
+    #[test]
     fn stale_remote_data_events_are_counted_without_per_chunk_log() {
         let flow = tcp_core::FlowKey::tcp(
             Ipv4Addr::new(10, 255, 255, 2),

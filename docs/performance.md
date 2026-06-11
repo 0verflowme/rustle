@@ -403,6 +403,9 @@ Performance work must preserve these invariants:
 - `stale_remote_data_storm_after_flow_removal_is_bounded` proves stale
   remote-data storms after flow removal do not refill remote backlog storage,
   emit closed-flow work, or trip backlog overflow accounting
+- `high_fanout_stale_remote_data_after_removal_is_bounded` gives the same
+  lifecycle invariant a fast multi-flow regression before the external
+  256-flow bridge stress harness runs
 - stale `RemoteData` chunks are counted without per-chunk logging; stale
   close/eof/failure/open transitions still log for diagnosis
 - generic UDP request payloads are parsed into `Bytes` once from the reusable

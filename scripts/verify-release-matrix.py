@@ -253,6 +253,7 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "bridge_event_handler_into_reuses_closed_flow_scratch_vector",
     "should_log_stale_bridge_event",
     "stale_remote_data_storm_after_flow_removal_is_bounded",
+    "high_fanout_stale_remote_data_after_removal_is_bounded",
     "stale_remote_data_events_are_counted_without_per_chunk_log",
     "remote_close_defers_flow_close_for_late_remote_data",
     "remote_backlog_pauses_bridge_events_at_high_watermark",

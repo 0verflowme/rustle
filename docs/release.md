@@ -273,6 +273,9 @@ Required before tagging a release:
 - `stale_remote_data_storm_after_flow_removal_is_bounded` passes, proving
   high-rate stale `RemoteData` after a flow has been removed does not recreate
   remote backlog state or emit closed-flow cleanup work.
+- `high_fanout_stale_remote_data_after_removal_is_bounded` passes, proving the
+  same stale-data cleanup invariant across many removed flow generations without
+  the external SSH or HTTP stress harness.
 - `stale_remote_data_events_are_counted_without_per_chunk_log` passes, proving
   stale remote payload chunks are counted without creating a stderr log storm.
 - `scripts/stress-bridge-lab.sh` passes with its default both-transport
