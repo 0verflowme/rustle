@@ -203,6 +203,23 @@ This fails the benchmark if `rustle-agent` does not meet the configured
 fraction of sshuttle throughput on the same SSH server, target URL, request
 count, and concurrency.
 
+For environment-specific regression checks, match the output `tool` column with
+a shell-style pattern and set either or both live thresholds:
+
+```sh
+RUSTLE_BENCH_LIVE_TOOL_PATTERN=rustle-agent \
+RUSTLE_BENCH_LIVE_MAX_P50_MS=250 \
+RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S=20 \
+scripts/bench-live-compare.sh
+```
+
+The pattern can target an exact row such as `rustle-agent`, a group such as
+`rustle-*`, or `sshuttle`. The harness fails if the pattern matches no
+successful rows, if any matched row exceeds `RUSTLE_BENCH_LIVE_MAX_P50_MS`, or
+if any matched row falls below `RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S`. These
+checks are local guardrails for a fixed machine, remote SSH server, target URL,
+request count, and concurrency; they are not portable performance claims.
+
 For password-auth labs, use prompt-based password collection:
 
 ```sh
@@ -218,6 +235,11 @@ private temp file. sshuttle uses `sshpass -f` with a private temp file when
 during cleanup. Bare `--password` still supports the legacy
 `RUSTLE_SSH_PASSWORD_FILE` environment path for compatibility with older local
 scripts.
+
+For throwaway lab hosts, `RUSTLE_BENCH_INSECURE_HOST_KEY=1` or
+`RUSTLE_LIVE_INSECURE_HOST_KEY=1` also applies to sshuttle identity mode. When
+the harness constructs sshuttle's `-e ssh` command, both password and identity
+mode include `StrictHostKeyChecking=no` and `UserKnownHostsFile=/dev/null`.
 
 For compatibility with older local scripts, the live Rustle benchmark also
 accepts a single transport through `RUSTLE_BENCH_BRIDGE_TRANSPORT`:
@@ -423,6 +445,9 @@ Performance work must preserve these invariants:
   length-prefixed frame without an extracted-response `Vec<u8>` copy
 - agent streams use explicit byte-credit windows instead of unbounded SSH-channel
   buffering
+- single-flow remote-to-local throughput depends on both the smoltcp proxy
+  response buffer and the agent stream response window; they are kept aligned at
+  1 MiB so one high-latency flow is not capped by the old 256 KiB credit window
 - agent senders segment oversized local buffers into bounded protocol frames
   instead of relying on callers to respect frame-size limits
 - agent writer tasks must reuse per-task burst frame and encoded-byte buffers

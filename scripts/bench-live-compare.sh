@@ -34,6 +34,9 @@ CURL_TIMEOUT="${RUSTLE_BENCH_CURL_TIMEOUT:-45}"
 START_TIMEOUT="${RUSTLE_BENCH_START_TIMEOUT:-45}"
 KEEP_LOGS="${RUSTLE_BENCH_KEEP_LOGS:-0}"
 MIN_AGENT_SSHUTTLE_RATIO="${RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO:-}"
+LIVE_GATE_TOOL_PATTERN="${RUSTLE_BENCH_LIVE_TOOL_PATTERN:-}"
+LIVE_MAX_P50_MS="${RUSTLE_BENCH_LIVE_MAX_P50_MS:-}"
+LIVE_MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S:-}"
 EXPECT_BYTES="${RUSTLE_BENCH_EXPECT_BYTES:-${RUSTLE_LIVE_EXPECT_BYTES:-}}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
@@ -62,6 +65,35 @@ except ValueError as exc:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO must be a number") from exc
 if ratio <= 0:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO must be greater than 0")
+PY
+fi
+if [[ -n "$LIVE_MAX_P50_MS" || -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
+  if [[ -z "$LIVE_GATE_TOOL_PATTERN" ]]; then
+    smoke_die "set RUSTLE_BENCH_LIVE_TOOL_PATTERN when using live benchmark p50 or throughput gates"
+  fi
+fi
+if [[ -n "$LIVE_MAX_P50_MS" ]]; then
+  "$(smoke_python)" - "$LIVE_MAX_P50_MS" <<'PY'
+import sys
+
+try:
+    threshold = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_LIVE_MAX_P50_MS must be a number") from exc
+if threshold <= 0:
+    raise SystemExit("RUSTLE_BENCH_LIVE_MAX_P50_MS must be greater than 0")
+PY
+fi
+if [[ -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
+  "$(smoke_python)" - "$LIVE_MIN_THROUGHPUT_MIB_S" <<'PY'
+import sys
+
+try:
+    threshold = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S must be a number") from exc
+if threshold <= 0:
+    raise SystemExit("RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S must be greater than 0")
 PY
 fi
 if [[ -n "$EXPECT_BYTES" ]]; then
@@ -439,6 +471,19 @@ stop_rustle() {
   RUSTLE_WRAPPER_PID=""
 }
 
+sshuttle_insecure_host_key_enabled() {
+  [[ "${RUSTLE_BENCH_INSECURE_HOST_KEY:-0}" == "1" || "${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}" == "1" ]]
+}
+
+sshuttle_ssh_host_key_options() {
+  if sshuttle_insecure_host_key_enabled; then
+    printf ' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+  elif [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
+    printf ' -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes' \
+      "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}"
+  fi
+}
+
 start_sshuttle() {
   local run_dir="$1"
   smoke_require sshuttle
@@ -458,17 +503,11 @@ start_sshuttle() {
     (umask 077 && printf '%s\n' "$SSHUTTLE_PASSWORD_VALUE" >"$password_file")
     CURRENT_PASSWORD_FILE="$password_file"
     local ssh_cmd="sshpass -f ${password_file} ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o KbdInteractiveAuthentication=yes -o NumberOfPasswordPrompts=1"
-    if [[ "${RUSTLE_BENCH_INSECURE_HOST_KEY:-${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}}" == "1" ]]; then
-      ssh_cmd+=" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-    elif [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
-      ssh_cmd+=" -o UserKnownHostsFile=${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}} -o StrictHostKeyChecking=yes"
-    fi
+    ssh_cmd+="$(sshuttle_ssh_host_key_options)"
     cmd+=(-e "$ssh_cmd")
   elif [[ -n "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}" ]]; then
     local ssh_cmd="ssh -i ${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}} -o IdentitiesOnly=yes"
-    if [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
-      ssh_cmd+=" -o UserKnownHostsFile=${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}} -o StrictHostKeyChecking=yes"
-    fi
+    ssh_cmd+="$(sshuttle_ssh_host_key_options)"
     cmd+=(-e "$ssh_cmd")
   fi
 
@@ -829,6 +868,69 @@ if ratio < min_ratio:
 print(
     "rustle-agent/sshuttle throughput ratio "
     f"{ratio:.2f} passed threshold {min_ratio:.2f}",
+    file=sys.stderr,
+)
+PY
+fi
+
+if [[ -n "$LIVE_MAX_P50_MS" || -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
+  "$(smoke_python)" - "$RESULTS_TSV" "$LIVE_GATE_TOOL_PATTERN" "$LIVE_MAX_P50_MS" "$LIVE_MIN_THROUGHPUT_MIB_S" <<'PY'
+import fnmatch
+import sys
+
+path, pattern, max_p50, min_throughput = sys.argv[1:]
+max_p50_value = None if max_p50 == "" else float(max_p50)
+min_throughput_value = None if min_throughput == "" else float(min_throughput)
+
+failures = []
+matched_rows = 0
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) != 20:
+            raise SystemExit(f"invalid live benchmark row: {line!r}")
+        tool = parts[0]
+        if not fnmatch.fnmatchcase(tool, pattern):
+            continue
+        success = int(parts[4])
+        failed = int(parts[5])
+        if failed != 0 or success == 0:
+            continue
+        matched_rows += 1
+        run = parts[1]
+        p50 = float(parts[7])
+        throughput = float(parts[10])
+        if max_p50_value is not None and p50 > max_p50_value:
+            failures.append(
+                f"{tool} run={run} p50={p50:.1f}ms exceeds {max_p50_value:.1f}ms"
+            )
+        if min_throughput_value is not None and throughput < min_throughput_value:
+            failures.append(
+                f"{tool} run={run} throughput={throughput:.2f}MiB/s below "
+                f"{min_throughput_value:.2f}MiB/s"
+            )
+
+if matched_rows == 0:
+    raise SystemExit(
+        "live benchmark regression gates requested, but "
+        f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r} matched no successful rows"
+    )
+
+if failures:
+    raise SystemExit(
+        "live benchmark regression gate failed for "
+        f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r}:\n" + "\n".join(failures)
+    )
+
+checks = []
+if max_p50_value is not None:
+    checks.append(f"p50 <= {max_p50_value:.1f}ms")
+if min_throughput_value is not None:
+    checks.append(f"throughput >= {min_throughput_value:.2f}MiB/s")
+print(
+    "live benchmark regression gate passed for "
+    f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r}: "
+    + ", ".join(checks),
     file=sys.stderr,
 )
 PY

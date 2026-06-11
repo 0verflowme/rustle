@@ -17,7 +17,7 @@ use smoltcp::wire::{
 };
 
 pub const TCP_RECV_BUFFER_BYTES: usize = 64 * 1024;
-pub const TCP_SEND_BUFFER_BYTES: usize = 256 * 1024;
+pub const TCP_SEND_BUFFER_BYTES: usize = 1024 * 1024;
 pub const TCP_BUFFER_BYTES: usize = TCP_RECV_BUFFER_BYTES;
 pub const DEFAULT_MAX_ACTIVE_FLOWS: usize = 1024;
 pub const DEFAULT_FLOW_OPEN_TIMEOUT: Duration = Duration::from_secs(15);

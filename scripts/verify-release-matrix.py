@@ -510,11 +510,17 @@ REQUIRED_ARCHITECTURE_NOTE_SNIPPETS = [
 REQUIRED_LIVE_BENCH_SNIPPETS = [
     'RUSTLE_TRANSPORTS="agent direct-tcpip"',
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
+    "RUSTLE_BENCH_LIVE_TOOL_PATTERN",
+    "RUSTLE_BENCH_LIVE_MAX_P50_MS",
+    "RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S",
     "RUSTLE_BENCH_EXPECT_BYTES",
     "smoke_wait_for_rustle_target_route_logs",
     "rustle-agent",
     "sshuttle",
     "agent/sshuttle",
+    "sshuttle_insecure_host_key_enabled",
+    "sshuttle_ssh_host_key_options",
+    "fnmatch.fnmatchcase",
     "--password-file",
     "smoke_resolve_rustle_bench_bin",
     '"${#cmd_env[@]}" -gt 0',
@@ -618,6 +624,8 @@ REQUIRED_LIVE_FIXTURE_SNIPPETS = [
     "RUSTLE_FIXTURE_BODY_BYTES",
     "1048576 10485760 104857600",
     "BENCH_ENV",
+    "bench_cmd=(env)",
+    '"${#BENCH_ENV[@]}" -gt 0',
     "RUSTLE_BENCH_PASSWORD_VALUE",
     "RUSTLE_BENCH_SSHUTTLE_PASSWORD_VALUE",
     "RUSTLE_FIXTURE_IDENTITY",
@@ -738,6 +746,9 @@ REQUIRED_WINDOWS_TUN_SMOKE_VERIFIER_SNIPPETS = [
 
 REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
+    "RUSTLE_BENCH_LIVE_TOOL_PATTERN",
+    "RUSTLE_BENCH_LIVE_MAX_P50_MS",
+    "RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S",
     "cargo build --release",
     "target/release/rustle",
     "RUSTLE_BENCH_PROFILE=debug",
@@ -793,6 +804,9 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "loopback DNS proxy",
     "Rustle receives the password through its `--password-file` option",
     "Bare `--password` still supports the legacy",
+    "sshuttle identity mode",
+    "StrictHostKeyChecking=no",
+    "UserKnownHostsFile=/dev/null",
     "known-failed primary lanes must not add reconnect latency",
     "least-loaded healthy lane elsewhere in the pool",
     "fallback alternate scans do not allocate sorted lane snapshots",
@@ -960,6 +974,11 @@ def main() -> None:
         fail(
             "scripts/bench-live-compare.sh is missing required snippets: "
             f"{missing_live_bench!r}"
+        )
+    if live_bench.count('ssh_cmd+="$(sshuttle_ssh_host_key_options)"') < 2:
+        fail(
+            "scripts/bench-live-compare.sh must apply sshuttle host-key options "
+            "in password and identity modes"
         )
 
     missing_agent_primary_scripts = [

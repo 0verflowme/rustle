@@ -21,7 +21,7 @@ const AGENT_LOCAL_INPUT_FRAMES_PER_STREAM: usize = 128;
 const AGENT_STREAM_COMPLETIONS: usize = 1024;
 const AGENT_TCP_READ_CHUNK: usize = AGENT_MAX_FRAME_PAYLOAD;
 const AGENT_UDP_READ_CHUNK: usize = 64 * 1024;
-const AGENT_STREAM_WINDOW_BYTES: usize = 256 * 1024;
+const AGENT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
 const AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES: usize = AGENT_STREAM_WINDOW_BYTES / 4;
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1523,7 +1523,7 @@ mod tests {
             &mut client_writer,
             AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
                 .unwrap()
-                .with_credit(256 * 1024),
+                .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
         )
         .await;
 
@@ -1640,7 +1640,7 @@ mod tests {
                 &mut client_writer,
                 AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
                     .unwrap()
-                    .with_credit(256 * 1024),
+                    .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
             )
             .await;
             write_test_frame(
@@ -1748,7 +1748,7 @@ mod tests {
             &mut client_writer,
             AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
                 .unwrap()
-                .with_credit(256 * 1024),
+                .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
         )
         .await;
         write_test_frame(

@@ -253,7 +253,11 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
   fixture_results="${TMPDIR}/fixture-${body_bytes}-bench.tsv"
   smoke_info "benchmarking live fixture body_bytes=${body_bytes} url=${fixture_url}"
 
-  env "${BENCH_ENV[@]}" \
+  bench_cmd=(env)
+  if [[ "${#BENCH_ENV[@]}" -gt 0 ]]; then
+    bench_cmd+=("${BENCH_ENV[@]}")
+  fi
+  "${bench_cmd[@]}" \
     RUSTLE_BENCH_REMOTE="$REMOTE" \
     RUSTLE_BENCH_TARGET_CIDR="$TARGET_CIDR" \
     RUSTLE_BENCH_URL="$fixture_url" \

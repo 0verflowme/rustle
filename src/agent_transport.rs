@@ -16,7 +16,7 @@ use crate::agent_proto::{
 
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
-const AGENT_STREAM_WINDOW_BYTES: usize = 256 * 1024;
+const AGENT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
 const AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES: usize = AGENT_STREAM_WINDOW_BYTES / 4;
 const AGENT_STREAM_RESET_BYTES: usize = 512;
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -33,6 +33,7 @@ type HeartbeatState = Arc<Mutex<AgentHeartbeat>>;
 struct StreamEntry {
     inbound: mpsc::Sender<AgentFrame>,
     send_credit: Arc<Semaphore>,
+    optimistic_open_credit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +157,11 @@ impl AgentTransport {
         self.open_ipv4(AgentFrameKind::OpenTcp, open).await
     }
 
+    pub async fn open_tcp_ipv4_optimistic(&self, open: AgentOpenIpv4) -> Result<AgentStream> {
+        self.open_ipv4_optimistic_with_timeout(open, AGENT_STREAM_OPEN_TIMEOUT)
+            .await
+    }
+
     pub async fn open_tcp_host(&self, open: AgentOpenHost) -> Result<AgentStream> {
         if self.peer.capabilities & CAP_TCP_CONNECT_HOST == 0 {
             bail!("agent does not advertise hostname TCP connect support");
@@ -184,6 +190,15 @@ impl AgentTransport {
         open_timeout: Duration,
     ) -> Result<AgentStream> {
         self.open_with_payload(kind, open.encode(), open_timeout)
+            .await
+    }
+
+    async fn open_ipv4_optimistic_with_timeout(
+        &self,
+        open: AgentOpenIpv4,
+        open_timeout: Duration,
+    ) -> Result<AgentStream> {
+        self.open_optimistic_with_payload(AgentFrameKind::OpenTcp, open.encode(), open_timeout)
             .await
     }
 
@@ -226,6 +241,7 @@ impl AgentTransport {
                 StreamEntry {
                     inbound: inbound_tx,
                     send_credit: Arc::clone(&send_credit),
+                    optimistic_open_credit: 0,
                 },
             );
         }
@@ -255,7 +271,7 @@ impl AgentTransport {
                 if frame.credit > 0 {
                     send_credit.add_permits(frame.credit as usize);
                 }
-                let stream = AgentStream {
+                let mut stream = AgentStream {
                     stream_id,
                     outbound: self.outbound.clone(),
                     inbound: inbound_rx,
@@ -265,11 +281,13 @@ impl AgentTransport {
                     max_frame_payload: (self.peer.max_frame_payload as usize)
                         .min(AGENT_MAX_FRAME_PAYLOAD),
                     pending_receive_credit: 0,
+                    initial_receive_credit_granted: false,
                 };
                 if let Err(err) = stream.grant_receive_credit(AGENT_STREAM_WINDOW_BYTES).await {
                     stream.close_credit_and_unregister().await;
                     return Err(err);
                 }
+                stream.initial_receive_credit_granted = true;
                 Ok(stream)
             }
             AgentFrameKind::Reset => {
@@ -282,6 +300,76 @@ impl AgentTransport {
                 bail!("agent expected opened/reset for stream {stream_id}, got {other:?}");
             }
         }
+    }
+
+    async fn open_optimistic_with_payload(
+        &self,
+        kind: AgentFrameKind,
+        payload: Bytes,
+        open_timeout: Duration,
+    ) -> Result<AgentStream> {
+        ensure_agent_ready(&self.failure).await?;
+        let stream_id = self.allocate_stream_id()?;
+        let open_frame = AgentFrame::new(kind, stream_id, payload)?;
+        let outbound_permit = match tokio::time::timeout(
+            open_timeout,
+            self.outbound.clone().reserve_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                let message = "agent writer task is closed".to_owned();
+                mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
+                return Err(anyhow!(message));
+            }
+            Err(_) => {
+                let message = format!(
+                    "timed out after {}ms waiting for agent outbound capacity to open stream {stream_id}",
+                    open_timeout.as_millis()
+                );
+                mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
+                return Err(anyhow!(message));
+            }
+        };
+        let (inbound_tx, inbound_rx) = mpsc::channel(AGENT_INBOUND_FRAMES_PER_STREAM);
+        let optimistic_open_credit = AGENT_STREAM_WINDOW_BYTES;
+        let send_credit = Arc::new(Semaphore::new(optimistic_open_credit));
+        {
+            let mut streams = self.streams.lock().await;
+            streams.insert(
+                stream_id,
+                StreamEntry {
+                    inbound: inbound_tx,
+                    send_credit: Arc::clone(&send_credit),
+                    optimistic_open_credit,
+                },
+            );
+        }
+        if let Err(err) = ensure_agent_ready(&self.failure).await {
+            self.unregister_stream(stream_id).await;
+            return Err(err);
+        }
+
+        outbound_permit.send(open_frame);
+
+        let mut stream = AgentStream {
+            stream_id,
+            outbound: self.outbound.clone(),
+            inbound: inbound_rx,
+            streams: Arc::clone(&self.streams),
+            failure: Arc::clone(&self.failure),
+            send_credit,
+            max_frame_payload: (self.peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD),
+            pending_receive_credit: 0,
+            initial_receive_credit_granted: false,
+        };
+        if let Err(err) = stream.grant_receive_credit(AGENT_STREAM_WINDOW_BYTES).await {
+            stream.close_credit_and_unregister().await;
+            return Err(err);
+        }
+        stream.initial_receive_credit_granted = true;
+        Ok(stream)
     }
 
     async fn unregister_stream(&self, stream_id: u64) {
@@ -307,6 +395,7 @@ pub struct AgentStream {
     send_credit: Arc<Semaphore>,
     max_frame_payload: usize,
     pending_receive_credit: usize,
+    initial_receive_credit_granted: bool,
 }
 
 impl AgentStream {
@@ -368,6 +457,18 @@ impl AgentStream {
     pub async fn recv(&mut self) -> Option<AgentFrame> {
         let frame = self.inbound.recv().await?;
         match frame.kind {
+            AgentFrameKind::Opened => {
+                if !self.initial_receive_credit_granted {
+                    if self
+                        .grant_receive_credit(AGENT_STREAM_WINDOW_BYTES)
+                        .await
+                        .is_err()
+                    {
+                        return None;
+                    }
+                    self.initial_receive_credit_granted = true;
+                }
+            }
             AgentFrameKind::Data if !frame.payload.is_empty() => {
                 if self
                     .record_received_data_credit(frame.payload.len())
@@ -713,6 +814,13 @@ async fn dispatch_agent_frame(
         }
         return;
     }
+    if frame.kind == AgentFrameKind::Opened && entry.optimistic_open_credit > 0 {
+        let additional_credit =
+            (frame.credit as usize).saturating_sub(entry.optimistic_open_credit);
+        if additional_credit > 0 {
+            entry.send_credit.add_permits(additional_credit);
+        }
+    }
     if matches!(frame.kind, AgentFrameKind::Close | AgentFrameKind::Reset) {
         entry.send_credit.close();
     }
@@ -844,6 +952,7 @@ mod tests {
             send_credit: Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
             pending_receive_credit: 0,
+            initial_receive_credit_granted: true,
         }
     }
 
@@ -1001,6 +1110,7 @@ mod tests {
             StreamEntry {
                 inbound: inbound_tx,
                 send_credit,
+                optimistic_open_credit: 0,
             },
         );
 
@@ -1488,6 +1598,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn optimistic_open_sends_first_data_before_opened() {
+        let (client_io, agent_io) = duplex(256 * 1024);
+        let (mut agent_reader, mut agent_writer) = split(agent_io);
+
+        let fake_agent = tokio::spawn(async move {
+            let mut inbound = BytesMut::new();
+            let hello = read_agent_frame(&mut agent_reader, &mut inbound)
+                .await
+                .expect("read client hello");
+            assert_eq!(hello.kind, AgentFrameKind::Hello);
+            write_agent_frame(
+                &mut agent_writer,
+                &AgentFrame::new(AgentFrameKind::Hello, 0, AgentHello::current(1300).encode())
+                    .expect("agent hello"),
+            )
+            .await
+            .expect("write agent hello");
+
+            let open = read_agent_frame(&mut agent_reader, &mut inbound)
+                .await
+                .expect("read open frame");
+            assert_eq!(open.kind, AgentFrameKind::OpenTcp);
+
+            let receive_window = timeout(
+                Duration::from_secs(1),
+                read_agent_frame(&mut agent_reader, &mut inbound),
+            )
+            .await
+            .expect("receive window before opened")
+            .expect("read optimistic receive window");
+            assert_eq!(receive_window.kind, AgentFrameKind::Window);
+            assert_eq!(receive_window.stream_id, open.stream_id);
+            assert_eq!(receive_window.credit as usize, AGENT_STREAM_WINDOW_BYTES);
+
+            let data = timeout(
+                Duration::from_secs(1),
+                read_agent_frame(&mut agent_reader, &mut inbound),
+            )
+            .await
+            .expect("data before opened")
+            .expect("read optimistic data");
+            assert_eq!(data.kind, AgentFrameKind::Data);
+            assert_eq!(data.stream_id, open.stream_id);
+            assert_eq!(&data.payload[..], b"hello");
+
+            write_agent_frame(
+                &mut agent_writer,
+                &AgentFrame::new(AgentFrameKind::Opened, open.stream_id, Bytes::new())
+                    .expect("opened")
+                    .with_credit(5),
+            )
+            .await
+            .expect("write opened");
+
+            assert!(
+                timeout(
+                    Duration::from_millis(50),
+                    read_agent_frame(&mut agent_reader, &mut inbound)
+                )
+                .await
+                .is_err(),
+                "opened should not trigger a duplicate receive window"
+            );
+        });
+
+        let (client_reader, client_writer) = split(client_io);
+        let transport = AgentTransport::connect(client_reader, client_writer, 1300)
+            .await
+            .expect("connect transport");
+        let mut stream = timeout(
+            Duration::from_millis(100),
+            transport.open_tcp_ipv4_optimistic(AgentOpenIpv4 {
+                destination_ip: Ipv4Addr::new(127, 0, 0, 1),
+                destination_port: 8080,
+                originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+                originator_port: 49152,
+            }),
+        )
+        .await
+        .expect("optimistic open should return before opened")
+        .expect("open optimistic stream");
+
+        stream
+            .send_data(Bytes::from_static(b"hello"))
+            .await
+            .expect("send before opened");
+        let opened = timeout(Duration::from_secs(1), stream.recv())
+            .await
+            .expect("receive opened")
+            .expect("opened frame");
+        assert_eq!(opened.kind, AgentFrameKind::Opened);
+
+        fake_agent.await.expect("fake agent join");
+        drop(transport);
+    }
+
+    #[tokio::test]
     async fn stream_recv_batches_receive_credit_until_threshold() {
         let (outbound, mut outbound_rx) = mpsc::channel(8);
         let (inbound_tx, inbound) = mpsc::channel(8);
@@ -1534,24 +1741,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_recv_grants_max_frame_receive_credit_immediately() {
+    async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
         let (outbound, mut outbound_rx) = mpsc::channel(8);
         let (inbound_tx, inbound) = mpsc::channel(8);
         let mut stream = test_agent_stream(9, outbound, inbound);
+        let max_frame = AGENT_MAX_FRAME_PAYLOAD;
+        let frames_to_threshold = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / max_frame;
 
-        inbound_tx
-            .send(
-                AgentFrame::new(
-                    AgentFrameKind::Data,
-                    9,
-                    Bytes::from(vec![0xa5; AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES]),
+        for index in 0..frames_to_threshold {
+            inbound_tx
+                .send(
+                    AgentFrame::new(AgentFrameKind::Data, 9, Bytes::from(vec![0xa5; max_frame]))
+                        .expect("max data frame"),
                 )
-                .expect("max data frame"),
-            )
-            .await
-            .expect("queue max data frame");
-        let frame = stream.recv().await.expect("receive max data frame");
-        assert_eq!(frame.kind, AgentFrameKind::Data);
+                .await
+                .expect("queue max data frame");
+            let frame = stream.recv().await.expect("receive max data frame");
+            assert_eq!(frame.kind, AgentFrameKind::Data);
+            if index + 1 < frames_to_threshold {
+                assert!(
+                    outbound_rx.try_recv().is_err(),
+                    "max frames below threshold should stay batched"
+                );
+            }
+        }
 
         let window = outbound_rx.recv().await.expect("receive immediate window");
         assert_eq!(window.kind, AgentFrameKind::Window);
@@ -1906,6 +2119,7 @@ mod tests {
             StreamEntry {
                 inbound: blocked_tx,
                 send_credit: std::sync::Arc::clone(&blocked_credit),
+                optimistic_open_credit: 0,
             },
         );
 
@@ -1919,6 +2133,7 @@ mod tests {
             send_credit: std::sync::Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
             pending_receive_credit: 0,
+            initial_receive_credit_granted: true,
         };
         let err = stream
             .send_frame_with_timeout(
@@ -1950,6 +2165,7 @@ mod tests {
             StreamEntry {
                 inbound,
                 send_credit: std::sync::Arc::clone(&send_credit),
+                optimistic_open_credit: 0,
             },
         );
 
