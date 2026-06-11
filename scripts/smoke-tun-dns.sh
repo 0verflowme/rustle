@@ -43,6 +43,7 @@ esac
 CONFIGURE_DNS="${RUSTLE_SMOKE_CONFIGURE_DNS:-0}"
 DNS_NAME="${RUSTLE_SMOKE_DNS_NAME:-rustle-smoke.example.com}"
 DNS_BEFORE=""
+DNS_RESTORE_CHECKED=0
 VIRTUAL_DNS_ROUTE_ADDED=0
 
 case "$CONFIGURE_DNS" in
@@ -120,6 +121,22 @@ runtime_dns_uses_expected_resolver() {
   esac
 }
 
+diagnose_runtime_dns_conflict() {
+  case "$(uname -s)" in
+    Darwin)
+      local config global_config
+      config="$(scutil --dns 2>&1 || true)"
+      global_config="${config%%DNS configuration (for scoped queries)*}"
+      if grep -Fq 'nameserver[0] :' <<<"$global_config" \
+        && ! grep -Fq "nameserver[0] : ${SYSTEM_DNS_IP}" <<<"$global_config"; then
+        printf '%s\n' \
+          "macOS runtime DNS is still using a global resolver before scoped service DNS; a VPN or profile-managed resolver may be overriding networksetup DNS." >&2
+      fi
+      ;;
+    Linux) ;;
+  esac
+}
+
 wait_for_runtime_dns() {
   local if_name="$1"
   for ((i = 0; i < 50; i++)); do
@@ -133,6 +150,18 @@ wait_for_runtime_dns() {
     Linux) SYSTEMD_PAGER=cat resolvectl status "$if_name" >&2 || true ;;
   esac
   return 1
+}
+
+verify_dns_restored() {
+  [[ "$CONFIGURE_DNS" == "1" && -n "$DNS_BEFORE" ]] || return 0
+  DNS_RESTORE_CHECKED=1
+  local dns_after
+  dns_after="$(dns_snapshot)"
+  if [[ "$dns_after" != "$DNS_BEFORE" ]]; then
+    printf 'DNS snapshot before Rustle:\n%s\n' "$DNS_BEFORE" >&2
+    printf 'DNS snapshot after Rustle:\n%s\n' "$dns_after" >&2
+    return 1
+  fi
 }
 
 flush_system_dns_cache_best_effort() {
@@ -226,16 +255,24 @@ stop_rustle() {
 
 cleanup() {
   local status="${1:-0}"
+  local cleanup_failed=0
   stop_rustle
   delete_virtual_dns_route_best_effort
   delete_target_route_best_effort
   smoke_stop_pid "${SMOKE_DNS_PID:-}"
   smoke_stop_pid "${SMOKE_SSHD_PID:-}"
+  if [[ "$DNS_RESTORE_CHECKED" != "1" ]] && ! verify_dns_restored; then
+    cleanup_failed=1
+  fi
   if [[ "$status" -ne 0 || "${RUSTLE_SMOKE_KEEP_LOGS:-0}" == "1" ]]; then
     smoke_info "kept TUN DNS smoke logs in ${TMPDIR}"
   else
     rm -rf "$TMPDIR"
   fi
+  if [[ "$cleanup_failed" -ne 0 && "$status" -eq 0 ]]; then
+    return 1
+  fi
+  return "$status"
 }
 trap 'cleanup $?' EXIT
 
@@ -310,6 +347,7 @@ if [[ "$CONFIGURE_DNS" == "1" ]]; then
   fi
   flush_system_dns_cache_best_effort
   if ! wait_for_runtime_dns "$TUN_IF_NAME"; then
+    diagnose_runtime_dns_conflict
     sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
     smoke_die "runtime DNS resolver did not pick up the expected Rustle resolver"
   fi
@@ -374,10 +412,7 @@ fi
 stop_rustle
 
 if [[ "$CONFIGURE_DNS" == "1" ]]; then
-  DNS_AFTER="$(dns_snapshot)"
-  if [[ "$DNS_AFTER" != "$DNS_BEFORE" ]]; then
-    printf 'DNS snapshot before Rustle:\n%s\n' "$DNS_BEFORE" >&2
-    printf 'DNS snapshot after Rustle:\n%s\n' "$DNS_AFTER" >&2
+  if ! verify_dns_restored; then
     smoke_die "system DNS settings did not return to their original state"
   fi
 fi
