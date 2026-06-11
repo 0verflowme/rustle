@@ -52,6 +52,23 @@ The live smoke and benchmark launchers preserve `RUSTLE_AGENT_DIR` through
 their privileged `sudo` wrapper so agent-mode release proof can use the same
 sidecar store that automatic upload bootstrap uses in production.
 
+For live labs that need a sidecar before published release artifacts exist,
+`scripts/build-agent-sidecars.sh` builds selected release targets, packages them
+with the same archive layout, writes `SHA256SUMS`, and then runs
+`scripts/prepare-agent-sidecars.sh` to create the sidecar store:
+
+```sh
+RUSTLE_AGENT_BUILD_TARGETS=x86_64-unknown-linux-musl \
+RUSTLE_AGENT_ARCHIVE_DIR=dist \
+RUSTLE_AGENT_DIR="$HOME/.cache/rustle/agents" \
+scripts/build-agent-sidecars.sh
+```
+
+On macOS cross-building Linux sidecars, install `cargo-zigbuild` and make `zig`
+available on `PATH`, or set `RUSTLE_AGENT_BUILD_ZIG=/path/to/zig`. This source
+build helper is for diagnostics and live proof; tagged releases are still built
+by the GitHub release workflow.
+
 ## Platform Contract
 
 Rustle's core tunnel model is the same on every supported OS:

@@ -28,6 +28,7 @@ TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
 NETNS_UDP_SMOKE = REPO / "scripts" / "smoke-linux-netns-udp.sh"
 WINDOWS_TUN_SMOKE_VERIFIER = REPO / "scripts" / "verify-windows-tun-smoke.py"
 AGENT_SIDECARS = REPO / "scripts" / "prepare-agent-sidecars.sh"
+AGENT_SIDECAR_BUILD = REPO / "scripts" / "build-agent-sidecars.sh"
 AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 
 
@@ -303,9 +304,12 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "automatic remote-agent bootstrap",
     "rustle-x86_64-unknown-linux-musl/rustle",
     "scripts/prepare-agent-sidecars.sh",
+    "scripts/build-agent-sidecars.sh",
     "scripts/smoke-agent-sidecars.sh",
     "RUSTLE_AGENT_RELEASE_TAG",
     "RUSTLE_AGENT_ARCHIVE_DIR",
+    "RUSTLE_AGENT_BUILD_TARGETS",
+    "RUSTLE_AGENT_BUILD_ZIG",
     "RUSTLE_AGENT_REQUIRE_ALL=1",
     "rustle-agent-linux-x86_64",
     "rustle-agent-macos-aarch64",
@@ -389,6 +393,10 @@ REQUIRED_AGENT_SIDECAR_SNIPPETS = [
     "RUSTLE_AGENT_TARGETS",
     "RUSTLE_AGENT_REQUIRE_ALL",
     "RUSTLE_AGENT_SKIP_CHECKSUMS",
+    'ARCHIVE_DIR="$(cd -- "$ARCHIVE_DIR" && pwd -P)"',
+    'OUT_DIR="$(cd -- "$OUT_DIR" && pwd -P)"',
+    'if [[ -e "$alias_path" ]]; then',
+    'if [[ -L "$alias_path" && "$FORCE" != "1" ]]; then',
     "SHA256SUMS",
     "create_alias_if_missing",
     "rustle-agent-${platform}",
@@ -396,8 +404,33 @@ REQUIRED_AGENT_SIDECAR_SNIPPETS = [
     "aarch64-pc-windows-msvc",
 ]
 
+REQUIRED_AGENT_SIDECAR_BUILD_SNIPPETS = [
+    "RUSTLE_AGENT_BUILD_TARGETS",
+    "RUSTLE_AGENT_ARCHIVE_DIR",
+    "RUSTLE_AGENT_DIR",
+    "RUSTLE_AGENT_BUILD_USE_ZIG",
+    "RUSTLE_AGENT_BUILD_PROFILE",
+    "RUSTLE_AGENT_BUILD_ZIG",
+    "cargo zigbuild --locked --release --target \"$target\"",
+    "cargo build --locked --release --target \"$target\"",
+    "rustle-%s.tar.gz",
+    "rustle-%s.zip",
+    "README.md",
+    "ARCHITECTURE.md",
+    "RELEASE.md",
+    "SHA256SUMS",
+    "RUSTLE_AGENT_REQUIRE_ALL=1",
+    "RUSTLE_AGENT_FORCE=1",
+    "prepare-agent-sidecars.sh",
+]
+
 REQUIRED_AGENT_SIDECAR_SMOKE_SNIPPETS = [
     "RUSTLE_AGENT_FORCE=1",
+    "relative-work",
+    "missing-sidecar",
+    "prepare-force.out",
+    'RUSTLE_AGENT_ARCHIVE_DIR="../archives"',
+    'RUSTLE_AGENT_DIR="agents"',
     "linux-x64-musl-sidecar",
     "linux-arm64-musl-sidecar",
     "macos-x64-sidecar",
@@ -684,9 +717,11 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "agent` first and `direct-tcpip` second",
     "same SSH server, target URL, request",
     "bench-live-fixture.sh",
+    "scripts/build-agent-sidecars.sh",
     "1 MiB / 10 MiB / 100 MiB",
     'RUSTLE_AGENT_DIR="$HOME/.cache/rustle/agents"',
     "preserve that variable through `sudo`",
+    "published archives are not",
     "split default routes",
     "intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",
@@ -807,6 +842,7 @@ def main() -> None:
     netns_udp_smoke = NETNS_UDP_SMOKE.read_text(encoding="utf-8")
     windows_tun_smoke_verifier = WINDOWS_TUN_SMOKE_VERIFIER.read_text(encoding="utf-8")
     agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
+    agent_sidecar_build = AGENT_SIDECAR_BUILD.read_text(encoding="utf-8")
     agent_sidecar_smoke = AGENT_SIDECAR_SMOKE.read_text(encoding="utf-8")
 
     matrix = parse_matrix(workflow)
@@ -976,6 +1012,17 @@ def main() -> None:
         fail(
             "scripts/prepare-agent-sidecars.sh is missing required snippets: "
             f"{missing_agent_sidecars!r}"
+        )
+
+    missing_agent_sidecar_build = [
+        snippet
+        for snippet in REQUIRED_AGENT_SIDECAR_BUILD_SNIPPETS
+        if snippet not in agent_sidecar_build
+    ]
+    if missing_agent_sidecar_build:
+        fail(
+            "scripts/build-agent-sidecars.sh is missing required snippets: "
+            f"{missing_agent_sidecar_build!r}"
         )
 
     missing_agent_sidecar_smoke = [

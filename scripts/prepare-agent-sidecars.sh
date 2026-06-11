@@ -54,6 +54,8 @@ case "$SKIP_CHECKSUMS" in
 esac
 
 mkdir -p "$ARCHIVE_DIR" "$OUT_DIR"
+ARCHIVE_DIR="$(cd -- "$ARCHIVE_DIR" && pwd -P)"
+OUT_DIR="$(cd -- "$OUT_DIR" && pwd -P)"
 
 archive_name() {
   local target="$1"
@@ -231,7 +233,10 @@ create_alias() {
 create_alias_if_missing() {
   local alias_path="$1"
   local target_path="$2"
-  if [[ -e "$alias_path" || -L "$alias_path" ]]; then
+  if [[ -e "$alias_path" ]]; then
+    return 0
+  fi
+  if [[ -L "$alias_path" && "$FORCE" != "1" ]]; then
     return 0
   fi
   create_alias "$alias_path" "$target_path"

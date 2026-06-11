@@ -16,6 +16,9 @@ ARCHIVE_DIR="${TMP_ROOT}/archives"
 SRC_DIR="${TMP_ROOT}/src"
 AGENT_DIR="${TMP_ROOT}/agents"
 mkdir -p "$ARCHIVE_DIR" "$SRC_DIR" "$AGENT_DIR"
+ARCHIVE_DIR="$(cd -- "$ARCHIVE_DIR" && pwd -P)"
+SRC_DIR="$(cd -- "$SRC_DIR" && pwd -P)"
+AGENT_DIR="$(cd -- "$AGENT_DIR" && pwd -P)"
 
 make_unix_archive() {
   local target="$1"
@@ -129,5 +132,32 @@ if [[ "$targets" == *aarch64-pc-windows-msvc* ]]; then
   grep -q 'windows-x64-sidecar' "${AGENT_DIR}/rustle-agent-windows-x86_64.exe"
   grep -q 'windows-arm-sidecar' "${AGENT_DIR}/rustle-agent-windows-aarch64.exe"
 fi
+
+REL_WORK="${TMP_ROOT}/relative-work"
+mkdir -p "$REL_WORK"
+(
+  cd "$REL_WORK"
+  RUSTLE_AGENT_ARCHIVE_DIR="../archives" \
+  RUSTLE_AGENT_DIR="agents" \
+  RUSTLE_AGENT_TARGETS="x86_64-unknown-linux-musl" \
+  RUSTLE_AGENT_REQUIRE_ALL=1 \
+  RUSTLE_AGENT_FORCE=1 \
+    "${SCRIPT_DIR}/prepare-agent-sidecars.sh" >prepare-relative.out
+)
+REL_AGENT_DIR="$(cd -- "${REL_WORK}/agents" && pwd -P)"
+grep -q "^RUSTLE_AGENT_DIR=${REL_AGENT_DIR}$" "${REL_WORK}/prepare-relative.out"
+test -f "${REL_AGENT_DIR}/rustle-agent-linux-x86_64"
+grep -q 'linux-x64-musl-sidecar' "${REL_AGENT_DIR}/rustle-agent-linux-x86_64"
+
+FORCE_AGENT_DIR="${TMP_ROOT}/force-agents"
+mkdir -p "$FORCE_AGENT_DIR"
+ln -s missing-sidecar "${FORCE_AGENT_DIR}/rustle-agent-linux-x86_64"
+RUSTLE_AGENT_ARCHIVE_DIR="$ARCHIVE_DIR" \
+RUSTLE_AGENT_DIR="$FORCE_AGENT_DIR" \
+RUSTLE_AGENT_TARGETS="x86_64-unknown-linux-musl" \
+RUSTLE_AGENT_REQUIRE_ALL=1 \
+RUSTLE_AGENT_FORCE=1 \
+  "${SCRIPT_DIR}/prepare-agent-sidecars.sh" >"${TMP_ROOT}/prepare-force.out"
+grep -q 'linux-x64-musl-sidecar' "${FORCE_AGENT_DIR}/rustle-agent-linux-x86_64"
 
 smoke_info "agent sidecar preparation smoke passed"

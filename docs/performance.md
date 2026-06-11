@@ -285,7 +285,10 @@ For agent-mode live benchmarks from a different local platform than the remote,
 prepare a sidecar store with `scripts/prepare-agent-sidecars.sh` and export
 `RUSTLE_AGENT_DIR` before running the smoke or benchmark. The live smoke and
 benchmark launchers preserve that variable through `sudo` so Rustle can upload
-the matching sidecar after route setup.
+the matching sidecar after route setup. When published archives are not
+available yet, use `scripts/build-agent-sidecars.sh` to build selected release
+targets from source and populate the same sidecar store before running the live
+fixture.
 
 For password-auth labs, the fixture SSH command can reuse
 `RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with
