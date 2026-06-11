@@ -382,6 +382,8 @@ Performance work must preserve these invariants:
 - generic UDP response events keep agent `Data` frame payloads as `Bytes` until
   TUN packet synthesis instead of copying each response into a temporary
   `Vec<u8>`
+- idle generic UDP associations emit close events that remove association state
+  and release active-association budget deterministically
 - DNS response events keep remote resolver payloads as `Bytes`; agent UDP DNS
   moves agent `Data` payloads directly and DNS-over-TCP slices the accumulated
   length-prefixed frame without an extracted-response `Vec<u8>` copy

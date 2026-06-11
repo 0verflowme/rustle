@@ -267,6 +267,10 @@ Required before tagging a release:
 - `udp_response_event_keeps_agent_payload_as_bytes` passes, proving generic UDP
   response events preserve the agent `Bytes` payload until TUN packet synthesis
   instead of copying every response into a temporary vector.
+- `udp_association_idle_timeout_emits_close_for_accounting` passes, proving an
+  idle generic UDP association closes deterministically and emits the close event
+  the main loop uses to remove association state and release the active UDP
+  association budget.
 - `dns_response_event_keeps_remote_payload_as_bytes` passes, proving DNS
   response events preserve remote resolver payloads as `Bytes` until TUN packet
   synthesis. Source inspection must also show agent UDP DNS returns

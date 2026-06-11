@@ -257,6 +257,8 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "payload: Bytes",
     "events.try_send_response(key, frame.payload)",
     "udp_response_event_keeps_agent_payload_as_bytes",
+    "spawn_udp_association_with_idle_timeout",
+    "udp_association_idle_timeout_emits_close_for_accounting",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
 ]
 
@@ -346,6 +348,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5",
     "low-concurrency path",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
+    "udp_association_idle_timeout_emits_close_for_accounting",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",
     "resolver takeover points the OS at the Rustle virtual DNS",
@@ -606,6 +609,7 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "high-rate remote-data events do not allocate temporary closed-flow vectors",
     "generic UDP request payloads are parsed into `Bytes` once",
     "generic UDP response events keep agent `Data` frame payloads as `Bytes`",
+    "idle generic UDP associations emit close events",
     "DNS response events keep remote resolver payloads as `Bytes`",
     "loopback DNS proxy",
     "Rustle receives the password through its `--password-file` option",

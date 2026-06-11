@@ -3433,8 +3433,24 @@ fn spawn_udp_association(
     from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
 ) {
+    spawn_udp_association_with_idle_timeout(
+        agent,
+        key,
+        from_local,
+        events,
+        UDP_ASSOCIATION_IDLE_TIMEOUT,
+    );
+}
+
+fn spawn_udp_association_with_idle_timeout(
+    agent: ReconnectingAgentBridge,
+    key: UdpFlowKey,
+    from_local: mpsc::Receiver<Bytes>,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+) {
     tokio::spawn(async move {
-        let error = run_udp_association(agent, key, from_local, events.clone())
+        let error = run_udp_association(agent, key, from_local, events.clone(), idle_timeout)
             .await
             .err()
             .map(|err| err.to_string());
@@ -3752,6 +3768,7 @@ async fn run_udp_association(
     key: UdpFlowKey,
     mut from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let stream = agent
         .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
@@ -3768,7 +3785,14 @@ async fn run_udp_association(
             )
         })?;
 
-    run_udp_association_stream(AgentIoStream::Bridge(stream), key, &mut from_local, events).await
+    run_udp_association_stream(
+        AgentIoStream::Bridge(stream),
+        key,
+        &mut from_local,
+        events,
+        idle_timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -3777,6 +3801,7 @@ async fn run_udp_association_transport(
     key: UdpFlowKey,
     mut from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
+    idle_timeout: Duration,
 ) -> Result<()> {
     let stream = agent
         .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
@@ -3793,7 +3818,14 @@ async fn run_udp_association_transport(
             )
         })?;
 
-    run_udp_association_stream(AgentIoStream::Raw(stream), key, &mut from_local, events).await
+    run_udp_association_stream(
+        AgentIoStream::Raw(stream),
+        key,
+        &mut from_local,
+        events,
+        idle_timeout,
+    )
+    .await
 }
 
 async fn run_udp_association_stream(
@@ -3801,8 +3833,9 @@ async fn run_udp_association_stream(
     key: UdpFlowKey,
     from_local: &mut mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
+    idle_timeout: Duration,
 ) -> Result<()> {
-    let idle = tokio::time::sleep(UDP_ASSOCIATION_IDLE_TIMEOUT);
+    let idle = tokio::time::sleep(idle_timeout);
     tokio::pin!(idle);
 
     loop {
@@ -3820,7 +3853,7 @@ async fn run_udp_association_stream(
                             key.dst_ip, key.dst_port
                         )
                     })?;
-                idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOCIATION_IDLE_TIMEOUT);
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
             maybe_frame = stream.recv() => {
                 let Some(frame) = maybe_frame else {
@@ -3834,7 +3867,7 @@ async fn run_udp_association_stream(
                                 key.src_ip, key.src_port, key.dst_ip, key.dst_port,
                             );
                         }
-                        idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOCIATION_IDLE_TIMEOUT);
+                        idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                     }
                     agent_proto::AgentFrameKind::Eof | agent_proto::AgentFrameKind::Close => break,
                     agent_proto::AgentFrameKind::Reset => {
@@ -13082,6 +13115,7 @@ mod tests {
             key,
             from_local,
             events,
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
         ));
 
         to_remote
@@ -13133,6 +13167,61 @@ mod tests {
             .expect("agent join")
             .expect("agent run");
         udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_idle_timeout_emits_close_for_accounting() {
+        let (transport, agent) = test_agent_transport().await;
+        let bridge = ReconnectingAgentBridge::new(
+            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+            vec![detached_bridge_transport(transport)],
+        );
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(127, 0, 0, 1),
+            dst_port: 5353,
+        };
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let mut association_limit = DnsInflight::new(1);
+        assert!(association_limit.try_admit());
+
+        spawn_udp_association_with_idle_timeout(
+            bridge.clone(),
+            key,
+            from_local,
+            events,
+            std::time::Duration::from_millis(10),
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx.recv())
+            .await
+            .expect("idle association closes")
+            .expect("close event");
+        assert_eq!(closed.key, key);
+        assert!(closed.error.is_none());
+        assert!(response_rx.try_recv().is_err());
+
+        associations.remove(&closed.key);
+        association_limit.complete();
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(association_limit.completed(), 1);
+        assert!(associations.is_empty());
+
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
     }
 
     #[tokio::test]
