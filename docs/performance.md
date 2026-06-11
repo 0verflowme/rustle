@@ -253,7 +253,10 @@ Python HTTP server on the SSH host, then runs `scripts/bench-live-compare.sh`
 against controlled 1 MiB / 10 MiB / 100 MiB responses. Each run sets
 `RUSTLE_BENCH_EXPECT_BYTES` so the benchmark fails if a response is truncated
 and `RUSTLE_BENCH_EXPECT=rustle-live-fixture` so a same-size response from the
-wrong service cannot be counted as fixture throughput.
+wrong service cannot be counted as fixture throughput. The fixture wrapper also
+captures the nested benchmark TSV output for each body size and verifies that
+each row reports successful requests and exactly `body_bytes * success`
+downloaded bytes.
 
 ```sh
 RUSTLE_FIXTURE_REMOTE=alice@ssh.example.com \

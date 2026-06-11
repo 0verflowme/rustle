@@ -19,6 +19,7 @@ PERFORMANCE_NOTES = REPO / "docs" / "performance.md"
 LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
+LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
 AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
 VERIFY_LOCAL = REPO / "scripts" / "verify-local.sh"
@@ -518,6 +519,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        "verify-live-fixture-rows.py",
+    ),
+    (
+        VERIFY_LOCAL,
         'RUN_DNS_TAKEOVER="${RUSTLE_VERIFY_DNS_TAKEOVER:-0}"',
     ),
     (
@@ -542,12 +547,25 @@ REQUIRED_LIVE_FIXTURE_SNIPPETS = [
     'sys.stdout.write("READY %d\\n"',
     'is_head = data[:5].upper() == b"HEAD "',
     "RUSTLE_BENCH_READY_METHOD=HEAD",
+    "verify_fixture_benchmark_rows",
+    "verify-live-fixture-rows.py",
+    "$fixture_results",
     "thread.daemon = True",
     "conn.close()",
     "sock.close()",
     "RUSTLE_BENCH_EXPECT=rustle-live-fixture",
     "RUSTLE_BENCH_EXPECT_BYTES",
     "bench-live-compare.sh",
+]
+
+REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS = [
+    "verify(path: pathlib.Path, body_bytes: int)",
+    "body_bytes * success",
+    "invalid live fixture benchmark row",
+    "produced no benchmark rows",
+    "produced invalid benchmark rows",
+    "--self-test",
+    "assert_rejects",
 ]
 
 REQUIRED_LIVE_SMOKE_SNIPPETS = [
@@ -616,6 +634,8 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "DNS resolver takeover, normal system resolver delivery through Rustle",
     "global `scutil --dns` resolver",
     "RUSTLE_VERIFY_LIVE_FIXTURE=1",
+    "captures the nested benchmark TSV output",
+    "body_bytes * success",
     "compact command already defaults to the framed agent transport",
     "compact auto-lane path starts after the primary agent lane",
     "short first-flow defer",
@@ -719,6 +739,7 @@ def main() -> None:
     live_smoke = LIVE_SMOKE.read_text(encoding="utf-8")
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
+    live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
     agent_sidecars = AGENT_SIDECARS.read_text(encoding="utf-8")
@@ -821,6 +842,17 @@ def main() -> None:
         fail(
             "scripts/bench-live-fixture.sh is missing required snippets: "
             f"{missing_live_fixture!r}"
+        )
+
+    missing_live_fixture_rows = [
+        snippet
+        for snippet in REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS
+        if snippet not in live_fixture_rows
+    ]
+    if missing_live_fixture_rows:
+        fail(
+            "scripts/verify-live-fixture-rows.py is missing required snippets: "
+            f"{missing_live_fixture_rows!r}"
         )
 
     missing_live_smoke = [

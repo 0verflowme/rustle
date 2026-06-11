@@ -231,6 +231,12 @@ stop_fixture() {
   fi
 }
 
+verify_fixture_benchmark_rows() {
+  local results_file="$1"
+  local body_bytes="$2"
+  "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" "$results_file" "$body_bytes"
+}
+
 for body_bytes in $FIXTURE_BODY_BYTES; do
   case "$body_bytes" in
     '' | *[!0-9]*) smoke_die "RUSTLE_FIXTURE_BODY_BYTES entries must be positive integers" ;;
@@ -244,6 +250,7 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
   start_fixture "$body_bytes" "$fixture_out" "$fixture_err"
   actual_port="$(sed -n 's/^READY //p' "$fixture_out" | tail -n 1)"
   fixture_url="http://${FIXTURE_HOST}:${actual_port}/"
+  fixture_results="${TMPDIR}/fixture-${body_bytes}-bench.tsv"
   smoke_info "benchmarking live fixture body_bytes=${body_bytes} url=${fixture_url}"
 
   env "${BENCH_ENV[@]}" \
@@ -254,6 +261,7 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
     RUSTLE_BENCH_EXPECT=rustle-live-fixture \
     RUSTLE_BENCH_EXPECT_BYTES="$body_bytes" \
     RUSTLE_BENCH_READY_METHOD=HEAD \
-    "${SCRIPT_DIR}/bench-live-compare.sh"
+    "${SCRIPT_DIR}/bench-live-compare.sh" | tee "$fixture_results"
+  verify_fixture_benchmark_rows "$fixture_results" "$body_bytes"
   stop_fixture
 done
