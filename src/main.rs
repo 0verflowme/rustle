@@ -8995,6 +8995,49 @@ mod tests {
         assert!(windows.contains("Remove-Item -LiteralPath $parent -Recurse -Force"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn uploaded_agent_cleanup_removes_unverified_posix_staging_tree() {
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let parent = env::temp_dir().join(format!(
+            "rustle-agent.cleanup-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        let temp = TempTree {
+            path: parent.clone(),
+        };
+        std::fs::create_dir(&temp.path).expect("create private staging dir");
+
+        let agent_path = temp.path.join("rustle-agent");
+        let refdir = PathBuf::from(format!("{}.refs", agent_path.display()));
+        std::fs::write(&agent_path, b"unverified").expect("write unverified helper");
+        std::fs::create_dir(&refdir).expect("create refs dir");
+        std::fs::write(refdir.join("12345"), b"stale lane marker").expect("write refs marker");
+
+        let cleanup = Command::new("sh")
+            .arg("-c")
+            .arg(uploaded_posix_agent_cleanup_command(
+                agent_path.to_str().expect("staging path is UTF-8"),
+            ))
+            .status()
+            .expect("run POSIX cleanup command");
+        assert!(cleanup.success(), "cleanup command failed");
+
+        assert!(!agent_path.exists(), "unverified helper should be removed");
+        assert!(!refdir.exists(), "refs directory should be removed");
+        assert!(!parent.exists(), "private staging dir should be removed");
+    }
+
     #[test]
     fn sha256_hex_validation_accepts_only_complete_digests() {
         assert!(is_sha256_hex(

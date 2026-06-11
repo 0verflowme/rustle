@@ -392,6 +392,9 @@ failure, timeout, or route/device shutdown.
   `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` executes
   the generated wrapper twice against a fake agent and proves the staged helper
   stays present until the last lane exits, then removes both the helper and refs.
+  `uploaded_agent_cleanup_removes_unverified_posix_staging_tree` executes the
+  verification-failure cleanup command against a fake unverified helper with a
+  non-empty refs directory and proves the private staging tree is removed.
   Reconnects may still re-upload if the staged temporary helper has already
   been cleaned up.
 - Every flow owns bounded memory. Buffer sizes are explicit, fixed, and

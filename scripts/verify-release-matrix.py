@@ -214,6 +214,7 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "uploaded_agent_sha256_command_uses_remote_hash_tools",
     "windows_uploaded_agent_sha256_command_uses_get_file_hash",
     "uploaded_agent_cleanup_command_quotes_path_and_refs",
+    "uploaded_agent_cleanup_removes_unverified_posix_staging_tree",
     "sha256_file_hex_hashes_local_file",
     "embedded_wintun_path_is_content_and_arch_addressed",
     "sha256_hex(bytes)",
@@ -365,6 +366,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "posix_remote_agent_upload_command_creates_private_executable_file",
     "Uploaded-agent integrity checks",
     "uploaded_agent_sha256_command_uses_remote_hash_tools",
+    "uploaded_agent_cleanup_removes_unverified_posix_staging_tree",
     "sha256_file_hex_hashes_local_file",
 ]
 
