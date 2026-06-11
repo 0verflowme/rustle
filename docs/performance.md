@@ -320,7 +320,10 @@ mode on the same machines:
 
 - rootless bridge benchmarks pass for both transports at 1, 8, 32, 64, and 256
   synthetic flows with 64 KiB and 1 MiB response bodies; the high-fanout stress
-  gate defaults to both `agent` and `direct-tcpip` at 256 x 1 MiB
+  gate defaults to both `agent` and `direct-tcpip` at 256 x 1 MiB. That stress
+  run is a lifecycle gate for TCP cleanup, stale remote-data handling, and
+  bridge survival under fanout; it is not throughput evidence unless the
+  benchmark is explicitly run with a release binary and recorded as such.
 - rootless framed-agent UDP benchmarks pass at 64, 512, and 1200 byte responses
   with pipeline depths 1, 32, and 128
 - agent throughput is at least as good as direct-tcpip at high concurrency, or

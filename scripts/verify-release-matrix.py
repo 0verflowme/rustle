@@ -507,6 +507,14 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         REPO / "scripts" / "stress-bridge-lab.sh",
+        'CONNECTIONS="${RUSTLE_STRESS_BRIDGE_CONNECTIONS:-256}"',
+    ),
+    (
+        REPO / "scripts" / "stress-bridge-lab.sh",
+        'BODY_BYTES="${RUSTLE_STRESS_BRIDGE_BODY_BYTES:-1048576}"',
+    ),
+    (
+        REPO / "scripts" / "stress-bridge-lab.sh",
         "RUSTLE_STRESS_BRIDGE_PROFILE:-debug",
     ),
     (
@@ -548,6 +556,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         'RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip"',
+    ),
+    (
+        VERIFY_LOCAL,
+        '"${SCRIPT_DIR}/stress-bridge-lab.sh"',
     ),
 ]
 
@@ -660,6 +672,9 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S",
     "1 MiB / 1-flow gate",
     "hard gate",
+    "256 x 1 MiB",
+    "lifecycle gate",
+    "not throughput evidence",
     "rustle-agent",
     "primary `agent` transport",
     "agent` first and `direct-tcpip` second",
