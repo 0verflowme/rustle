@@ -20,6 +20,7 @@ LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
+AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
 VERIFY_LOCAL = REPO / "scripts" / "verify-local.sh"
 SMOKE_LIB = REPO / "scripts" / "smoke-lib.sh"
 TUN_DNS_SMOKE = REPO / "scripts" / "smoke-tun-dns.sh"
@@ -220,6 +221,11 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "poll_into",
     "drain_tx_into",
     "packet_queue_device_drain_tx_into_reuses_output_vector",
+    "TCP_SEND_BUFFER_BYTES",
+    "socket.set_ack_delay(None)",
+    "socket.set_nagle_enabled(false)",
+    "new_flow_socket_uses_proxy_response_window_and_latency_settings",
+    "bridge_lab_synthetic_client_models_proxy_response_window",
     "flow_keys_into",
     "ready_to_bridge_flow_ids_into",
     "opening_flow_count",
@@ -334,6 +340,11 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "flow_manager_cleanup_enumeration_into_reuses_output_vectors",
     "remote_backlogs_flush_all_into_reuses_scratch_vectors",
     "bridge_event_handler_into_reuses_closed_flow_scratch_vector",
+    "target/release/rustle",
+    "RUSTLE_BENCH_PROFILE=debug",
+    "used as throughput evidence",
+    "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5",
+    "low-concurrency path",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
     "dns_over_agent_prefers_udp_for_ipv4_remote",
     "RUSTLE_SMOKE_CONFIGURE_DNS=1",
@@ -436,6 +447,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "sshuttle",
     "agent/sshuttle",
     "--password-file",
+    "smoke_resolve_rustle_bench_bin",
     '"${#cmd_env[@]}" -gt 0',
     "RUSTLE_BENCH_READY_METHOD",
     "probe_args+=(--head)",
@@ -447,8 +459,24 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
         'TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORTS:-agent direct-tcpip}"',
     ),
     (
+        BRIDGE_BENCH,
+        "smoke_resolve_rustle_bench_bin",
+    ),
+    (
+        BRIDGE_BENCH,
+        "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S",
+    ),
+    (
+        AGENT_UDP_BENCH,
+        "smoke_resolve_rustle_bench_bin",
+    ),
+    (
         REPO / "scripts" / "stress-bridge-lab.sh",
         'TRANSPORTS="${RUSTLE_STRESS_BRIDGE_TRANSPORTS:-agent direct-tcpip}"',
+    ),
+    (
+        REPO / "scripts" / "stress-bridge-lab.sh",
+        "RUSTLE_STRESS_BRIDGE_PROFILE:-debug",
     ),
     (
         VERIFY_LOCAL,
@@ -457,6 +485,14 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         'RUN_LIVE_FIXTURE="${RUSTLE_VERIFY_LIVE_FIXTURE:-0}"',
+    ),
+    (
+        VERIFY_LOCAL,
+        "cargo build --locked --release",
+    ),
+    (
+        VERIFY_LOCAL,
+        "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5",
     ),
     (
         VERIFY_LOCAL,
@@ -491,6 +527,9 @@ REQUIRED_LIVE_SMOKE_SNIPPETS = [
 ]
 
 REQUIRED_SMOKE_LIB_SNIPPETS = [
+    "smoke_resolve_rustle_bench_bin",
+    "RUSTLE_BENCH_PROFILE",
+    "target/${profile}/rustle",
     "smoke_wait_for_log_fixed_or_exit",
     "smoke_wait_for_rustle_target_route_logs",
     "route: added 0.0.0.0/1",
@@ -527,6 +566,11 @@ REQUIRED_TUN_DNS_SMOKE_SNIPPETS = [
 
 REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO",
+    "cargo build --release",
+    "target/release/rustle",
+    "RUSTLE_BENCH_PROFILE=debug",
+    "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S",
+    "1 MiB / 1-flow gate",
     "hard gate",
     "rustle-agent",
     "primary `agent` transport",

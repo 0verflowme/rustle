@@ -16,7 +16,7 @@ kernel firewall hooks.
 Build first:
 
 ```sh
-cargo build
+cargo build --release
 ```
 
 Run the default bridge benchmark:
@@ -24,6 +24,11 @@ Run the default bridge benchmark:
 ```sh
 scripts/bench-bridge-lab.sh
 ```
+
+Performance benchmark scripts resolve `target/release/rustle` by default so
+single-flow results are not dominated by debug-build async and crypto overhead.
+Set `RUSTLE_BENCH_PROFILE=debug` only when intentionally debugging benchmark
+harness behavior, or set `RUSTLE_BIN=/path/to/rustle` to use an explicit binary.
 
 The script starts a temporary local `sshd`, starts a local HTTP server, then runs
 `rustle bridge-lab --summary` across a connection matrix. It benchmarks the
@@ -55,9 +60,15 @@ RUSTLE_BENCH_RATIO_MIN_CONNECTIONS=32 \
 scripts/bench-bridge-lab.sh
 ```
 
-That check is intentionally a coarse guardrail, not a release claim. It catches
-obvious agent-path regressions while leaving detailed performance conclusions to
-multi-run live benchmarks on the same SSH server and target.
+Use `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a low-concurrency release-mode
+floor. `scripts/verify-local.sh` uses a conservative 1 MiB / 1-flow gate so a
+debug binary or serious serial data-path regression cannot masquerade as
+performance evidence.
+
+Those checks are intentionally coarse guardrails, not release claims. They
+catch obvious agent-path and single-flow regressions while leaving detailed
+performance conclusions to multi-run live benchmarks on the same SSH server and
+target.
 
 This benchmark is useful for bridge regressions because it exercises:
 
@@ -85,7 +96,7 @@ generic UDP datagram behavior.
 Build first:
 
 ```sh
-cargo build
+cargo build --release
 ```
 
 Run the default framed-agent UDP benchmark:

@@ -1868,8 +1868,9 @@ struct BridgeLabClient {
     response: Vec<u8>,
 }
 
-fn receive_lab_client_response(client: &mut BridgeLabClient) -> Result<()> {
+fn receive_lab_client_response(client: &mut BridgeLabClient) -> Result<usize> {
     let socket = client.sockets.get_mut::<tcp::Socket>(client.handle);
+    let mut received = 0_usize;
     while socket.can_recv() {
         let mut buf = [0_u8; 16 * 1024];
         let len = socket
@@ -1879,8 +1880,9 @@ fn receive_lab_client_response(client: &mut BridgeLabClient) -> Result<()> {
             break;
         }
         client.response.extend_from_slice(&buf[..len]);
+        received = received.saturating_add(len);
     }
-    Ok(())
+    Ok(received)
 }
 
 fn bridge_lab_client_complete(client: &BridgeLabClient) -> bool {
@@ -2002,6 +2004,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
 
     loop {
         let now = smol_now(started_at);
+        let mut made_progress = false;
         for index in 0..clients.len() {
             let packets = {
                 let client = &mut clients[index];
@@ -2010,9 +2013,9 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut flow_manager)?
             };
-            route_lab_packets_to_clients(packets, &mut clients)?;
+            made_progress |= route_lab_packets_to_clients(packets, &mut clients)? > 0;
         }
-        pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)?;
+        made_progress |= pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)? > 0;
 
         ensure_bridges(
             &mut flow_manager,
@@ -2029,8 +2032,9 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                     .send_slice(request.as_bytes())
                     .context("failed to send synthetic lab request")?;
                 lab_client.sent_request = true;
+                made_progress = true;
             }
-            receive_lab_client_response(lab_client)?;
+            made_progress |= receive_lab_client_response(lab_client)? > 0;
         }
 
         for index in 0..clients.len() {
@@ -2038,9 +2042,11 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 let client = &mut clients[index];
                 drain_lab_client_to_manager(now, client, &mut flow_manager)?
             };
-            route_lab_packets_to_clients(packets, &mut clients)?;
+            made_progress |= route_lab_packets_to_clients(packets, &mut clients)? > 0;
         }
-        let _ = drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
+        let drain_stats =
+            drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
+        made_progress |= drain_stats.bytes_to_bridge > 0;
 
         let mut processed_bridge_events = 0_usize;
         while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH
@@ -2072,33 +2078,37 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 bridges.remove(&closed_flow);
             }
         }
+        made_progress |= processed_bridge_events > 0;
+        let backlog_bytes_before_flush = remote_backlogs.total_bytes();
         remote_backlogs.flush_all_into(
             &mut flow_manager,
             now,
             &mut backlog_flow_ids,
             &mut closed_flows,
         )?;
+        made_progress |= remote_backlogs.total_bytes() != backlog_bytes_before_flush;
         for closed_flow in closed_flows.drain(..) {
             bridges.remove(&closed_flow);
+            made_progress = true;
         }
-        let _ = expire_stale_flows(
+        made_progress |= expire_stale_flows(
             &mut flow_manager,
             &mut bridges,
             &mut remote_backlogs,
             now,
             &mut expired_flows,
-        );
+        ) > 0;
 
-        pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)?;
+        made_progress |= pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)? > 0;
         for lab_client in &mut clients {
-            receive_lab_client_response(lab_client)?;
+            made_progress |= receive_lab_client_response(lab_client)? > 0;
         }
-        let _ = prune_closed_flows(
+        made_progress |= prune_closed_flows(
             &mut flow_manager,
             &mut bridges,
             &mut remote_backlogs,
             &mut removable_flows,
-        )?;
+        )? > 0;
 
         let completed = clients
             .iter()
@@ -2121,7 +2131,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             );
         }
 
-        if processed_bridge_events == 0 {
+        if !made_progress {
             tokio::time::sleep(Duration::from_millis(5)).await;
         } else {
             tokio::task::yield_now().await;
@@ -5990,10 +6000,13 @@ fn synthetic_lab_client(
     });
 
     let mut sockets = SocketSet::new(vec![]);
-    let client_handle = sockets.add(tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; 4096]),
-        tcp::SocketBuffer::new(vec![0; 4096]),
-    ));
+    let mut client_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; tcp_core::TCP_SEND_BUFFER_BYTES]),
+        tcp::SocketBuffer::new(vec![0; tcp_core::TCP_RECV_BUFFER_BYTES]),
+    );
+    client_socket.set_ack_delay(None);
+    client_socket.set_nagle_enabled(false);
+    let client_handle = sockets.add(client_socket);
     sockets
         .get_mut::<tcp::Socket>(client_handle)
         .connect(
@@ -6025,7 +6038,7 @@ fn pump_lab_manager_to_clients(
     now: SmolInstant,
     flow_manager: &mut tcp_core::FlowManager,
     clients: &mut [BridgeLabClient],
-) -> Result<()> {
+) -> Result<usize> {
     let packets = flow_manager.poll(now);
     route_lab_packets_to_clients(packets, clients)
 }
@@ -6033,7 +6046,8 @@ fn pump_lab_manager_to_clients(
 fn route_lab_packets_to_clients(
     packets: Vec<tcp_core::PacketBuf>,
     clients: &mut [BridgeLabClient],
-) -> Result<()> {
+) -> Result<usize> {
+    let mut routed = 0_usize;
     for packet in packets {
         let Some(segment) = tcp_core::parse_ipv4_tcp_segment(packet.as_ref())
             .context("failed to inspect lab TCP packet")?
@@ -6053,8 +6067,9 @@ fn route_lab_packets_to_clients(
             );
         };
         client.device.inject(packet.as_ref())?;
+        routed = routed.saturating_add(1);
     }
-    Ok(())
+    Ok(routed)
 }
 
 #[derive(Debug)]
@@ -10489,6 +10504,24 @@ mod tests {
         assert!(bridge_lab_response_complete(complete));
         assert!(!bridge_lab_response_complete(incomplete));
         assert!(!bridge_lab_response_complete(b"raw bytes"));
+    }
+
+    #[test]
+    fn bridge_lab_synthetic_client_models_proxy_response_window() {
+        let (_iface, _device, sockets, handle) = synthetic_lab_client(
+            Ipv4Addr::new(10, 255, 255, 2),
+            DEFAULT_TUN_IP,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+            49152,
+        )
+        .expect("synthetic client");
+        let socket = sockets.get::<tcp::Socket>(handle);
+
+        assert_eq!(socket.recv_capacity(), tcp_core::TCP_SEND_BUFFER_BYTES);
+        assert_eq!(socket.send_capacity(), tcp_core::TCP_RECV_BUFFER_BYTES);
+        assert_eq!(socket.ack_delay(), None);
+        assert!(!socket.nagle_enabled());
     }
 
     #[test]

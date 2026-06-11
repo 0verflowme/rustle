@@ -223,6 +223,30 @@ smoke_resolve_rustle_bin() {
   smoke_die "missing Rustle binary; run 'cargo build' or set RUSTLE_BIN=/path/to/rustle"
 }
 
+smoke_resolve_rustle_bench_bin() {
+  if [[ -n "${RUSTLE_BIN:-}" ]]; then
+    smoke_resolve_rustle_bin
+    return
+  fi
+
+  local profile="${RUSTLE_BENCH_PROFILE:-release}"
+  case "$profile" in
+    debug | release) ;;
+    *) smoke_die "RUSTLE_BENCH_PROFILE must be debug or release" ;;
+  esac
+
+  local candidate="${SMOKE_REPO_ROOT}/target/${profile}/rustle"
+  if [[ -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return
+  fi
+
+  if [[ "$profile" == "release" ]]; then
+    smoke_die "missing release Rustle binary; run 'cargo build --release' or set RUSTLE_BIN=/path/to/rustle"
+  fi
+  smoke_die "missing debug Rustle binary; run 'cargo build' or set RUSTLE_BIN=/path/to/rustle"
+}
+
 smoke_start_sshd() {
   local tmpdir="$1"
 

@@ -13,7 +13,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
+RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bench_bin)"
 RUNS="${RUSTLE_BENCH_RUNS:-3}"
 WARMUP_RUNS="${RUSTLE_BENCH_WARMUP_RUNS:-1}"
 CONNECTIONS="${RUSTLE_BENCH_CONNECTIONS:-1 8 32 64}"
@@ -21,6 +21,7 @@ BODY_BYTES="${RUSTLE_BENCH_BODY_BYTES:-65536}"
 TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORTS:-agent direct-tcpip}"
 MIN_AGENT_DIRECT_RATIO="${RUSTLE_BENCH_MIN_AGENT_DIRECT_RATIO:-}"
 RATIO_MIN_CONNECTIONS="${RUSTLE_BENCH_RATIO_MIN_CONNECTIONS:-1}"
+MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S:-}"
 RESULTS_TSV="${TMPDIR}/bridge-results.tsv"
 
 case "$RUNS" in
@@ -42,6 +43,18 @@ except ValueError as exc:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_DIRECT_RATIO must be a number") from exc
 if ratio <= 0:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_DIRECT_RATIO must be greater than 0")
+PY
+fi
+if [[ -n "$MIN_THROUGHPUT_MIB_S" ]]; then
+  "$(smoke_python)" - "$MIN_THROUGHPUT_MIB_S" <<'PY'
+import sys
+
+try:
+    threshold = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S must be a number") from exc
+if threshold <= 0:
+    raise SystemExit("RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S must be greater than 0")
 PY
 fi
 
@@ -201,6 +214,40 @@ if failures:
     raise SystemExit(
         "agent bridge throughput below configured sanity ratio "
         f"{min_ratio:.2f}:\n" + "\n".join(failures)
+    )
+PY
+fi
+
+if [[ -n "$MIN_THROUGHPUT_MIB_S" ]]; then
+  "$(smoke_python)" - "$RESULTS_TSV" "$MIN_THROUGHPUT_MIB_S" <<'PY'
+import sys
+
+path = sys.argv[1]
+minimum = float(sys.argv[2])
+
+failures = []
+rows = 0
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) != 7:
+            raise SystemExit(f"invalid benchmark row: {line!r}")
+        transport, body_bytes, connections, run, _elapsed, _response, throughput = parts
+        rows += 1
+        value = float(throughput)
+        if value < minimum:
+            failures.append(
+                f"{transport} body={body_bytes} connections={connections} run={run} "
+                f"throughput={value:.2f}MiB/s"
+            )
+
+if rows == 0:
+    raise SystemExit("throughput floor was requested, but benchmark produced no measured rows")
+
+if failures:
+    raise SystemExit(
+        "bridge throughput below configured floor "
+        f"{minimum:.2f}MiB/s:\n" + "\n".join(failures)
     )
 PY
 fi

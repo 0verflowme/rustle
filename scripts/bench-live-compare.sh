@@ -312,7 +312,7 @@ write_password_file() {
   (umask 077 && printf '%s' "$password_value" >"$path")
 }
 
-RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
+RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bench_bin)"
 RUSTLE_PASSWORD_VALUE="${RUSTLE_BENCH_PASSWORD_VALUE:-${RUSTLE_LIVE_PASSWORD_VALUE:-}}"
 if [[ -z "$RUSTLE_PASSWORD_VALUE" && "${RUSTLE_BENCH_PASSWORD:-${RUSTLE_LIVE_PASSWORD:-0}}" == "1" ]]; then
   printf 'SSH password for Rustle: ' >&2

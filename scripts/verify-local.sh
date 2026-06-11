@@ -135,6 +135,17 @@ else
 fi
 
 if [[ "$RUN_BENCH" == "1" ]]; then
+  verify_run cargo build --locked --release
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_BODY_BYTES=1048576 \
+    RUSTLE_BENCH_CONNECTIONS=1 \
+    RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip" \
+    RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5 \
+    "${SCRIPT_DIR}/bench-bridge-lab.sh"
+
   verify_run env \
     RUSTLE_BENCH_RUNS=2 \
     RUSTLE_BENCH_WARMUP_RUNS=0 \

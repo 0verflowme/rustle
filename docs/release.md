@@ -253,6 +253,14 @@ Required before tagging a release:
 - `scripts/stress-bridge-lab.sh` passes with its default both-transport
   256 x 1 MiB matrix, proving the framed agent path and direct-tcpip fallback
   survive the high-fanout TCP lifecycle workload.
+- Performance benchmark rows used for release claims are produced by release
+  binaries. The benchmark scripts resolve `target/release/rustle` by default;
+  `RUSTLE_BENCH_PROFILE=debug` is only for harness diagnosis and must not be
+  used as throughput evidence.
+- `scripts/verify-local.sh` includes a release-mode 1 MiB / 1-flow bridge
+  benchmark with `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, proving the
+  low-concurrency path is not accidentally measured with a debug binary or
+  regressed into serial frame stalls.
 - `udp_admission_moves_parsed_payload_bytes_into_association_queue` passes,
   proving generic UDP request admission moves the parsed `Bytes` payload into
   the per-association agent queue without copying it into another owned buffer.

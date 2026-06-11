@@ -16,7 +16,9 @@ use smoltcp::wire::{
     TcpPacket,
 };
 
-pub const TCP_BUFFER_BYTES: usize = 64 * 1024;
+pub const TCP_RECV_BUFFER_BYTES: usize = 64 * 1024;
+pub const TCP_SEND_BUFFER_BYTES: usize = 256 * 1024;
+pub const TCP_BUFFER_BYTES: usize = TCP_RECV_BUFFER_BYTES;
 pub const DEFAULT_MAX_ACTIVE_FLOWS: usize = 1024;
 pub const DEFAULT_FLOW_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -75,10 +77,13 @@ pub enum FlowState {
 }
 
 pub fn new_flow_socket() -> tcp::Socket<'static> {
-    tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-        tcp::SocketBuffer::new(vec![0; TCP_BUFFER_BYTES]),
-    )
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; TCP_RECV_BUFFER_BYTES]),
+        tcp::SocketBuffer::new(vec![0; TCP_SEND_BUFFER_BYTES]),
+    );
+    socket.set_ack_delay(None);
+    socket.set_nagle_enabled(false);
+    socket
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -927,6 +932,16 @@ mod tests {
         assert_eq!(flow.dst_ip, Ipv4Addr::new(172, 16, 0, 9));
         assert_eq!(flow.dst_port, 443);
         assert_eq!(flow.protocol, IpProtocol::Tcp);
+    }
+
+    #[test]
+    fn new_flow_socket_uses_proxy_response_window_and_latency_settings() {
+        let socket = new_flow_socket();
+
+        assert_eq!(socket.recv_capacity(), TCP_RECV_BUFFER_BYTES);
+        assert_eq!(socket.send_capacity(), TCP_SEND_BUFFER_BYTES);
+        assert_eq!(socket.ack_delay(), None);
+        assert!(!socket.nagle_enabled());
     }
 
     #[test]

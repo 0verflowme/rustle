@@ -13,7 +13,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
+RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bench_bin)"
 RUNS="${RUSTLE_BENCH_RUNS:-3}"
 WARMUP_RUNS="${RUSTLE_BENCH_WARMUP_RUNS:-1}"
 BODY_BYTES="${RUSTLE_BENCH_AGENT_UDP_BODY_BYTES:-64 512 1200}"
