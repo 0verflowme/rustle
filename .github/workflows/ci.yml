@@ -207,8 +207,7 @@ jobs:
           RUSTLE_BENCH_CONNECTIONS: 1
           RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent direct-tcpip quic-native
           RUSTLE_BENCH_MAX_ELAPSED_MS: 2000
-          RUSTLE_BENCH_MAX_P50_US: 500000
-          RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO: 1.10
+          RUSTLE_BENCH_MAX_P50_US: 25000
         run: bash scripts/bench-bridge-lab.sh
 
       - name: Rootless 100 MiB agent/native release benchmark

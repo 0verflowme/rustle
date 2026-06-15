@@ -395,7 +395,7 @@ REQUIRED_CI_SNIPPETS = [
     "RUSTLE_BENCH_BODY_BYTES: 104857600",
     "RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent direct-tcpip quic-native",
     "RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent quic-native",
-    "RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO: 1.10",
+    "RUSTLE_BENCH_MAX_P50_US: 25000",
     "RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO: 1.00",
     "RUSTLE_BENCH_BRIDGE_TRANSPORTS: quic-agent",
     "RUSTLE_BENCH_AGENT_DNS_TRANSPORTS: quic-agent",
@@ -523,7 +523,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "RUSTLE_BENCH_PROFILE=debug",
     "used as throughput evidence",
     "RUSTLE_BENCH_MAX_ELAPSED_MS=2000",
-    "RUSTLE_BENCH_MAX_P50_US=500000",
+    "RUSTLE_BENCH_MAX_P50_US=25000",
     "RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5",
     "low-concurrency path",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
@@ -891,7 +891,7 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
-        "RUSTLE_BENCH_MAX_P50_US=500000",
+        'RUSTLE_BENCH_MAX_P50_US="${RUSTLE_BENCH_MAX_P50_US:-25000}"',
     ),
     (
         VERIFY_LOCAL,

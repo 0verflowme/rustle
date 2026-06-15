@@ -2612,6 +2612,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
 
     let (event_tx, mut event_rx) = mpsc::channel(1024);
     let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+    let mut pending_bridge_events = VecDeque::<ssh_bridge::BridgeEvent>::new();
     let mut remote_backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
     let mut ready_flow_ids = Vec::new();
     let mut flow_keys = Vec::new();
@@ -2683,8 +2684,13 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH
             && !remote_backlogs.should_pause_bridge_events()
         {
-            let Ok(event) = event_rx.try_recv() else {
-                break;
+            let event = if let Some(event) = pending_bridge_events.pop_front() {
+                event
+            } else {
+                let Ok(event) = event_rx.try_recv() else {
+                    break;
+                };
+                event
             };
             processed_bridge_events += 1;
             match &event {
@@ -2764,7 +2770,14 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         }
 
         if !made_progress {
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::select! {
+                event = event_rx.recv() => {
+                    if let Some(event) = event {
+                        pending_bridge_events.push_back(event);
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
         } else {
             tokio::task::yield_now().await;
         }

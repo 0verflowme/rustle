@@ -86,8 +86,8 @@ stay above a fraction of the primary `agent` path on the same body/connection
 matrix, and `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` to bound native QUIC
 tiny-response p50 against `agent`.
 `scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
-with both elapsed and `p50_us` ceilings, compares `quic-native` p50 against
-`agent`, runs a 1 MiB / 1-flow gate, and runs a 100 MiB single-flow throughput gate
+with both elapsed and absolute `p50_us` ceilings across `agent`, `direct-tcpip`,
+and `quic-native`, runs a 1 MiB / 1-flow gate, and runs a 100 MiB single-flow throughput gate
 through both the primary `agent` transport and `quic-native`
 (`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
 proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
@@ -96,8 +96,8 @@ startup regression, serious serial data-path regression, or large-response
 throughput collapse masquerading as performance evidence. They do not prove the
 optional QUIC carrier is faster than the primary SSH-agent carrier on real
 remote networks; the local same-host gate now requires native QUIC 100 MiB
-throughput to meet or beat `agent` and tiny-response p50 to stay within 10% of
-`agent`. The v2 faster-data-plane claim still requires the same ratios on live
+throughput to meet or beat `agent`, while tiny-response latency is bounded by an
+absolute p50 ceiling. The v2 faster-data-plane claim still requires the same ratios on live
 remote matrices, with the p50 ratio tightened to `1.00` before release.
 Ubuntu CI also runs the deterministic release-mode subset: tiny-response p50,
 100 MiB `agent`, 100 MiB `quic-agent`, and DNS p50 for `agent`, `quic-agent`,

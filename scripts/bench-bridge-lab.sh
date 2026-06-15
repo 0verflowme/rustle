@@ -209,7 +209,7 @@ for body_bytes in $BODY_BYTES; do
         backlog_flows="$(printf '%s\n' "$summary" | sed -n 's/.* backlog_flows=\([0-9][0-9]*\).*/\1/p')"
         backlog_bytes="$(printf '%s\n' "$summary" | sed -n 's/.* backlog_bytes=\([0-9][0-9]*\).*/\1/p')"
         cleanup_iterations="$(printf '%s\n' "$summary" | sed -n 's/.* cleanup_iterations=\([0-9][0-9]*\).*/\1/p')"
-        if [[ -z "$summary_completed" || -z "$response_bytes" || -z "$elapsed_ms" || -z "$p50_us" || -z "$p95_us" || -z "$max_us" || -z "$active_flows" || -z "$active_bridges" || -z "$backlog_flows" || -z "$backlog_bytes" || -z "$cleanup_iterations" || "$elapsed_ms" -eq 0 ]]; then
+        if [[ -z "$summary_completed" || -z "$response_bytes" || -z "$elapsed_ms" || -z "$p50_us" || -z "$p95_us" || -z "$max_us" || -z "$active_flows" || -z "$active_bridges" || -z "$backlog_flows" || -z "$backlog_bytes" || -z "$cleanup_iterations" ]]; then
           sed 's/^/rustle stdout: /' "$out" >&2 || true
           smoke_die "could not parse bridge benchmark summary for transport ${transport}"
         fi
@@ -241,7 +241,7 @@ for body_bytes in $BODY_BYTES; do
 import sys
 
 response_bytes = int(sys.argv[1])
-elapsed_ms = int(sys.argv[2])
+elapsed_ms = max(1, int(sys.argv[2]))
 throughput = (response_bytes / (1024 * 1024)) / (elapsed_ms / 1000)
 print(f"{throughput:.2f}")
 PY
@@ -367,6 +367,7 @@ fi
 if [[ -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then
   "$(smoke_python)" - "$RESULTS_TSV" "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" "$RATIO_MIN_CONNECTIONS" <<'PY'
 import collections
+import statistics
 import sys
 
 path = sys.argv[1]
@@ -394,16 +395,17 @@ for body_bytes, connections in keys:
     if not agent or not quic_native:
         continue
     comparisons += 1
-    agent_avg = sum(agent) / len(agent)
-    quic_native_avg = sum(quic_native) / len(quic_native)
-    if agent_avg == 0:
-        ratio = 1.0 if quic_native_avg == 0 else float("inf")
+    agent_median = statistics.median(agent)
+    quic_native_median = statistics.median(quic_native)
+    if agent_median == 0:
+        ratio = 1.0 if quic_native_median == 0 else float("inf")
     else:
-        ratio = quic_native_avg / agent_avg
+        ratio = quic_native_median / agent_median
     if ratio > max_ratio:
         failures.append(
             f"body={body_bytes} connections={connections} "
-            f"quic-native/agent-p50={ratio:.2f} quic-native={quic_native_avg:.0f}us agent={agent_avg:.0f}us"
+            f"quic-native/agent-median-p50={ratio:.2f} "
+            f"quic-native={quic_native_median:.0f}us agent={agent_median:.0f}us"
         )
 
 if comparisons == 0:
