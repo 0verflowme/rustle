@@ -526,7 +526,8 @@ async fn run_bridge_on_connection(connection: Connection) -> Result<()> {
             }
             Err(quinn::ConnectionError::ApplicationClosed(_))
             | Err(quinn::ConnectionError::LocallyClosed)
-            | Err(quinn::ConnectionError::ConnectionClosed(_)) => break,
+            | Err(quinn::ConnectionError::ConnectionClosed(_))
+            | Err(quinn::ConnectionError::Reset) => break,
             Err(err) => return Err(err).context("failed to accept native QUIC bridge stream"),
         }
     }
