@@ -22,6 +22,7 @@ pub const TCP_BUFFER_BYTES: usize = TCP_RECV_BUFFER_BYTES;
 pub const DEFAULT_MAX_ACTIVE_FLOWS: usize = 1024;
 pub const DEFAULT_FLOW_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_BRIDGE_OPEN_TIMEOUT: Duration = DEFAULT_FLOW_IDLE_TIMEOUT;
 pub const PACKET_QUEUE_CAPACITY: usize = 256;
 const PACKET_QUEUE_TX_RESERVE: usize = 1;
 
@@ -165,6 +166,7 @@ pub struct FlowSnapshot {
 pub struct FlowPolicy {
     pub max_active_flows: usize,
     pub opening_timeout: Duration,
+    pub bridge_open_timeout: Duration,
     pub idle_timeout: Duration,
 }
 
@@ -173,6 +175,7 @@ impl Default for FlowPolicy {
         Self {
             max_active_flows: DEFAULT_MAX_ACTIVE_FLOWS,
             opening_timeout: DEFAULT_FLOW_OPEN_TIMEOUT,
+            bridge_open_timeout: DEFAULT_BRIDGE_OPEN_TIMEOUT,
             idle_timeout: DEFAULT_FLOW_IDLE_TIMEOUT,
         }
     }
@@ -184,6 +187,7 @@ struct FlowEntry {
     handle: SocketHandle,
     state: FlowState,
     created_at: Instant,
+    state_since: Instant,
     last_activity: Instant,
     local_to_remote_bytes: u64,
     remote_to_local_bytes: u64,
@@ -223,6 +227,9 @@ impl FlowManager {
         }
         if policy.opening_timeout == Duration::ZERO {
             bail!("opening_timeout must be greater than zero");
+        }
+        if policy.bridge_open_timeout == Duration::ZERO {
+            bail!("bridge_open_timeout must be greater than zero");
         }
         if policy.idle_timeout == Duration::ZERO {
             bail!("idle_timeout must be greater than zero");
@@ -500,7 +507,26 @@ impl FlowManager {
         let Some(entry) = self.flows.get_mut(&flow) else {
             bail!("flow {flow:?} does not exist");
         };
-        entry.state = state;
+        if entry.state != state {
+            entry.state = state;
+            entry.state_since = entry.last_activity;
+        }
+        Ok(())
+    }
+
+    pub fn mark_flow_state_at(
+        &mut self,
+        flow: FlowKey,
+        state: FlowState,
+        now: Instant,
+    ) -> Result<()> {
+        let Some(entry) = self.flows.get_mut(&flow) else {
+            bail!("flow {flow:?} does not exist");
+        };
+        if entry.state != state {
+            entry.state = state;
+            entry.state_since = now;
+        }
         Ok(())
     }
 
@@ -510,6 +536,7 @@ impl FlowManager {
         };
         self.sockets.get_mut::<tcp::Socket>(entry.handle).close();
         entry.state = state;
+        entry.state_since = entry.last_activity;
         Ok(())
     }
 
@@ -519,6 +546,7 @@ impl FlowManager {
         };
         self.sockets.get_mut::<tcp::Socket>(entry.handle).abort();
         entry.state = FlowState::Reset;
+        entry.state_since = entry.last_activity;
         Ok(())
     }
 
@@ -564,10 +592,13 @@ impl FlowManager {
         out.clear();
         out.reserve(self.flows.len());
         out.extend(self.flows.iter().filter_map(|(&flow, entry)| {
-            let opening_expired = matches!(
-                entry.state,
-                FlowState::NewSyn | FlowState::TcpHandshaking | FlowState::SshOpening
-            ) && now - entry.created_at >= self.policy.opening_timeout;
+            let opening_expired = match entry.state {
+                FlowState::NewSyn | FlowState::TcpHandshaking => {
+                    now - entry.state_since >= self.policy.opening_timeout
+                }
+                FlowState::SshOpening => now - entry.state_since >= self.policy.bridge_open_timeout,
+                _ => false,
+            };
             let idle_expired = matches!(
                 entry.state,
                 FlowState::TcpEstablished
@@ -582,6 +613,7 @@ impl FlowManager {
             if let Some(entry) = self.flows.get_mut(flow) {
                 self.sockets.get_mut::<tcp::Socket>(entry.handle).abort();
                 entry.state = FlowState::Reset;
+                entry.state_since = now;
                 entry.last_activity = now;
             }
         }
@@ -638,6 +670,7 @@ impl FlowManager {
                 handle,
                 state: FlowState::TcpHandshaking,
                 created_at: now,
+                state_since: now,
                 last_activity: now,
                 local_to_remote_bytes: 0,
                 remote_to_local_bytes: 0,
@@ -650,12 +683,13 @@ impl FlowManager {
         for entry in self.flows.values_mut() {
             let socket = self.sockets.get::<tcp::Socket>(entry.handle);
             if socket.may_send() && socket.may_recv() {
-                entry.state = match entry.state {
-                    FlowState::TcpHandshaking | FlowState::NewSyn => FlowState::TcpEstablished,
-                    state => state,
-                };
+                if matches!(entry.state, FlowState::TcpHandshaking | FlowState::NewSyn) {
+                    entry.state = FlowState::TcpEstablished;
+                    entry.state_since = now;
+                }
             } else if !socket.is_open() {
                 entry.state = FlowState::Closed;
+                entry.state_since = now;
                 entry.last_activity = now;
             }
         }
@@ -1163,6 +1197,54 @@ mod tests {
     }
 
     #[test]
+    fn ssh_opening_timeout_starts_when_flow_enters_ssh_opening() {
+        let mut manager = FlowManager::with_policy(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+            FlowPolicy {
+                max_active_flows: 16,
+                opening_timeout: Duration::from_millis(5),
+                bridge_open_timeout: Duration::from_millis(5),
+                idle_timeout: Duration::from_secs(300),
+            },
+        )
+        .expect("flow manager");
+        let packet = ipv4_tcp_packet(0x02, 0);
+        let flow = FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 1),
+            49152,
+            Ipv4Addr::new(172, 16, 0, 9),
+            443,
+        );
+
+        manager
+            .ingest_packet(Instant::from_millis(0), &packet)
+            .expect("opening SYN");
+        manager
+            .mark_flow_state_at(flow, FlowState::TcpEstablished, Instant::from_millis(1))
+            .expect("mark established");
+        assert!(
+            manager
+                .expire_stale_flows(Instant::from_millis(100))
+                .is_empty(),
+            "established flow waiting for bridge admission should use idle timeout"
+        );
+
+        manager
+            .mark_flow_state_at(flow, FlowState::SshOpening, Instant::from_millis(100))
+            .expect("mark opening");
+        assert!(manager
+            .expire_stale_flows(Instant::from_millis(104))
+            .is_empty());
+        assert_eq!(
+            manager.expire_stale_flows(Instant::from_millis(106)),
+            vec![flow]
+        );
+    }
+
+    #[test]
     fn flow_manager_cleanup_enumeration_into_reuses_output_vectors() {
         let mut manager = FlowManager::with_policy(
             Ipv4Addr::new(10, 255, 255, 1),
@@ -1173,6 +1255,7 @@ mod tests {
                 max_active_flows: 16,
                 opening_timeout: Duration::from_millis(5),
                 idle_timeout: Duration::from_secs(300),
+                ..FlowPolicy::default()
             },
         )
         .expect("flow manager");
@@ -1754,6 +1837,7 @@ mod tests {
                 max_active_flows: 1,
                 opening_timeout: Duration::from_secs(15),
                 idle_timeout: Duration::from_secs(300),
+                ..FlowPolicy::default()
             },
         )
         .expect("flow manager");
@@ -1792,6 +1876,7 @@ mod tests {
                 max_active_flows: 16,
                 opening_timeout: Duration::from_millis(5),
                 idle_timeout: Duration::from_secs(300),
+                ..FlowPolicy::default()
             },
         )
         .expect("flow manager");

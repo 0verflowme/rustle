@@ -93,7 +93,9 @@ verify_run cargo fmt --check
 verify_run cargo test
 verify_run cargo clippy --all-targets -- -D warnings
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-matrix.py"
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" --self-test
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-archives.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-windows-tun-smoke.py"
 for script in "${SCRIPT_DIR}"/*.sh; do
   verify_run bash -n "$script"
@@ -109,10 +111,12 @@ verify_run smoke_wait_for_uploaded_agent_cleanup
 
 if [[ "$RUN_ROOTLESS" == "1" ]]; then
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-bridge-lab.sh"
+  verify_run_skip_ok "${SCRIPT_DIR}/smoke-ssh-config-alias-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-sidecars.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-udp-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-bridge-lab.sh"
+  verify_run_skip_ok "${SCRIPT_DIR}/smoke-quic-agent-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-reconnect-lab.sh"
   verify_run_skip_ok "${SCRIPT_DIR}/smoke-agent-active-failure-lab.sh"
   verify_run_skip_ok env RUSTLE_SMOKE_AGENT_ACTIVE_FAILURE_SESSIONS=2 RUSTLE_SMOKE_AGENT_ACTIVE_FAILURE_CONNECTIONS=6 RUSTLE_SMOKE_AGENT_ACTIVE_FAILURE_MIN_COMPLETED=4 RUSTLE_SMOKE_AGENT_ACTIVE_FAILURE_REQUIRE_RESET=0 "${SCRIPT_DIR}/smoke-agent-active-failure-lab.sh"
@@ -122,12 +126,21 @@ fi
 if should_run_privileged; then
   verify_run_skip_ok env RUSTLE_SMOKE_BRIDGE_TRANSPORT=direct-tcpip "${SCRIPT_DIR}/smoke-tun-dns.sh"
   verify_run_skip_ok env RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-tun-dns.sh"
+  verify_run_skip_ok env RUSTLE_SMOKE_TARGET_CIDR=0.0.0.0/0 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent RUSTLE_SMOKE_ROUTE_ONLY=1 "${SCRIPT_DIR}/smoke-tun-dns.sh"
   if [[ "$RUN_DNS_TAKEOVER" == "1" ]]; then
     verify_run_skip_ok env RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-tun-dns.sh"
   fi
-  verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
-  verify_run_skip_ok env RUSTLE_NETNS_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
-  verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-udp.sh"
+  case "$(uname -s)" in
+    Linux)
+      verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
+      verify_run_skip_ok env RUSTLE_NETNS_BRIDGE_TRANSPORT=agent "${SCRIPT_DIR}/smoke-linux-netns-tcp.sh"
+      verify_run_skip_ok "${SCRIPT_DIR}/smoke-linux-netns-udp.sh"
+      ;;
+    *)
+      skips=$((skips + 3))
+      verify_info "Linux network namespace gates skipped on $(uname -s); not required on this platform"
+      ;;
+  esac
   verify_run smoke_wait_for_uploaded_agent_cleanup
 else
   skips=$((skips + 1))
@@ -141,12 +154,14 @@ if [[ "$RUN_BENCH" == "1" ]]; then
   verify_run cargo build --locked --release
 
   verify_run env \
-    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_RUNS=3 \
     RUSTLE_BENCH_WARMUP_RUNS=0 \
     RUSTLE_BENCH_BODY_BYTES=1024 \
     RUSTLE_BENCH_CONNECTIONS=1 \
-    RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip" \
+    RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip quic-native" \
     RUSTLE_BENCH_MAX_ELAPSED_MS=2000 \
+    RUSTLE_BENCH_MAX_P50_US=500000 \
+    RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO="${RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO:-1.10}" \
     "${SCRIPT_DIR}/bench-bridge-lab.sh"
 
   verify_run env \
@@ -155,6 +170,25 @@ if [[ "$RUN_BENCH" == "1" ]]; then
     RUSTLE_BENCH_BODY_BYTES=1048576 \
     RUSTLE_BENCH_CONNECTIONS=1 \
     RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip" \
+    RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5 \
+    "${SCRIPT_DIR}/bench-bridge-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=3 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_BODY_BYTES=104857600 \
+    RUSTLE_BENCH_CONNECTIONS=1 \
+    RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent quic-native" \
+    RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5 \
+    RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO="${RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO:-1.00}" \
+    "${SCRIPT_DIR}/bench-bridge-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_BODY_BYTES=104857600 \
+    RUSTLE_BENCH_CONNECTIONS=1 \
+    RUSTLE_BENCH_BRIDGE_TRANSPORTS="quic-agent" \
     RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5 \
     "${SCRIPT_DIR}/bench-bridge-lab.sh"
 
@@ -175,6 +209,47 @@ if [[ "$RUN_BENCH" == "1" ]]; then
     RUSTLE_BENCH_AGENT_UDP_MESSAGES=32 \
     RUSTLE_BENCH_AGENT_UDP_PIPELINES="1 8" \
     "${SCRIPT_DIR}/bench-agent-udp-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_AGENT_DNS_QUERIES=4 \
+    RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
+    "${SCRIPT_DIR}/bench-agent-dns-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_AGENT_DNS_QUERIES=4 \
+    RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="quic-agent" \
+    RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
+    "${SCRIPT_DIR}/bench-agent-dns-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_AGENT_DNS_QUERIES=4 \
+    RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="quic-native" \
+    RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
+    "${SCRIPT_DIR}/bench-agent-dns-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_AGENT_DNS_QUERIES=4 \
+    RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="quic-native" \
+    RUSTLE_BENCH_AGENT_DNS_REMOTE_HOST=localhost \
+    RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
+    "${SCRIPT_DIR}/bench-agent-dns-lab.sh"
+
+  verify_run env \
+    RUSTLE_BENCH_RUNS=1 \
+    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_AGENT_RECONNECT_CONNECTIONS=4 \
+    RUSTLE_BENCH_AGENT_RECONNECT_MIN_COMPLETED=2 \
+    RUSTLE_BENCH_AGENT_RECONNECT_MAX_ELAPSED_MS=6000 \
+    RUSTLE_BENCH_AGENT_RECONNECT_MAX_P50_US=2000000 \
+    "${SCRIPT_DIR}/bench-agent-reconnect-lab.sh"
 
   verify_run smoke_wait_for_uploaded_agent_cleanup
 fi

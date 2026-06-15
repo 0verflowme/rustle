@@ -41,17 +41,61 @@ case "$(uname -s)" in
   *) SYSTEM_DNS_IP="${RUSTLE_SMOKE_SYSTEM_DNS_IP:-$VIRTUAL_DNS_IP}" ;;
 esac
 CONFIGURE_DNS="${RUSTLE_SMOKE_CONFIGURE_DNS:-0}"
+ROUTE_ONLY="${RUSTLE_SMOKE_ROUTE_ONLY:-0}"
 DNS_NAME="${RUSTLE_SMOKE_DNS_NAME:-rustle-smoke.example.com}"
 DNS_BEFORE=""
 DNS_RESTORE_CHECKED=0
 VIRTUAL_DNS_ROUTE_ADDED=0
 
+cidr_parts() {
+  "$(smoke_python)" - "$TARGET_CIDR" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+print(network.network_address)
+print(network.netmask)
+print(network.prefixlen)
+PY
+}
+
+CIDR_INFO="$(cidr_parts)"
+TARGET_NETWORK="$(printf '%s\n' "$CIDR_INFO" | sed -n '1p')"
+TARGET_NETMASK="$(printf '%s\n' "$CIDR_INFO" | sed -n '2p')"
+TARGET_PREFIX="$(printf '%s\n' "$CIDR_INFO" | sed -n '3p')"
+
+route_snapshot() {
+  case "$(uname -s)" in
+    Darwin)
+      if [[ "$TARGET_PREFIX" == "0" ]]; then
+        netstat -rn -f inet | grep -E '(^|[[:space:]])(0/1|0\.0\.0\.0/1|128\.0/1|128\.0\.0\.0/1)([[:space:]]|$)' || true
+      else
+        netstat -rn -f inet | grep -E "(^|[[:space:]])${TARGET_NETWORK//./\\.}([[:space:]]|/|$)" || true
+      fi
+      ;;
+    Linux)
+      if [[ "$TARGET_PREFIX" == "0" ]]; then
+        { ip route show "0.0.0.0/1"; ip route show "128.0.0.0/1"; } || true
+      else
+        ip route show "$TARGET_CIDR" || true
+      fi
+      ;;
+  esac
+}
+
+ROUTE_BEFORE="$(route_snapshot)"
+
 case "$CONFIGURE_DNS" in
   0 | 1) ;;
   *) smoke_die "RUSTLE_SMOKE_CONFIGURE_DNS must be 0 or 1" ;;
 esac
+case "$ROUTE_ONLY" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_SMOKE_ROUTE_ONLY must be 0 or 1" ;;
+esac
 
 if [[ "$CONFIGURE_DNS" == "1" ]]; then
+  [[ "$ROUTE_ONLY" == "0" ]] || smoke_die "RUSTLE_SMOKE_ROUTE_ONLY=1 cannot be combined with RUSTLE_SMOKE_CONFIGURE_DNS=1"
   case "$(uname -s)" in
     Darwin) smoke_require networksetup ;;
     Linux) smoke_require resolvectl ;;
@@ -177,10 +221,26 @@ flush_system_dns_cache_best_effort() {
 delete_target_route_best_effort() {
   case "$(uname -s)" in
     Darwin)
-      "${SUDO_CMD[@]}" route -n delete -host "$TARGET_IP" >/dev/null 2>&1 || true
+      if [[ "$TARGET_PREFIX" == "0" ]]; then
+        "${SUDO_CMD[@]}" route -n delete -net 0.0.0.0 -netmask 128.0.0.0 \
+          >/dev/null 2>&1 || true
+        "${SUDO_CMD[@]}" route -n delete -net 128.0.0.0 -netmask 128.0.0.0 \
+          >/dev/null 2>&1 || true
+      elif [[ "$TARGET_PREFIX" == "32" ]]; then
+        "${SUDO_CMD[@]}" route -n delete -host "$TARGET_NETWORK" \
+          >/dev/null 2>&1 || true
+      else
+        "${SUDO_CMD[@]}" route -n delete -net "$TARGET_NETWORK" -netmask "$TARGET_NETMASK" \
+          >/dev/null 2>&1 || true
+      fi
       ;;
     Linux)
-      "${SUDO_CMD[@]}" ip route del "$TARGET_CIDR" >/dev/null 2>&1 || true
+      if [[ "$TARGET_PREFIX" == "0" ]]; then
+        "${SUDO_CMD[@]}" ip route del "0.0.0.0/1" >/dev/null 2>&1 || true
+        "${SUDO_CMD[@]}" ip route del "128.0.0.0/1" >/dev/null 2>&1 || true
+      else
+        "${SUDO_CMD[@]}" ip route del "$TARGET_CIDR" >/dev/null 2>&1 || true
+      fi
       ;;
   esac
 }
@@ -258,7 +318,11 @@ cleanup() {
   local cleanup_failed=0
   stop_rustle
   delete_virtual_dns_route_best_effort
-  delete_target_route_best_effort
+  local route_after
+  route_after="$(route_snapshot)"
+  if [[ "$route_after" != "$ROUTE_BEFORE" ]]; then
+    delete_target_route_best_effort
+  fi
   smoke_stop_pid "${SMOKE_DNS_PID:-}"
   smoke_stop_pid "${SMOKE_SSHD_PID:-}"
   if [[ "$DNS_RESTORE_CHECKED" != "1" ]] && ! verify_dns_restored; then
@@ -330,7 +394,8 @@ if [[ -z "$TUN_IF_NAME" ]]; then
 fi
 add_virtual_dns_route "$TUN_IF_NAME"
 
-if ! smoke_wait_for_log "route: added ${TARGET_CIDR}" "$RUSTLE_LOG" 10; then
+if ! smoke_wait_for_rustle_target_route_logs \
+  "$TARGET_PREFIX" "$TARGET_CIDR" "$RUSTLE_LOG" 10 "$RUSTLE_PID" rustle; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
   smoke_die "Rustle did not add the target route"
 fi
@@ -351,6 +416,18 @@ if [[ "$CONFIGURE_DNS" == "1" ]]; then
     sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
     smoke_die "runtime DNS resolver did not pick up the expected Rustle resolver"
   fi
+fi
+
+if [[ "$ROUTE_ONLY" == "1" ]]; then
+  stop_rustle
+  ROUTE_AFTER="$(route_snapshot)"
+  if [[ "$ROUTE_AFTER" != "$ROUTE_BEFORE" ]]; then
+    printf 'before route snapshot:\n%s\n' "$ROUTE_BEFORE" >&2
+    printf 'after route snapshot:\n%s\n' "$ROUTE_AFTER" >&2
+    smoke_die "target route table did not return to its original state"
+  fi
+  smoke_info "TUN route smoke passed"
+  exit 0
 fi
 
 smoke_info "sending UDP DNS query for ${DNS_NAME} to ${VIRTUAL_DNS_IP}:53"
@@ -453,19 +530,11 @@ smoke_require_stat_zero "UDP active associations" "$UDP_ACTIVE" "$FINAL_STATS"
 smoke_require_stat_zero "bridge send failures" "$BRIDGE_SEND_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "remote backlog overflows" "$BACKLOG_OVERFLOWED" "$FINAL_STATS"
 
-case "$(uname -s)" in
-  Darwin)
-    if netstat -rn -f inet | grep -Eq "(^|[[:space:]])${TARGET_IP//./\\.}([[:space:]]|$)"; then
-      netstat -rn -f inet | grep -E "${TARGET_IP//./\\.}" >&2 || true
-      smoke_die "target route still exists after Rustle shutdown"
-    fi
-    ;;
-  Linux)
-    if ip route show "$TARGET_CIDR" | grep -q "$TARGET_IP"; then
-      ip route show "$TARGET_CIDR" >&2 || true
-      smoke_die "target route still exists after Rustle shutdown"
-    fi
-    ;;
-esac
+ROUTE_AFTER="$(route_snapshot)"
+if [[ "$ROUTE_AFTER" != "$ROUTE_BEFORE" ]]; then
+  printf 'before route snapshot:\n%s\n' "$ROUTE_BEFORE" >&2
+  printf 'after route snapshot:\n%s\n' "$ROUTE_AFTER" >&2
+  smoke_die "target route table did not return to its original state"
+fi
 
 smoke_info "TUN DNS smoke passed"

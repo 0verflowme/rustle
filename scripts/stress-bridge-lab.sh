@@ -33,5 +33,8 @@ fi
 if [[ -n "${RUSTLE_STRESS_AGENT_COMMAND:-}" ]]; then
   env_args+=("RUSTLE_BENCH_AGENT_COMMAND=${RUSTLE_STRESS_AGENT_COMMAND}")
 fi
+if [[ -n "${RUSTLE_STRESS_QUIC_AGENT_COMMAND:-}" ]]; then
+  env_args+=("RUSTLE_BENCH_QUIC_AGENT_COMMAND=${RUSTLE_STRESS_QUIC_AGENT_COMMAND}")
+fi
 
 env "${env_args[@]}" "${SCRIPT_DIR}/bench-bridge-lab.sh"

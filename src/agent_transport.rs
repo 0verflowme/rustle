@@ -13,11 +13,10 @@ use crate::agent_proto::{
     AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD, AGENT_PROTOCOL_VERSION,
     CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
 };
+use crate::agent_window::AgentCreditWindow;
 
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
-const AGENT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
-const AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES: usize = AGENT_STREAM_WINDOW_BYTES / 4;
 const AGENT_STREAM_RESET_BYTES: usize = 512;
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -280,10 +279,13 @@ impl AgentTransport {
                     send_credit,
                     max_frame_payload: (self.peer.max_frame_payload as usize)
                         .min(AGENT_MAX_FRAME_PAYLOAD),
-                    pending_receive_credit: 0,
+                    receive_window: AgentCreditWindow::new(),
                     initial_receive_credit_granted: false,
                 };
-                if let Err(err) = stream.grant_receive_credit(AGENT_STREAM_WINDOW_BYTES).await {
+                if let Err(err) = stream
+                    .grant_receive_credit(AgentCreditWindow::initial_credit())
+                    .await
+                {
                     stream.close_credit_and_unregister().await;
                     return Err(err);
                 }
@@ -333,7 +335,7 @@ impl AgentTransport {
             }
         };
         let (inbound_tx, inbound_rx) = mpsc::channel(AGENT_INBOUND_FRAMES_PER_STREAM);
-        let optimistic_open_credit = AGENT_STREAM_WINDOW_BYTES;
+        let optimistic_open_credit = AgentCreditWindow::initial_credit();
         let send_credit = Arc::new(Semaphore::new(optimistic_open_credit));
         {
             let mut streams = self.streams.lock().await;
@@ -361,10 +363,13 @@ impl AgentTransport {
             failure: Arc::clone(&self.failure),
             send_credit,
             max_frame_payload: (self.peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD),
-            pending_receive_credit: 0,
+            receive_window: AgentCreditWindow::new(),
             initial_receive_credit_granted: false,
         };
-        if let Err(err) = stream.grant_receive_credit(AGENT_STREAM_WINDOW_BYTES).await {
+        if let Err(err) = stream
+            .grant_receive_credit(AgentCreditWindow::initial_credit())
+            .await
+        {
             stream.close_credit_and_unregister().await;
             return Err(err);
         }
@@ -394,7 +399,7 @@ pub struct AgentStream {
     failure: FailureState,
     send_credit: Arc<Semaphore>,
     max_frame_payload: usize,
-    pending_receive_credit: usize,
+    receive_window: AgentCreditWindow,
     initial_receive_credit_granted: bool,
 }
 
@@ -460,7 +465,7 @@ impl AgentStream {
             AgentFrameKind::Opened => {
                 if !self.initial_receive_credit_granted {
                     if self
-                        .grant_receive_credit(AGENT_STREAM_WINDOW_BYTES)
+                        .grant_receive_credit(AgentCreditWindow::initial_credit())
                         .await
                         .is_err()
                     {
@@ -518,12 +523,10 @@ impl AgentStream {
     }
 
     async fn record_received_data_credit(&mut self, bytes: usize) -> Result<()> {
-        self.pending_receive_credit = self.pending_receive_credit.saturating_add(bytes);
-        if self.pending_receive_credit < AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES {
-            return Ok(());
+        if let Some(credit) = self.receive_window.record_consumed(bytes) {
+            self.grant_receive_credit(credit).await?;
         }
-        let credit = std::mem::take(&mut self.pending_receive_credit);
-        self.grant_receive_credit(credit).await
+        Ok(())
     }
 
     async fn grant_receive_credit(&self, bytes: usize) -> Result<()> {
@@ -900,6 +903,10 @@ mod tests {
 
     use super::*;
     use crate::agent_runtime::{run, AgentRuntimeConfig};
+    use crate::agent_window::{
+        AGENT_STREAM_INITIAL_WINDOW_BYTES as AGENT_STREAM_WINDOW_BYTES,
+        AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES,
+    };
 
     #[derive(Clone, Default)]
     struct CountingWriter {
@@ -951,7 +958,7 @@ mod tests {
             failure: Arc::new(Mutex::new(None)),
             send_credit: Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
-            pending_receive_credit: 0,
+            receive_window: AgentCreditWindow::new(),
             initial_receive_credit_granted: true,
         }
     }
@@ -1780,6 +1787,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_recv_grows_receive_window_after_sustained_consumption() {
+        let (outbound, mut outbound_rx) = mpsc::channel(8);
+        let (inbound_tx, inbound) = mpsc::channel(8);
+        let mut stream = test_agent_stream(11, outbound, inbound);
+        let frames_to_window = AGENT_STREAM_WINDOW_BYTES / AGENT_MAX_FRAME_PAYLOAD;
+        let mut largest_credit = 0_usize;
+
+        for _ in 0..frames_to_window {
+            inbound_tx
+                .send(
+                    AgentFrame::new(
+                        AgentFrameKind::Data,
+                        11,
+                        Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
+                    )
+                    .expect("data frame"),
+                )
+                .await
+                .expect("queue max-frame data");
+            let frame = stream.recv().await.expect("receive max-frame data");
+            assert_eq!(frame.kind, AgentFrameKind::Data);
+            while let Ok(window) = outbound_rx.try_recv() {
+                assert_eq!(window.kind, AgentFrameKind::Window);
+                assert_eq!(window.stream_id, 11);
+                largest_credit = largest_credit.max(window.credit as usize);
+            }
+        }
+
+        assert!(largest_credit > AGENT_STREAM_WINDOW_BYTES);
+        assert!(stream.receive_window.current_window() > AGENT_STREAM_WINDOW_BYTES);
+    }
+
+    #[tokio::test]
     async fn stream_send_data_segments_payloads_above_frame_limit() {
         let (client_io, agent_io) = duplex(512 * 1024);
         let (mut agent_reader, mut agent_writer) = split(agent_io);
@@ -2132,7 +2172,7 @@ mod tests {
             failure: std::sync::Arc::clone(&failure),
             send_credit: std::sync::Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
-            pending_receive_credit: 0,
+            receive_window: AgentCreditWindow::new(),
             initial_receive_credit_granted: true,
         };
         let err = stream

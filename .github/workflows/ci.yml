@@ -36,6 +36,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python3 scripts/verify-windows-tun-smoke.py
 
+      - name: Verify live benchmark row gates
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/verify-live-benchmark-rows.py --self-test
+
       - name: Install Linux smoke dependencies
         if: runner.os == 'Linux'
         run: |
@@ -92,6 +96,19 @@ jobs:
           fi
           exit "$status"
 
+      - name: Rootless SSH config alias smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-ssh-config-alias-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "SSH config alias smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
       - name: Rootless agent TCP smoke
         if: runner.os != 'Windows'
         shell: bash
@@ -131,6 +148,19 @@ jobs:
           fi
           exit "$status"
 
+      - name: Rootless QUIC agent bridge smoke
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/smoke-quic-agent-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "QUIC agent bridge smoke skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
       - name: Rootless agent reconnect smoke
         if: runner.os != 'Windows'
         shell: bash
@@ -143,6 +173,89 @@ jobs:
             exit 0
           fi
           exit "$status"
+
+      - name: Rootless agent reconnect benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_PROFILE: debug
+          RUSTLE_BENCH_RUNS: 3
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_AGENT_RECONNECT_MAX_ELAPSED_MS: 6000
+          RUSTLE_BENCH_AGENT_RECONNECT_MAX_P50_US: 2000000
+        run: |
+          set -euo pipefail
+          status=0
+          bash scripts/bench-agent-reconnect-lab.sh || status=$?
+          if [[ "$status" -eq 77 ]]; then
+            echo "agent reconnect benchmark skipped on this runner"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Build release benchmark binary
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --locked --release
+
+      - name: Rootless tiny-response release benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_RUNS: 3
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_BODY_BYTES: 1024
+          RUSTLE_BENCH_CONNECTIONS: 1
+          RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent direct-tcpip quic-native
+          RUSTLE_BENCH_MAX_ELAPSED_MS: 2000
+          RUSTLE_BENCH_MAX_P50_US: 500000
+          RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO: 1.10
+        run: bash scripts/bench-bridge-lab.sh
+
+      - name: Rootless 100 MiB agent/native release benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_RUNS: 3
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_BODY_BYTES: 104857600
+          RUSTLE_BENCH_CONNECTIONS: 1
+          RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent quic-native
+          RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S: 5
+          RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO: 1.00
+        run: bash scripts/bench-bridge-lab.sh
+
+      - name: Rootless 100 MiB QUIC agent release benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_RUNS: 1
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_BODY_BYTES: 104857600
+          RUSTLE_BENCH_CONNECTIONS: 1
+          RUSTLE_BENCH_BRIDGE_TRANSPORTS: quic-agent
+          RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S: 5
+        run: bash scripts/bench-bridge-lab.sh
+
+      - name: Rootless DNS latency release benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_RUNS: 1
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_AGENT_DNS_QUERIES: 4
+          RUSTLE_BENCH_AGENT_DNS_MAX_P50_US: 500000
+        run: bash scripts/bench-agent-dns-lab.sh
+
+      - name: Rootless QUIC DNS latency release benchmark
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          RUSTLE_BENCH_RUNS: 1
+          RUSTLE_BENCH_WARMUP_RUNS: 0
+          RUSTLE_BENCH_AGENT_DNS_QUERIES: 4
+          RUSTLE_BENCH_AGENT_DNS_TRANSPORTS: quic-agent
+          RUSTLE_BENCH_AGENT_DNS_MAX_P50_US: 500000
+        run: bash scripts/bench-agent-dns-lab.sh
 
       - name: Rootless agent active-failure smoke
         if: runner.os != 'Windows'

@@ -15,14 +15,13 @@ use crate::agent_proto::{
     encode_frame_into, encoded_frames_len, try_decode_frame, AgentFrame, AgentFrameKind,
     AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
+use crate::agent_window::AgentCreditWindow;
 
 const AGENT_OUTBOUND_FRAMES: usize = 512;
 const AGENT_LOCAL_INPUT_FRAMES_PER_STREAM: usize = 128;
 const AGENT_STREAM_COMPLETIONS: usize = 1024;
 const AGENT_TCP_READ_CHUNK: usize = AGENT_MAX_FRAME_PAYLOAD;
 const AGENT_UDP_READ_CHUNK: usize = 64 * 1024;
-const AGENT_STREAM_WINDOW_BYTES: usize = 1024 * 1024;
-const AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES: usize = AGENT_STREAM_WINDOW_BYTES / 4;
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_FRAME_WRITE_BURST: usize = 64;
@@ -630,7 +629,7 @@ async fn run_tcp_connected_stream(
         &out_tx,
         AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
             .expect("empty frame")
-            .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
+            .with_credit(AgentCreditWindow::initial_credit() as u32),
     )
     .await
     .is_err()
@@ -641,7 +640,7 @@ async fn run_tcp_connected_stream(
     let (mut reader, mut writer) = stream.into_split();
     let write_out_tx = out_tx.clone();
     let writer_task = tokio::spawn(async move {
-        let mut pending_receive_credit = 0_usize;
+        let mut receive_window = AgentCreditWindow::new();
         while let Some(input) = from_local.recv().await {
             match input {
                 AgentTcpInput::Data(bytes) => {
@@ -655,14 +654,9 @@ async fn run_tcp_connected_stream(
                         .await;
                         return;
                     }
-                    if record_receive_credit(
-                        &write_out_tx,
-                        stream_id,
-                        &mut pending_receive_credit,
-                        len,
-                    )
-                    .await
-                    .is_err()
+                    if record_receive_credit(&write_out_tx, stream_id, &mut receive_window, len)
+                        .await
+                        .is_err()
                     {
                         return;
                     }
@@ -778,7 +772,7 @@ async fn run_udp_stream_inner(
         &out_tx,
         AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
             .expect("empty frame")
-            .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
+            .with_credit(AgentCreditWindow::initial_credit() as u32),
     )
     .await
     .is_err()
@@ -790,7 +784,7 @@ async fn run_udp_stream_inner(
     let write_socket = Arc::clone(&socket);
     let write_out_tx = out_tx.clone();
     let writer_task = tokio::spawn(async move {
-        let mut pending_receive_credit = 0_usize;
+        let mut receive_window = AgentCreditWindow::new();
         while let Some(input) = from_local.recv().await {
             match input {
                 AgentUdpInput::Data(bytes) => {
@@ -804,14 +798,9 @@ async fn run_udp_stream_inner(
                         .await;
                         return;
                     }
-                    if record_receive_credit(
-                        &write_out_tx,
-                        stream_id,
-                        &mut pending_receive_credit,
-                        len,
-                    )
-                    .await
-                    .is_err()
+                    if record_receive_credit(&write_out_tx, stream_id, &mut receive_window, len)
+                        .await
+                        .is_err()
                     {
                         return;
                     }
@@ -863,15 +852,13 @@ async fn run_udp_stream_inner(
 async fn record_receive_credit(
     out_tx: &mpsc::Sender<AgentFrame>,
     stream_id: u64,
-    pending_receive_credit: &mut usize,
+    receive_window: &mut AgentCreditWindow,
     bytes: usize,
 ) -> Result<()> {
-    *pending_receive_credit = pending_receive_credit.saturating_add(bytes);
-    if *pending_receive_credit < AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES {
-        return Ok(());
+    if let Some(credit) = receive_window.record_consumed(bytes) {
+        send_window(out_tx, stream_id, credit).await?;
     }
-    let credit = std::mem::take(pending_receive_credit);
-    send_window(out_tx, stream_id, credit).await
+    Ok(())
 }
 
 async fn send_reset(out_tx: &mpsc::Sender<AgentFrame>, stream_id: u64, reason: &str) -> Result<()> {
@@ -934,6 +921,10 @@ mod tests {
 
     use super::*;
     use crate::agent_proto::{encode_frame, try_decode_frame, AgentHello, AgentOpenIpv4};
+    use crate::agent_window::{
+        AGENT_STREAM_INITIAL_WINDOW_BYTES as AGENT_STREAM_WINDOW_BYTES,
+        AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES,
+    };
 
     struct PendingWriter {
         entered_write: Arc<Notify>,
@@ -1167,11 +1158,11 @@ mod tests {
     #[tokio::test]
     async fn runtime_receive_credit_batches_until_threshold() {
         let (out_tx, mut out_rx) = mpsc::channel(8);
-        let mut pending_receive_credit = 0_usize;
+        let mut receive_window = AgentCreditWindow::new();
         let chunk = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / 4;
 
         for _ in 0..3 {
-            record_receive_credit(&out_tx, 7, &mut pending_receive_credit, chunk)
+            record_receive_credit(&out_tx, 7, &mut receive_window, chunk)
                 .await
                 .expect("record receive credit below threshold");
             assert!(
@@ -1180,7 +1171,7 @@ mod tests {
             );
         }
 
-        record_receive_credit(&out_tx, 7, &mut pending_receive_credit, chunk)
+        record_receive_credit(&out_tx, 7, &mut receive_window, chunk)
             .await
             .expect("record receive credit at threshold");
 
@@ -1191,7 +1182,6 @@ mod tests {
             window.credit as usize,
             AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
         );
-        assert_eq!(pending_receive_credit, 0);
         assert!(
             out_rx.try_recv().is_err(),
             "batched receive credit should emit exactly one window"
@@ -1201,12 +1191,12 @@ mod tests {
     #[tokio::test]
     async fn runtime_receive_credit_grants_max_frame_immediately() {
         let (out_tx, mut out_rx) = mpsc::channel(8);
-        let mut pending_receive_credit = 0_usize;
+        let mut receive_window = AgentCreditWindow::new();
 
         record_receive_credit(
             &out_tx,
             9,
-            &mut pending_receive_credit,
+            &mut receive_window,
             AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES,
         )
         .await
@@ -1219,11 +1209,26 @@ mod tests {
             window.credit as usize,
             AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
         );
-        assert_eq!(pending_receive_credit, 0);
         assert!(
             out_rx.try_recv().is_err(),
             "single max frame should emit exactly one window"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_receive_credit_grows_after_sustained_window_consumption() {
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut receive_window = AgentCreditWindow::new();
+
+        record_receive_credit(&out_tx, 11, &mut receive_window, AGENT_STREAM_WINDOW_BYTES)
+            .await
+            .expect("record sustained receive credit");
+
+        let window = out_rx.recv().await.expect("receive growth window");
+        assert_eq!(window.kind, AgentFrameKind::Window);
+        assert_eq!(window.stream_id, 11);
+        assert!(window.credit as usize > AGENT_STREAM_WINDOW_BYTES);
+        assert!(receive_window.current_window() > AGENT_STREAM_WINDOW_BYTES);
     }
 
     #[tokio::test]

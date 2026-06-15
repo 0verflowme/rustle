@@ -34,6 +34,9 @@ CURL_TIMEOUT="${RUSTLE_BENCH_CURL_TIMEOUT:-45}"
 START_TIMEOUT="${RUSTLE_BENCH_START_TIMEOUT:-45}"
 KEEP_LOGS="${RUSTLE_BENCH_KEEP_LOGS:-0}"
 MIN_AGENT_SSHUTTLE_RATIO="${RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO:-}"
+MAX_AGENT_SSHUTTLE_P50_RATIO="${RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO:-}"
+MIN_QUIC_NATIVE_AGENT_RATIO="${RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO:-}"
+MAX_QUIC_NATIVE_AGENT_P50_RATIO="${RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO:-}"
 LIVE_GATE_TOOL_PATTERN="${RUSTLE_BENCH_LIVE_TOOL_PATTERN:-}"
 LIVE_MAX_P50_MS="${RUSTLE_BENCH_LIVE_MAX_P50_MS:-}"
 LIVE_MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S:-}"
@@ -65,6 +68,42 @@ except ValueError as exc:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO must be a number") from exc
 if ratio <= 0:
     raise SystemExit("RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO must be greater than 0")
+PY
+fi
+if [[ -n "$MAX_AGENT_SSHUTTLE_P50_RATIO" ]]; then
+  "$(smoke_python)" - "$MAX_AGENT_SSHUTTLE_P50_RATIO" <<'PY'
+import sys
+
+try:
+    ratio = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO must be a number") from exc
+if ratio <= 0:
+    raise SystemExit("RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO must be greater than 0")
+PY
+fi
+if [[ -n "$MIN_QUIC_NATIVE_AGENT_RATIO" ]]; then
+  "$(smoke_python)" - "$MIN_QUIC_NATIVE_AGENT_RATIO" <<'PY'
+import sys
+
+try:
+    ratio = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO must be a number") from exc
+if ratio <= 0:
+    raise SystemExit("RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO must be greater than 0")
+PY
+fi
+if [[ -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then
+  "$(smoke_python)" - "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" <<'PY'
+import sys
+
+try:
+    ratio = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit("RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO must be a number") from exc
+if ratio <= 0:
+    raise SystemExit("RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO must be greater than 0")
 PY
 fi
 if [[ -n "$LIVE_MAX_P50_MS" || -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
@@ -107,6 +146,9 @@ fi
 if [[ "$CONCURRENCY" -gt "$REQUESTS" ]]; then
   CONCURRENCY="$REQUESTS"
 fi
+if [[ -n "${RUSTLE_BENCH_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" && -n "${RUSTLE_BENCH_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
+  smoke_die "RUSTLE_BENCH_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND cannot be combined with RUSTLE_BENCH_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH"
+fi
 if [[ -z "$RUSTLE_TRANSPORTS" ]]; then
   RUSTLE_TRANSPORTS="${RUSTLE_BENCH_BRIDGE_TRANSPORT:-${RUSTLE_LIVE_BRIDGE_TRANSPORT:-}}"
 fi
@@ -115,10 +157,20 @@ if [[ -z "$RUSTLE_TRANSPORTS" ]]; then
 fi
 for transport in $RUSTLE_TRANSPORTS; do
   case "$transport" in
-    direct-tcpip | agent) ;;
-    *) smoke_die "RUSTLE_BENCH_RUSTLE_TRANSPORTS entries must be direct-tcpip or agent" ;;
+    direct-tcpip | agent | quic-agent | quic-native) ;;
+    *) smoke_die "RUSTLE_BENCH_RUSTLE_TRANSPORTS entries must be direct-tcpip, agent, quic-agent, or quic-native" ;;
   esac
 done
+if [[ -n "$MIN_QUIC_NATIVE_AGENT_RATIO" || -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then
+  case " $RUSTLE_TRANSPORTS " in
+    *" agent "* ) ;;
+    *) smoke_die "include agent in RUSTLE_BENCH_RUSTLE_TRANSPORTS when using quic-native/agent ratio gates" ;;
+  esac
+  case " $RUSTLE_TRANSPORTS " in
+    *" quic-native "* ) ;;
+    *) smoke_die "include quic-native in RUSTLE_BENCH_RUSTLE_TRANSPORTS when using quic-native/agent ratio gates" ;;
+  esac
+fi
 
 URL_ROUTE_PROBE_IP="${RUSTLE_BENCH_ROUTE_PROBE_IP:-}"
 if [[ -z "$URL_ROUTE_PROBE_IP" ]]; then
@@ -391,6 +443,9 @@ start_rustle() {
   fi
   if [[ -n "${RUSTLE_BENCH_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" ]]; then
     cmd+=(--agent-command "${RUSTLE_BENCH_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}")
+  fi
+  if [[ -n "${RUSTLE_BENCH_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
+    cmd+=(--agent-path "${RUSTLE_BENCH_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}")
   fi
   if [[ -n "${RUSTLE_BENCH_AGENT_SESSIONS:-${RUSTLE_LIVE_AGENT_SESSIONS:-}}" ]]; then
     cmd+=(--agent-sessions "${RUSTLE_BENCH_AGENT_SESSIONS:-${RUSTLE_LIVE_AGENT_SESSIONS:-}}")
@@ -824,114 +879,29 @@ for tool in $TOOLS; do
   done
 done
 
+live_gate_args=()
 if [[ -n "$MIN_AGENT_SSHUTTLE_RATIO" ]]; then
-  "$(smoke_python)" - "$RESULTS_TSV" "$MIN_AGENT_SSHUTTLE_RATIO" <<'PY'
-import collections
-import sys
-
-path = sys.argv[1]
-min_ratio = float(sys.argv[2])
-
-throughput = collections.defaultdict(list)
-with open(path, "r", encoding="utf-8") as handle:
-    for line in handle:
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) != 20:
-            raise SystemExit(f"invalid live benchmark row: {line!r}")
-        tool = parts[0]
-        success = int(parts[4])
-        failed = int(parts[5])
-        if failed != 0 or success == 0:
-            continue
-        throughput[tool].append(float(parts[10]))
-
-agent = throughput.get("rustle-agent")
-sshuttle = throughput.get("sshuttle")
-if not agent or not sshuttle:
-    raise SystemExit(
-        "RUSTLE_BENCH_MIN_AGENT_SSHUTTLE_RATIO requires successful "
-        "rustle-agent and sshuttle rows; set "
-        'RUSTLE_BENCH_TOOLS="rustle sshuttle" and include agent in '
-        "RUSTLE_BENCH_RUSTLE_TRANSPORTS"
-    )
-
-agent_avg = sum(agent) / len(agent)
-sshuttle_avg = sum(sshuttle) / len(sshuttle)
-ratio = agent_avg / sshuttle_avg if sshuttle_avg else float("inf")
-if ratio < min_ratio:
-    raise SystemExit(
-        "rustle-agent throughput below configured sshuttle ratio "
-        f"{min_ratio:.2f}: agent/sshuttle={ratio:.2f} "
-        f"agent={agent_avg:.2f}MiB/s sshuttle={sshuttle_avg:.2f}MiB/s"
-    )
-
-print(
-    "rustle-agent/sshuttle throughput ratio "
-    f"{ratio:.2f} passed threshold {min_ratio:.2f}",
-    file=sys.stderr,
-)
-PY
+  live_gate_args+=(--min-agent-sshuttle-throughput-ratio "$MIN_AGENT_SSHUTTLE_RATIO")
 fi
-
+if [[ -n "$MAX_AGENT_SSHUTTLE_P50_RATIO" ]]; then
+  live_gate_args+=(--max-agent-sshuttle-p50-ratio "$MAX_AGENT_SSHUTTLE_P50_RATIO")
+fi
+if [[ -n "$MIN_QUIC_NATIVE_AGENT_RATIO" ]]; then
+  live_gate_args+=(--min-quic-native-agent-throughput-ratio "$MIN_QUIC_NATIVE_AGENT_RATIO")
+fi
+if [[ -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then
+  live_gate_args+=(--max-quic-native-agent-p50-ratio "$MAX_QUIC_NATIVE_AGENT_P50_RATIO")
+fi
 if [[ -n "$LIVE_MAX_P50_MS" || -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
-  "$(smoke_python)" - "$RESULTS_TSV" "$LIVE_GATE_TOOL_PATTERN" "$LIVE_MAX_P50_MS" "$LIVE_MIN_THROUGHPUT_MIB_S" <<'PY'
-import fnmatch
-import sys
-
-path, pattern, max_p50, min_throughput = sys.argv[1:]
-max_p50_value = None if max_p50 == "" else float(max_p50)
-min_throughput_value = None if min_throughput == "" else float(min_throughput)
-
-failures = []
-matched_rows = 0
-with open(path, "r", encoding="utf-8") as handle:
-    for line in handle:
-        parts = line.rstrip("\n").split("\t")
-        if len(parts) != 20:
-            raise SystemExit(f"invalid live benchmark row: {line!r}")
-        tool = parts[0]
-        if not fnmatch.fnmatchcase(tool, pattern):
-            continue
-        success = int(parts[4])
-        failed = int(parts[5])
-        if failed != 0 or success == 0:
-            continue
-        matched_rows += 1
-        run = parts[1]
-        p50 = float(parts[7])
-        throughput = float(parts[10])
-        if max_p50_value is not None and p50 > max_p50_value:
-            failures.append(
-                f"{tool} run={run} p50={p50:.1f}ms exceeds {max_p50_value:.1f}ms"
-            )
-        if min_throughput_value is not None and throughput < min_throughput_value:
-            failures.append(
-                f"{tool} run={run} throughput={throughput:.2f}MiB/s below "
-                f"{min_throughput_value:.2f}MiB/s"
-            )
-
-if matched_rows == 0:
-    raise SystemExit(
-        "live benchmark regression gates requested, but "
-        f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r} matched no successful rows"
-    )
-
-if failures:
-    raise SystemExit(
-        "live benchmark regression gate failed for "
-        f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r}:\n" + "\n".join(failures)
-    )
-
-checks = []
-if max_p50_value is not None:
-    checks.append(f"p50 <= {max_p50_value:.1f}ms")
-if min_throughput_value is not None:
-    checks.append(f"throughput >= {min_throughput_value:.2f}MiB/s")
-print(
-    "live benchmark regression gate passed for "
-    f"RUSTLE_BENCH_LIVE_TOOL_PATTERN={pattern!r}: "
-    + ", ".join(checks),
-    file=sys.stderr,
-)
-PY
+  live_gate_args+=(--tool-pattern "$LIVE_GATE_TOOL_PATTERN")
+  if [[ -n "$LIVE_MAX_P50_MS" ]]; then
+    live_gate_args+=(--max-p50-ms "$LIVE_MAX_P50_MS")
+  fi
+  if [[ -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
+    live_gate_args+=(--min-throughput-mib-s "$LIVE_MIN_THROUGHPUT_MIB_S")
+  fi
+fi
+if [[ "${#live_gate_args[@]}" -gt 0 ]]; then
+  "$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" \
+    "$RESULTS_TSV" "${live_gate_args[@]}"
 fi

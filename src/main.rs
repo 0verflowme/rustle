@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::env;
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Command;
@@ -22,7 +22,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use ssh_key::known_hosts::{HostPatterns, KnownHosts, Marker};
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tun_rs::DeviceBuilder;
@@ -33,8 +33,10 @@ mod agent_client;
 mod agent_proto;
 mod agent_runtime;
 mod agent_transport;
+mod agent_window;
 mod dns;
 mod platform;
+mod quic_agent;
 mod ssh_bridge;
 #[allow(dead_code)]
 mod tcp_core;
@@ -43,7 +45,9 @@ const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 const DEFAULT_TUN_PREFIX: u8 = 24;
 const DEFAULT_MTU: u16 = 1300;
 const PACKET_BUF_SIZE: usize = 2048;
-const REMOTE_BACKLOG_BYTES_PER_FLOW: usize = 2 * 1024 * 1024;
+const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
+const REMOTE_BACKLOG_BYTES_PER_FLOW: usize =
+    tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW;
 const REMOTE_BACKLOG_BYTES_TOTAL: usize = 128 * 1024 * 1024;
 const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,13 +80,17 @@ const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const AGENT_FAST_START_WARMUP_DELAY: Duration = Duration::from_millis(100);
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const BRIDGE_LAB_EVENT_BATCH: usize = 64;
+const BRIDGE_LAB_EVENT_BATCH: usize = 32;
 const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
 const SSH_PASSWORD_FILE_ENV: &str = "RUSTLE_SSH_PASSWORD_FILE";
 const AGENT_INITIAL_CONNECT_BATCH: usize = 4;
 const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
+const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
+const DEFAULT_QUIC_AGENT_COMMAND: &str = "rustle quic-agent";
+const DEFAULT_QUIC_BRIDGE_AGENT_COMMAND: &str = "rustle quic-bridge-agent";
+const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str = "uname -s 2>/dev/null; uname -m 2>/dev/null";
 const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
 const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
@@ -124,6 +132,18 @@ enum CommandKind {
     /// Lab: exercise framed agent UDP over SSH exec.
     #[command(hide = true)]
     AgentUdpLab(AgentUdpLabArgs),
+
+    /// Lab: measure DNS query latency through Rustle's DNS transport.
+    #[command(hide = true)]
+    AgentDnsLab(AgentDnsLabArgs),
+
+    /// Remote helper: run the Rustle agent protocol over a QUIC listener.
+    #[command(hide = true)]
+    QuicAgent(QuicAgentArgs),
+
+    /// Remote helper: run native per-flow QUIC bridge streams.
+    #[command(hide = true)]
+    QuicBridgeAgent(QuicBridgeAgentArgs),
 
     /// Remote helper: run the Rustle agent protocol on stdin/stdout.
     #[command(hide = true)]
@@ -176,6 +196,10 @@ struct SshArgs {
     /// OpenSSH known_hosts file to use for host-key verification.
     #[arg(long = "known-hosts")]
     known_hosts: Option<PathBuf>,
+
+    /// OpenSSH client config file to use for Host aliases.
+    #[arg(long = "ssh-config", value_name = "PATH", hide = true)]
+    ssh_config: Option<PathBuf>,
 
     /// Timeout for establishing the SSH control TCP connection.
     #[arg(
@@ -430,6 +454,8 @@ enum BridgeTransportKind {
     Auto,
     DirectTcpip,
     Agent,
+    QuicAgent,
+    QuicNative,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -504,10 +530,71 @@ struct AgentUdpLabArgs {
 }
 
 #[derive(Debug, Parser)]
+struct AgentDnsLabArgs {
+    #[command(flatten)]
+    ssh: SshArgs,
+
+    /// Remote DNS resolver to query through the selected Rustle transport.
+    #[arg(long = "dns-remote")]
+    dns_remote: String,
+
+    /// DNS name to query.
+    #[arg(long = "name", default_value = "rustle-smoke.example.com")]
+    name: String,
+
+    /// Number of DNS queries to send sequentially.
+    #[arg(long = "queries", default_value_t = 32)]
+    queries: usize,
+
+    /// Hidden transport switch for DNS latency labs.
+    #[arg(
+        long = "bridge-transport",
+        value_enum,
+        default_value = "agent",
+        hide = true
+    )]
+    bridge_transport: BridgeTransportKind,
+
+    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
+    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
+    agent_command: Option<String>,
+
+    /// Remote executable path to quote before appending the `agent` subcommand.
+    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
+    agent_path: Option<String>,
+
+    /// Number of Rustle agent exec transports to open for DNS queries.
+    #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
+    agent_sessions: usize,
+
+    /// MTU advertised to the remote agent.
+    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
+    mtu: u16,
+}
+
+#[derive(Debug, Parser)]
 struct AgentArgs {
     /// MTU advertised to the local Rustle controller.
     #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
     mtu: u16,
+}
+
+#[derive(Debug, Parser)]
+struct QuicAgentArgs {
+    /// UDP address the QUIC agent should listen on.
+    #[arg(long = "bind", default_value = "0.0.0.0:0")]
+    bind: SocketAddr,
+
+    /// MTU advertised to the local Rustle controller.
+    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
+    mtu: u16,
+}
+
+#[derive(Debug, Parser)]
+struct QuicBridgeAgentArgs {
+    /// UDP address the native QUIC bridge helper should listen on.
+    #[arg(long = "bind", default_value = "0.0.0.0:0")]
+    bind: SocketAddr,
 }
 
 #[tokio::main]
@@ -520,9 +607,46 @@ async fn main() -> Result<()> {
         Some(CommandKind::BridgeLab(args)) => run_bridge_lab(args).await,
         Some(CommandKind::AgentLab(args)) => run_agent_lab(args).await,
         Some(CommandKind::AgentUdpLab(args)) => run_agent_udp_lab(args).await,
+        Some(CommandKind::AgentDnsLab(args)) => run_agent_dns_lab(args).await,
+        Some(CommandKind::QuicAgent(args)) => run_quic_agent(args).await,
+        Some(CommandKind::QuicBridgeAgent(args)) => run_quic_bridge_agent(args).await,
         Some(CommandKind::Agent(args)) => run_agent(args).await,
         None => run_compact_tunnel(cli.compact).await,
     }
+}
+
+async fn run_quic_agent(args: QuicAgentArgs) -> Result<()> {
+    let server = quic_agent::start_quic_agent_server(args.bind)?;
+    {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", server.bootstrap().encode_line())
+            .context("failed to write QUIC agent bootstrap line")?;
+        stdout
+            .flush()
+            .context("failed to flush QUIC agent bootstrap line")?;
+    }
+    eprintln!("quic-agent: listening on {}", server.local_addr()?);
+    server
+        .run_one(agent_runtime::AgentRuntimeConfig::new(args.mtu))
+        .await
+}
+
+async fn run_quic_bridge_agent(args: QuicBridgeAgentArgs) -> Result<()> {
+    let server = quic_agent::start_quic_bridge_server(args.bind)?;
+    {
+        use std::io::Write;
+
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", server.bootstrap().encode_bridge_line())
+            .context("failed to write native QUIC bridge bootstrap line")?;
+        stdout
+            .flush()
+            .context("failed to flush native QUIC bridge bootstrap line")?;
+    }
+    eprintln!("quic-bridge-agent: listening on {}", server.local_addr()?);
+    server.run().await
 }
 
 async fn run_agent(args: AgentArgs) -> Result<()> {
@@ -544,7 +668,7 @@ async fn run_agent_lab_inner(args: AgentLabArgs) -> Result<()> {
 
     let agent_command =
         effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu);
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu)?;
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport
@@ -633,7 +757,7 @@ async fn run_agent_udp_lab_inner(args: AgentUdpLabArgs) -> Result<()> {
     let destination = parse_ipv4_destination(&args.destination)?;
     let agent_command =
         effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu);
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu)?;
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport
@@ -719,6 +843,143 @@ async fn run_agent_udp_lab_inner(args: AgentUdpLabArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_agent_dns_lab(args: AgentDnsLabArgs) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(60), run_agent_dns_lab_inner(args))
+        .await
+        .context("agent DNS lab timed out")?
+}
+
+async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
+    if args.queries == 0 {
+        bail!("agent-dns-lab --queries must be greater than zero");
+    }
+    if args.queries > MAX_AGENT_UDP_LAB_MESSAGES {
+        bail!(
+            "agent-dns-lab --queries must not exceed {}",
+            MAX_AGENT_UDP_LAB_MESSAGES
+        );
+    }
+
+    let dns_remote = parse_destination(&args.dns_remote)
+        .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
+    let agent_command = effective_bridge_agent_command(
+        args.bridge_transport,
+        args.agent_command.as_deref(),
+        args.agent_path.as_deref(),
+    )?;
+    let (bridge_runtime, dns_transport) = connect_bridge_runtime(
+        &args.ssh,
+        args.bridge_transport,
+        &agent_command,
+        args.mtu,
+        Some(&dns_remote),
+        BridgeRuntimeOptions {
+            ssh_sessions: DEFAULT_SSH_SESSIONS,
+            agent_sessions: args.agent_sessions,
+            fast_start_auto_agent_lanes: false,
+        },
+    )
+    .await?;
+
+    let mut latencies_us = Vec::with_capacity(args.queries);
+    let mut response_bytes = 0_usize;
+    let started_at = StdInstant::now();
+    for index in 0..args.queries {
+        let id = 0x5200_u16.wrapping_add(index as u16);
+        let query = build_dns_a_query(id, &args.name)?;
+        let query_started = StdInstant::now();
+        let response = query_dns_over_transport(dns_transport.clone(), &dns_remote, &query)
+            .await
+            .with_context(|| format!("DNS query {} through Rustle transport failed", index + 1))?;
+        let elapsed = query_started.elapsed().as_micros();
+        validate_dns_response(&query, response.as_ref())
+            .with_context(|| format!("invalid DNS response for query {}", index + 1))?;
+        response_bytes = response_bytes.saturating_add(response.len());
+        latencies_us.push(elapsed);
+    }
+
+    let elapsed = started_at.elapsed();
+    latencies_us.sort_unstable();
+    let p50_us = percentile_nearest_rank(&latencies_us, 50);
+    let p95_us = percentile_nearest_rank(&latencies_us, 95);
+    let max_us = *latencies_us.last().unwrap_or(&0);
+    println!(
+        "agent_dns_lab_summary transport={:?} queries={} response_bytes={} elapsed_ms={} p50_us={} p95_us={} max_us={}",
+        args.bridge_transport,
+        args.queries,
+        response_bytes,
+        elapsed.as_millis(),
+        p50_us,
+        p95_us,
+        max_us,
+    );
+
+    drop(bridge_runtime);
+    Ok(())
+}
+
+fn build_dns_a_query(id: u16, name: &str) -> Result<Vec<u8>> {
+    let name = name.trim_end_matches('.');
+    if name.is_empty() {
+        bail!("DNS query name must not be empty");
+    }
+
+    let mut query = Vec::with_capacity(12 + name.len() + 6);
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&0x0100_u16.to_be_bytes());
+    query.extend_from_slice(&1_u16.to_be_bytes());
+    query.extend_from_slice(&0_u16.to_be_bytes());
+    query.extend_from_slice(&0_u16.to_be_bytes());
+    query.extend_from_slice(&0_u16.to_be_bytes());
+
+    let mut qname_len = 1_usize;
+    for label in name.split('.') {
+        if label.is_empty() {
+            bail!("DNS query name contains an empty label: {name}");
+        }
+        if label.len() > 63 {
+            bail!("DNS label is too long in query name: {label}");
+        }
+        qname_len = qname_len
+            .checked_add(1 + label.len())
+            .ok_or_else(|| anyhow!("DNS query name is too long: {name}"))?;
+        if qname_len > 255 {
+            bail!("DNS query name is too long: {name}");
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&1_u16.to_be_bytes());
+    query.extend_from_slice(&1_u16.to_be_bytes());
+    Ok(query)
+}
+
+fn validate_dns_response(query: &[u8], response: &[u8]) -> Result<()> {
+    if query.len() < 2 || response.len() < 12 {
+        bail!("DNS response is too short");
+    }
+    if response[0..2] != query[0..2] {
+        bail!("DNS response ID does not match query ID");
+    }
+    let flags = u16::from_be_bytes([response[2], response[3]]);
+    if flags & 0x8000 == 0 {
+        bail!("DNS response is not marked as a response");
+    }
+    let rcode = flags & 0x000f;
+    if rcode != 0 {
+        bail!("DNS response returned rcode {rcode}");
+    }
+    Ok(())
+}
+
+fn percentile_nearest_rank(sorted: &[u128], percentile: usize) -> u128 {
+    debug_assert!(!sorted.is_empty());
+    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+    let index = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[index]
+}
+
 type AgentBridgeConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentBridgeTransport>> + Send + 'a>>;
 type AgentBridgeConnectManyFuture<'a> =
@@ -733,23 +994,23 @@ trait AgentBridgeConnector: Send + Sync {
 
 #[derive(Clone)]
 struct SshAgentBridgeConnector {
-    ssh: SshArgs,
+    prepared: Arc<PreparedSshConnection>,
     agent_command: String,
     mtu: u16,
 }
 
 impl SshAgentBridgeConnector {
-    fn new(ssh: SshArgs, agent_command: String, mtu: u16) -> Self {
-        Self {
-            ssh,
+    fn new(ssh: SshArgs, agent_command: String, mtu: u16) -> Result<Self> {
+        Ok(Self {
+            prepared: Arc::new(prepare_ssh_connection(&ssh)?),
             agent_command,
             mtu,
-        }
+        })
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        match connect_agent_bridge_transport_fresh_ssh_command(
-            &self.ssh,
+        match connect_agent_bridge_transport_fresh_prepared_ssh_command(
+            &self.prepared,
             &self.agent_command,
             self.mtu,
         )
@@ -760,7 +1021,9 @@ impl SshAgentBridgeConnector {
                 eprintln!(
                     "agent: remote command failed ({initial_err:#}); trying upload bootstrap"
                 );
-                match connect_uploaded_agent_bridge_transport(&self.ssh, self.mtu).await {
+                match connect_uploaded_agent_bridge_transport_prepared(&self.prepared, self.mtu)
+                    .await
+                {
                     Ok(agent) => {
                         eprintln!("agent: bootstrapped remote agent from local binary");
                         Ok(agent)
@@ -793,8 +1056,64 @@ impl AgentBridgeConnector for SshAgentBridgeConnector {
 
     fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a> {
         Box::pin(async move {
-            connect_agent_bridge_transport_fresh_ssh_command(&self.ssh, agent_command, self.mtu)
-                .await
+            connect_agent_bridge_transport_fresh_prepared_ssh_command(
+                &self.prepared,
+                agent_command,
+                self.mtu,
+            )
+            .await
+        })
+    }
+}
+
+struct SshQuicAgentBridgeConnector {
+    prepared: Arc<PreparedSshConnection>,
+    agent_command: String,
+    mtu: u16,
+}
+
+impl SshQuicAgentBridgeConnector {
+    fn new(ssh: SshArgs, agent_command: String, mtu: u16) -> Result<Self> {
+        Ok(Self {
+            prepared: Arc::new(prepare_ssh_connection(&ssh)?),
+            agent_command,
+            mtu,
+        })
+    }
+
+    async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
+        connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
+            &self.prepared,
+            &self.agent_command,
+            self.mtu,
+        )
+        .await
+    }
+}
+
+impl AgentBridgeConnector for SshQuicAgentBridgeConnector {
+    fn primary_command(&self) -> &str {
+        &self.agent_command
+    }
+
+    fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_> {
+        Box::pin(async move {
+            connect_agent_bridge_transports_from_connector(self, desired_sessions).await
+        })
+    }
+
+    fn connect_primary(&self) -> AgentBridgeConnectFuture<'_> {
+        Box::pin(async move { self.connect_primary_transport().await })
+    }
+
+    fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a> {
+        Box::pin(async move {
+            connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
+                &self.prepared,
+                agent_command,
+                self.mtu,
+            )
+            .await
         })
     }
 }
@@ -941,14 +1260,14 @@ async fn connect_additional_agent_bridge_transport_batch(
     }
 }
 
-async fn connect_agent_bridge_transport_fresh_ssh_command(
-    ssh: &SshArgs,
+async fn connect_agent_bridge_transport_fresh_prepared_ssh_command(
+    prepared: &PreparedSshConnection,
     agent_command: &str,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
     // A Rustle agent lane is deliberately a fresh SSH connection with one exec
     // channel, not another channel multiplexed over an existing SSH carrier.
-    let handle = connect_ssh(ssh).await?;
+    let handle = connect_prepared_ssh(prepared).await?;
     connect_agent_bridge_transport_on_handle(handle, agent_command, mtu).await
 }
 
@@ -982,20 +1301,162 @@ async fn connect_agent_bridge_transport_on_handle(
     })
 }
 
-async fn connect_uploaded_agent_bridge_transport(
-    ssh: &SshArgs,
+async fn connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
+    prepared: &PreparedSshConnection,
+    agent_command: &str,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    connect_uploaded_agent_bridge_transport_with_command(ssh, mtu)
+    let handle = connect_prepared_ssh(prepared).await?;
+    connect_quic_agent_bridge_transport_on_handle(handle, &prepared.target.host, agent_command, mtu)
+        .await
+}
+
+async fn connect_quic_agent_bridge_transport_on_handle(
+    handle: Handle<Client>,
+    remote_host: &str,
+    agent_command: &str,
+    mtu: u16,
+) -> Result<AgentBridgeTransport> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("failed to open SSH session channel for Rustle QUIC agent")?;
+    channel
+        .exec(true, agent_command.to_owned())
+        .await
+        .with_context(|| format!("failed to exec remote Rustle QUIC agent: {agent_command}"))?;
+
+    let mut reader = BufReader::new(channel.into_stream());
+    let mut line = String::new();
+    let read = tokio::time::timeout(QUIC_AGENT_BOOTSTRAP_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .context("timed out waiting for QUIC agent bootstrap line")?
+        .context("failed to read QUIC agent bootstrap line")?;
+    if read == 0 {
+        bail!("remote QUIC agent exited before writing its bootstrap line");
+    }
+    let bootstrap = quic_agent::QuicAgentBootstrap::decode_line(&line)
+        .context("invalid QUIC agent bootstrap line")?;
+    let remote_addr = resolve_quic_agent_addr(remote_host, bootstrap.port)?;
+    eprintln!(
+        "quic-agent: connecting UDP data plane to {remote_addr} cert_sha256={}",
+        bootstrap.cert_sha256
+    );
+
+    let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
+    let client = quic_agent::connect_quic_agent(remote_addr, &bootstrap, mtu).await?;
+    let (transport, session) = client.into_transport_and_session();
+
+    Ok(AgentBridgeTransport {
+        carrier: AgentBridgeCarrier::Quic(QuicAgentCarrier {
+            handle,
+            _session: session,
+            drain_task,
+        }),
+        transport,
+        agent_command: agent_command.to_owned(),
+    })
+}
+
+async fn connect_quic_native_bridge_fresh_ssh_command(
+    ssh: &SshArgs,
+    agent_command: &str,
+) -> Result<QuicNativeBridge> {
+    let target = resolve_ssh_target(ssh)?;
+    let handle = connect_ssh(ssh).await?;
+    connect_quic_native_bridge_on_handle(handle, &target.host, agent_command).await
+}
+
+async fn connect_quic_native_bridge_on_handle(
+    handle: Handle<Client>,
+    remote_host: &str,
+    agent_command: &str,
+) -> Result<QuicNativeBridge> {
+    let channel = handle
+        .channel_open_session()
+        .await
+        .context("failed to open SSH session channel for native QUIC bridge helper")?;
+    channel
+        .exec(true, agent_command.to_owned())
+        .await
+        .with_context(|| {
+            format!("failed to exec remote native QUIC bridge helper: {agent_command}")
+        })?;
+
+    let mut reader = BufReader::new(channel.into_stream());
+    let mut line = String::new();
+    let read = tokio::time::timeout(QUIC_AGENT_BOOTSTRAP_TIMEOUT, reader.read_line(&mut line))
+        .await
+        .context("timed out waiting for native QUIC bridge bootstrap line")?
+        .context("failed to read native QUIC bridge bootstrap line")?;
+    if read == 0 {
+        bail!("remote native QUIC bridge helper exited before writing its bootstrap line");
+    }
+    let bootstrap = quic_agent::QuicAgentBootstrap::decode_bridge_line(&line)
+        .context("invalid native QUIC bridge bootstrap line")?;
+    let remote_addr = resolve_quic_agent_addr(remote_host, bootstrap.port)?;
+    eprintln!(
+        "quic-native: connecting UDP data plane to {remote_addr} cert_sha256={}",
+        bootstrap.cert_sha256
+    );
+
+    let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
+    let client = quic_agent::connect_quic_bridge(remote_addr, &bootstrap).await?;
+
+    Ok(QuicNativeBridge {
+        client,
+        _carrier: Some(Arc::new(QuicNativeCarrier {
+            _handle: handle,
+            drain_task,
+        })),
+    })
+}
+
+async fn drain_quic_agent_ssh_output<R>(mut reader: BufReader<R>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = line.trim_end_matches(['\r', '\n']);
+                if !line.is_empty() {
+                    eprintln!("quic-agent: remote output: {line}");
+                }
+            }
+            Err(err) => {
+                eprintln!("quic-agent: failed to drain remote output: {err:#}");
+                break;
+            }
+        }
+    }
+}
+
+fn resolve_quic_agent_addr(remote_host: &str, port: u16) -> Result<SocketAddr> {
+    (remote_host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("failed to resolve QUIC agent address for {remote_host}:{port}"))?
+        .next()
+        .ok_or_else(|| anyhow!("no socket addresses found for QUIC agent {remote_host}:{port}"))
+}
+
+async fn connect_uploaded_agent_bridge_transport_prepared(
+    prepared: &PreparedSshConnection,
+    mtu: u16,
+) -> Result<AgentBridgeTransport> {
+    connect_uploaded_agent_bridge_transport_with_command_prepared(prepared, mtu)
         .await
         .map(|(transport, _)| transport)
 }
 
-async fn connect_uploaded_agent_bridge_transport_with_command(
-    ssh: &SshArgs,
+async fn connect_uploaded_agent_bridge_transport_with_command_prepared(
+    prepared: &PreparedSshConnection,
     mtu: u16,
 ) -> Result<(AgentBridgeTransport, String)> {
-    let handle = connect_ssh(ssh).await?;
+    let handle = connect_prepared_ssh(prepared).await?;
     let platform = probe_remote_platform(&handle)
         .await
         .context("failed to determine remote platform for Rustle agent bootstrap")?;
@@ -1432,6 +1893,55 @@ fn effective_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
+    effective_remote_helper_command(agent_command, agent_path, "agent", DEFAULT_AGENT_COMMAND)
+}
+
+fn effective_quic_agent_command(
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<String> {
+    effective_remote_helper_command(
+        agent_command,
+        agent_path,
+        "quic-agent",
+        DEFAULT_QUIC_AGENT_COMMAND,
+    )
+}
+
+fn effective_quic_bridge_agent_command(
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<String> {
+    effective_remote_helper_command(
+        agent_command,
+        agent_path,
+        "quic-bridge-agent",
+        DEFAULT_QUIC_BRIDGE_AGENT_COMMAND,
+    )
+}
+
+fn effective_bridge_agent_command(
+    transport: BridgeTransportKind,
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<String> {
+    match transport {
+        BridgeTransportKind::QuicAgent => effective_quic_agent_command(agent_command, agent_path),
+        BridgeTransportKind::QuicNative => {
+            effective_quic_bridge_agent_command(agent_command, agent_path)
+        }
+        BridgeTransportKind::Auto
+        | BridgeTransportKind::DirectTcpip
+        | BridgeTransportKind::Agent => effective_agent_command(agent_command, agent_path),
+    }
+}
+
+fn effective_remote_helper_command(
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+    helper_subcommand: &str,
+    default_command: &str,
+) -> Result<String> {
     match (agent_command, agent_path) {
         (Some(_), Some(_)) => {
             bail!("--agent-command cannot be combined with --agent-path");
@@ -1446,9 +1956,9 @@ fn effective_agent_command(
             if path.trim().is_empty() {
                 bail!("--agent-path must not be empty");
             }
-            Ok(format!("{} agent", shell_quote(path)))
+            Ok(format!("{} {helper_subcommand}", shell_quote(path)))
         }
-        (None, None) => Ok(DEFAULT_AGENT_COMMAND.to_owned()),
+        (None, None) => Ok(default_command.to_owned()),
     }
 }
 
@@ -1521,7 +2031,7 @@ async fn connect_bridge_runtime(
                 ssh.clone(),
                 agent_command.to_owned(),
                 mtu,
-            ));
+            )?);
             let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,
@@ -1554,13 +2064,35 @@ async fn connect_bridge_runtime(
             let dns_transport = DnsTransport::Agent(agent.clone());
             Ok((BridgeRuntime::Agent(agent), dns_transport))
         }
+        BridgeTransportKind::QuicAgent => {
+            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
+            let connector: Arc<dyn AgentBridgeConnector> = Arc::new(
+                SshQuicAgentBridgeConnector::new(ssh.clone(), agent_command.to_owned(), mtu)?,
+            );
+            let agent = connector.connect_initial(desired_agent_sessions).await?;
+            ensure_agent_dns_remote_supported(&agent, dns_remote)?;
+            let agent = ReconnectingAgentBridge::new_with_desired_lanes(
+                connector,
+                agent,
+                desired_agent_sessions,
+            );
+            let dns_transport = DnsTransport::Agent(agent.clone());
+            Ok((BridgeRuntime::Agent(agent), dns_transport))
+        }
+        BridgeTransportKind::QuicNative => {
+            let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, agent_command).await?;
+            Ok((
+                BridgeRuntime::QuicNative(bridge.clone()),
+                DnsTransport::QuicNative(bridge),
+            ))
+        }
         BridgeTransportKind::Auto => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(SshAgentBridgeConnector::new(
                 ssh.clone(),
                 agent_command.to_owned(),
                 mtu,
-            ));
+            )?);
             let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,
@@ -1776,8 +2308,11 @@ async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
 
 async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;
-    let agent_command =
-        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let agent_command = effective_bridge_agent_command(
+        args.bridge_transport,
+        args.agent_command.as_deref(),
+        args.agent_path.as_deref(),
+    )?;
     let target_routes = expand_target_routes(&args.targets)?;
     let dns_remote = parse_destination(&args.dns_remote)
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
@@ -1785,7 +2320,7 @@ async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         .ssh
         .ssh_server
         .as_deref()
-        .map(|remote| ssh_control_ip_to_protect(remote, &target_routes))
+        .map(|_| ssh_control_ip_to_protect(&args.ssh, &target_routes))
         .transpose()?
         .flatten();
 
@@ -1891,6 +2426,8 @@ struct BridgeLabClient {
     sockets: SocketSet<'static>,
     handle: smoltcp::iface::SocketHandle,
     sent_request: bool,
+    request_sent_at: Option<StdInstant>,
+    response_complete_at: Option<StdInstant>,
     saw_bridge_close: bool,
     response: Vec<u8>,
 }
@@ -1914,6 +2451,63 @@ fn receive_lab_client_response(client: &mut BridgeLabClient) -> Result<usize> {
 
 fn bridge_lab_client_complete(client: &BridgeLabClient) -> bool {
     client.sent_request && client.saw_bridge_close && bridge_lab_response_complete(&client.response)
+}
+
+fn abort_bridge_lab_client_socket(client: &mut BridgeLabClient) -> bool {
+    let socket = client.sockets.get_mut::<tcp::Socket>(client.handle);
+    if !socket.is_active() {
+        return false;
+    }
+    socket.abort();
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BridgeLabLatencySummary {
+    p50_us: u128,
+    p95_us: u128,
+    max_us: u128,
+}
+
+fn record_bridge_lab_response_completion(client: &mut BridgeLabClient, now: StdInstant) -> bool {
+    if client.response_complete_at.is_none()
+        && client.sent_request
+        && bridge_lab_response_complete(&client.response)
+    {
+        client.response_complete_at = Some(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn bridge_lab_client_latency_us(client: &BridgeLabClient) -> Option<u128> {
+    let sent_at = client.request_sent_at?;
+    let completed_at = client.response_complete_at?;
+    Some(completed_at.saturating_duration_since(sent_at).as_micros())
+}
+
+fn bridge_lab_latency_summary(
+    clients: &[BridgeLabClient],
+    latencies_us: &mut Vec<u128>,
+) -> BridgeLabLatencySummary {
+    latencies_us.clear();
+    latencies_us.extend(clients.iter().filter_map(bridge_lab_client_latency_us));
+    bridge_lab_latency_percentiles(latencies_us.as_mut_slice())
+}
+
+fn bridge_lab_latency_percentiles(latencies_us: &mut [u128]) -> BridgeLabLatencySummary {
+    if latencies_us.is_empty() {
+        return BridgeLabLatencySummary::default();
+    }
+    latencies_us.sort_unstable();
+    BridgeLabLatencySummary {
+        p50_us: percentile_nearest_rank(latencies_us, 50),
+        p95_us: percentile_nearest_rank(latencies_us, 95),
+        max_us: *latencies_us
+            .last()
+            .expect("non-empty bridge latency sample must have max"),
+    }
 }
 
 fn bridge_lab_response_complete(response: &[u8]) -> bool {
@@ -1957,8 +2551,11 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         .request
         .clone()
         .unwrap_or_else(|| default_http_request(&destination.host));
-    let agent_command =
-        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let agent_command = effective_bridge_agent_command(
+        args.bridge_transport,
+        args.agent_command.as_deref(),
+        args.agent_path.as_deref(),
+    )?;
     let (bridge_runtime, _) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
@@ -2006,6 +2603,8 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             sockets,
             handle,
             sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
             saw_bridge_close: false,
             response: Vec::new(),
         });
@@ -2022,7 +2621,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
     let mut expired_flows = Vec::new();
     let mut removable_flows = Vec::new();
     let started_at = StdInstant::now();
-    let deadline_secs = 15_u64.max((args.connections as u64).saturating_div(2));
+    let deadline_secs = 30_u64.max(args.connections as u64);
     let deadline = tokio::time::Instant::now()
         + args
             .deadline_ms
@@ -2040,7 +2639,8 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut flow_manager)?
             };
-            made_progress |= route_lab_packets_to_clients(packets, &mut clients)? > 0;
+            made_progress |=
+                route_lab_packets_to_clients(now, packets, &mut clients, &mut flow_manager)? > 0;
         }
         made_progress |= pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)? > 0;
 
@@ -2050,6 +2650,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             &bridge_runtime,
             event_tx.clone(),
             &mut ready_flow_ids,
+            now,
         )?;
 
         for lab_client in &mut clients {
@@ -2059,9 +2660,11 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                     .send_slice(request.as_bytes())
                     .context("failed to send synthetic lab request")?;
                 lab_client.sent_request = true;
+                lab_client.request_sent_at = Some(StdInstant::now());
                 made_progress = true;
             }
             made_progress |= receive_lab_client_response(lab_client)? > 0;
+            made_progress |= record_bridge_lab_response_completion(lab_client, StdInstant::now());
         }
 
         for index in 0..clients.len() {
@@ -2069,7 +2672,8 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 let client = &mut clients[index];
                 drain_lab_client_to_manager(now, client, &mut flow_manager)?
             };
-            made_progress |= route_lab_packets_to_clients(packets, &mut clients)? > 0;
+            made_progress |=
+                route_lab_packets_to_clients(now, packets, &mut clients, &mut flow_manager)? > 0;
         }
         let drain_stats =
             drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
@@ -2129,6 +2733,7 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         made_progress |= pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)? > 0;
         for lab_client in &mut clients {
             made_progress |= receive_lab_client_response(lab_client)? > 0;
+            made_progress |= record_bridge_lab_response_completion(lab_client, StdInstant::now());
         }
         made_progress |= prune_closed_flows(
             &mut flow_manager,
@@ -2165,19 +2770,45 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         }
     }
 
+    let cleanup_iterations = settle_bridge_lab_cleanup(
+        started_at,
+        &mut flow_manager,
+        &mut bridges,
+        &mut remote_backlogs,
+        &mut clients,
+        &mut event_rx,
+        BridgeLabCleanupScratch {
+            backlog_flow_ids: &mut backlog_flow_ids,
+            closed_flows: &mut closed_flows,
+            bridge_event_closed_flows: &mut bridge_event_closed_flows,
+            removable_flows: &mut removable_flows,
+        },
+    )
+    .await?;
+
     let elapsed = started_at.elapsed();
     let response_bytes: usize = clients.iter().map(|client| client.response.len()).sum();
     if args.summary {
+        let mut latencies_us = Vec::with_capacity(clients.len());
+        let latency = bridge_lab_latency_summary(&clients, &mut latencies_us);
         let completed = clients
             .iter()
             .filter(|client| bridge_lab_client_complete(client))
             .count();
         println!(
-            "bridge_lab_summary connections={} completed={} response_bytes={} elapsed_ms={}",
+            "bridge_lab_summary connections={} completed={} response_bytes={} elapsed_ms={} p50_us={} p95_us={} max_us={} active_flows={} active_bridges={} backlog_flows={} backlog_bytes={} cleanup_iterations={}",
             clients.len(),
             completed,
             response_bytes,
-            elapsed.as_millis()
+            elapsed.as_millis(),
+            latency.p50_us,
+            latency.p95_us,
+            latency.max_us,
+            flow_manager.active_flow_count(),
+            bridges.len(),
+            remote_backlogs.active_flow_count(),
+            remote_backlogs.total_bytes(),
+            cleanup_iterations,
         );
     } else {
         let mut response = Vec::with_capacity(response_bytes);
@@ -2190,6 +2821,87 @@ async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             .context("failed to write bridge lab response to stdout")?;
     }
     Ok(())
+}
+
+struct BridgeLabCleanupScratch<'a> {
+    backlog_flow_ids: &'a mut Vec<tcp_core::FlowId>,
+    closed_flows: &'a mut Vec<tcp_core::FlowKey>,
+    bridge_event_closed_flows: &'a mut Vec<tcp_core::FlowKey>,
+    removable_flows: &'a mut Vec<tcp_core::FlowKey>,
+}
+
+async fn settle_bridge_lab_cleanup(
+    started_at: StdInstant,
+    flow_manager: &mut tcp_core::FlowManager,
+    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    remote_backlogs: &mut RemoteBacklogs,
+    clients: &mut [BridgeLabClient],
+    event_rx: &mut mpsc::Receiver<ssh_bridge::BridgeEvent>,
+    scratch: BridgeLabCleanupScratch<'_>,
+) -> Result<usize> {
+    for iteration in 0..64_usize {
+        let now = smol_now(started_at);
+        for index in 0..clients.len() {
+            let _ = abort_bridge_lab_client_socket(&mut clients[index]);
+
+            let packets = {
+                let client = &mut clients[index];
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+                drain_lab_client_to_manager(now, client, flow_manager)?
+            };
+            let _ = route_lab_packets_to_clients(now, packets, clients, flow_manager)?;
+        }
+
+        let _ = pump_lab_manager_to_clients(now, flow_manager, clients)?;
+        let mut processed_bridge_events = 0_usize;
+        while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH
+            && !remote_backlogs.should_pause_bridge_events()
+        {
+            let Ok(event) = event_rx.try_recv() else {
+                break;
+            };
+            processed_bridge_events += 1;
+            let _ = handle_bridge_event_into(
+                event,
+                flow_manager,
+                remote_backlogs,
+                now,
+                scratch.bridge_event_closed_flows,
+            )?;
+            for closed_flow in scratch.bridge_event_closed_flows.drain(..) {
+                bridges.remove(&closed_flow);
+            }
+        }
+        remote_backlogs.flush_all_into(
+            flow_manager,
+            now,
+            scratch.backlog_flow_ids,
+            scratch.closed_flows,
+        )?;
+        for closed_flow in scratch.closed_flows.drain(..) {
+            bridges.remove(&closed_flow);
+        }
+        let _ = prune_closed_flows(
+            flow_manager,
+            bridges,
+            remote_backlogs,
+            scratch.removable_flows,
+        )?;
+
+        if flow_manager.active_flow_count() == 0
+            && bridges.is_empty()
+            && remote_backlogs.active_flow_count() == 0
+            && remote_backlogs.total_bytes() == 0
+        {
+            return Ok(iteration + 1);
+        }
+
+        tokio::task::yield_now().await;
+    }
+
+    Ok(64)
 }
 
 async fn capture_packets(
@@ -2280,21 +2992,64 @@ async fn capture_packets(
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixShutdownSignal {
+    Terminate,
+    Hangup,
+}
+
+#[cfg(unix)]
+impl UnixShutdownSignal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Terminate => "terminate",
+            Self::Hangup => "hangup",
+        }
+    }
+
+    fn os_name(self) -> &'static str {
+        match self {
+            Self::Terminate => "SIGTERM",
+            Self::Hangup => "SIGHUP",
+        }
+    }
+
+    fn kind(self) -> tokio::signal::unix::SignalKind {
+        match self {
+            Self::Terminate => tokio::signal::unix::SignalKind::terminate(),
+            Self::Hangup => tokio::signal::unix::SignalKind::hangup(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_shutdown_signals() -> [UnixShutdownSignal; 2] {
+    [UnixShutdownSignal::Terminate, UnixShutdownSignal::Hangup]
+}
+
 async fn shutdown_signal() -> Result<&'static str> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::signal;
 
-        let mut sigterm =
-            signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+        let [terminate, hangup] = unix_shutdown_signals();
+        let mut sigterm = signal(terminate.kind())
+            .with_context(|| format!("failed to listen for {}", terminate.os_name()))?;
+        let mut sighup = signal(hangup.kind())
+            .with_context(|| format!("failed to listen for {}", hangup.os_name()))?;
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
                 signal.context("failed to listen for Ctrl+C")?;
                 Ok("interrupt")
             }
             received = sigterm.recv() => {
-                received.context("SIGTERM stream closed")?;
-                Ok("terminate")
+                received.with_context(|| format!("{} stream closed", terminate.os_name()))?;
+                Ok(terminate.label())
+            }
+            received = sighup.recv() => {
+                received.with_context(|| format!("{} stream closed", hangup.os_name()))?;
+                Ok(hangup.label())
             }
         }
     }
@@ -2337,13 +3092,15 @@ fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
     if matches!(
         args.bridge_transport,
-        BridgeTransportKind::Auto | BridgeTransportKind::DirectTcpip
+        BridgeTransportKind::Auto
+            | BridgeTransportKind::DirectTcpip
+            | BridgeTransportKind::QuicNative
     ) {
         validate_ssh_session_count(args.ssh_sessions)?;
     }
     if matches!(
         args.bridge_transport,
-        BridgeTransportKind::Auto | BridgeTransportKind::Agent
+        BridgeTransportKind::Auto | BridgeTransportKind::Agent | BridgeTransportKind::QuicAgent
     ) {
         validate_agent_session_request_count(args.agent_sessions)?;
     }
@@ -2437,8 +3194,8 @@ fn expand_target_routes(targets: &[Ipv4Net]) -> Result<Vec<Ipv4Net>> {
     Ok(expanded)
 }
 
-fn ssh_control_ip_to_protect(ssh_server: &str, targets: &[Ipv4Net]) -> Result<Option<Ipv4Addr>> {
-    let ssh_addr = parse_ssh_target(ssh_server, None)?.addr;
+fn ssh_control_ip_to_protect(ssh: &SshArgs, targets: &[Ipv4Net]) -> Result<Option<Ipv4Addr>> {
+    let ssh_addr = resolve_ssh_target(ssh)?.addr;
     let addrs = ssh_addr
         .to_socket_addrs()
         .with_context(|| format!("failed to resolve SSH server address {ssh_addr}"))?;
@@ -2529,11 +3286,12 @@ async fn run_tunnel_loop(
                 if let Some(request) = parse_dns_request_for_tunnel(packet) {
                     stats.dns_forwarded = stats.dns_forwarded.saturating_add(1);
                     eprintln!(
-                        "dns: forwarding UDP query {}:{} -> {}:{} over SSH to {}:{}",
+                        "dns: forwarding UDP query {}:{} -> {}:{} over {} to {}:{}",
                         request.src_ip,
                         request.src_port,
                         request.dst_ip,
                         request.dst_port,
+                        dns_transport.label(),
                         dns_remote.host,
                         dns_remote.port
                     );
@@ -2564,9 +3322,9 @@ async fn run_tunnel_loop(
                     continue;
                 }
                 if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
-                    if let Some(agent) = dns_transport.agent_transport() {
+                    if let Some(transport) = dns_transport.udp_transport() {
                         admit_udp_datagram(
-                            agent,
+                            transport,
                             request,
                             &mut udp_associations,
                             &mut udp_inflight,
@@ -2592,6 +3350,7 @@ async fn run_tunnel_loop(
                     &bridge_runtime,
                     event_tx.clone(),
                     &mut ready_flow_ids,
+                    now,
                 )?;
                 stats.record_bridge_admission(admission_stats);
                 let drain_stats =
@@ -2749,6 +3508,7 @@ async fn run_tunnel_loop(
                     &bridge_runtime,
                     event_tx.clone(),
                     &mut ready_flow_ids,
+                    now,
                 )?;
                 stats.record_bridge_admission(admission_stats);
                 let drain_stats =
@@ -3316,8 +4076,10 @@ async fn start_local_dns_proxy(
             tokio::spawn(async move {
                 let _permit = permit;
                 eprintln!(
-                    "dns: forwarding local resolver query from {peer} over SSH to {}:{}",
-                    remote.host, remote.port
+                    "dns: forwarding local resolver query from {peer} over {} to {}:{}",
+                    transport.label(),
+                    remote.host,
+                    remote.port
                 );
                 let response =
                     match query_dns_over_transport(transport, &remote, query.as_ref()).await {
@@ -3344,35 +4106,57 @@ async fn start_local_dns_proxy(
 enum DnsTransport {
     DirectTcpip(SshSessionPool),
     Agent(ReconnectingAgentBridge),
+    QuicNative(QuicNativeBridge),
 }
 
 impl DnsTransport {
-    fn agent_transport(&self) -> Option<ReconnectingAgentBridge> {
+    fn label(&self) -> &'static str {
         match self {
-            Self::Agent(agent) => Some(agent.clone()),
+            Self::DirectTcpip(_) => "SSH",
+            Self::Agent(_) => "agent",
+            Self::QuicNative(_) => "native QUIC",
+        }
+    }
+
+    fn udp_transport(&self) -> Option<UdpAssociationTransport> {
+        match self {
+            Self::Agent(agent) => Some(UdpAssociationTransport::Agent(agent.clone())),
+            Self::QuicNative(bridge) => Some(UdpAssociationTransport::QuicNative(bridge.clone())),
             Self::DirectTcpip(_) => None,
         }
     }
 }
 
+#[derive(Clone)]
+enum UdpAssociationTransport {
+    Agent(ReconnectingAgentBridge),
+    QuicNative(QuicNativeBridge),
+}
+
 enum AgentIoStream {
     Bridge(AgentBridgeStream),
+    QuicNativeTcp(quic_agent::QuicBridgeStream),
+    QuicNativeUdp(quic_agent::QuicBridgeStream),
     #[cfg(test)]
     Raw(agent_transport::AgentStream),
 }
 
 impl AgentIoStream {
-    async fn send_data(&self, bytes: impl Into<Bytes>) -> Result<()> {
+    async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_data(bytes).await,
+            Self::QuicNativeTcp(stream) => stream.send_data(bytes.into()).await,
+            Self::QuicNativeUdp(stream) => stream.send_datagram(bytes.into()).await,
             #[cfg(test)]
             Self::Raw(stream) => stream.send_data(bytes).await,
         }
     }
 
-    async fn send_eof(&self) -> Result<()> {
+    async fn send_eof(&mut self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_eof().await,
+            Self::QuicNativeTcp(stream) => stream.send_eof().await,
+            Self::QuicNativeUdp(stream) => stream.send_eof().await,
             #[cfg(test)]
             Self::Raw(stream) => stream.send_eof().await,
         }
@@ -3381,6 +4165,30 @@ impl AgentIoStream {
     async fn recv(&mut self) -> Option<agent_proto::AgentFrame> {
         match self {
             Self::Bridge(stream) => stream.recv().await,
+            Self::QuicNativeTcp(stream) => {
+                let mut buf = vec![0_u8; agent_proto::AGENT_MAX_FRAME_PAYLOAD];
+                match stream.recv_data(&mut buf).await {
+                    Ok(Some(payload)) => {
+                        agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
+                            .ok()
+                    }
+                    Ok(None) => None,
+                    Err(err) => {
+                        eprintln!("quic-native: failed to read TCP data: {err:#}");
+                        None
+                    }
+                }
+            }
+            Self::QuicNativeUdp(stream) => match stream.recv_datagram().await {
+                Ok(Some(payload)) => {
+                    agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload).ok()
+                }
+                Ok(None) => None,
+                Err(err) => {
+                    eprintln!("quic-native: failed to read UDP datagram: {err:#}");
+                    None
+                }
+            },
             #[cfg(test)]
             Self::Raw(stream) => stream.recv().await,
         }
@@ -3389,6 +4197,8 @@ impl AgentIoStream {
     async fn close(self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.close().await,
+            Self::QuicNativeTcp(mut stream) => stream.send_eof().await,
+            Self::QuicNativeUdp(mut stream) => stream.send_eof().await,
             #[cfg(test)]
             Self::Raw(stream) => stream.close().await,
         }
@@ -3424,7 +4234,7 @@ fn send_dns_response_event(
 }
 
 fn admit_udp_datagram(
-    agent: ReconnectingAgentBridge,
+    transport: UdpAssociationTransport,
     request: dns::UdpPacket,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
@@ -3448,7 +4258,7 @@ fn admit_udp_datagram(
 
             let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
             spawn_udp_association_with_idle_timeout(
-                agent,
+                transport,
                 key,
                 from_local,
                 events.clone(),
@@ -3462,7 +4272,7 @@ fn admit_udp_datagram(
         Ok(()) => {
             stats.udp_forwarded = stats.udp_forwarded.saturating_add(1);
             eprintln!(
-                "udp: forwarding datagram {}:{} -> {}:{} over agent",
+                "udp: forwarding datagram {}:{} -> {}:{} over data plane",
                 key.src_ip, key.src_port, key.dst_ip, key.dst_port,
             );
         }
@@ -3497,14 +4307,14 @@ fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats
 }
 
 fn spawn_udp_association_with_idle_timeout(
-    agent: ReconnectingAgentBridge,
+    transport: UdpAssociationTransport,
     key: UdpFlowKey,
     from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
 ) {
     tokio::spawn(async move {
-        let error = run_udp_association(agent, key, from_local, events.clone(), idle_timeout)
+        let error = run_udp_association(transport, key, from_local, events.clone(), idle_timeout)
             .await
             .err()
             .map(|err| err.to_string());
@@ -3525,6 +4335,7 @@ async fn query_dns_over_transport(
     match transport {
         DnsTransport::DirectTcpip(ssh) => query_dns_over_ssh(ssh, remote, query).await,
         DnsTransport::Agent(agent) => query_dns_over_reconnecting_agent(agent, remote, query).await,
+        DnsTransport::QuicNative(bridge) => query_dns_over_quic_native(bridge, remote, query).await,
     }
 }
 
@@ -3538,7 +4349,7 @@ async fn query_dns_over_ssh(
     }
 
     let mut channel = tokio::time::timeout(
-        ssh_bridge::BRIDGE_OPEN_TIMEOUT,
+        ssh_bridge::DNS_DIRECT_OPEN_TIMEOUT,
         ssh.open_background_direct_tcpip(
             remote.host.clone(),
             u32::from(remote.port),
@@ -3620,6 +4431,46 @@ async fn query_dns_over_reconnecting_agent(
     } else {
         let stream = open_dns_agent_stream(agent, remote).await?;
         query_dns_over_agent_tcp_stream(stream, query).await
+    }
+}
+
+async fn query_dns_over_quic_native(
+    bridge: QuicNativeBridge,
+    remote: &Destination,
+    query: &[u8],
+) -> Result<Bytes> {
+    if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
+        let stream = bridge
+            .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
+                destination_ip: remote_ip,
+                destination_port: remote.port,
+                originator_ip: DEFAULT_TUN_IP,
+                originator_port: 0,
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open native QUIC UDP DNS association to {}:{}",
+                    remote.host, remote.port
+                )
+            })?;
+        query_dns_over_agent_udp_stream(AgentIoStream::QuicNativeUdp(stream), query).await
+    } else {
+        let stream = bridge
+            .open_tcp_host(agent_proto::AgentOpenHost {
+                destination_host: remote.host.clone(),
+                destination_port: remote.port,
+                originator_ip: DEFAULT_TUN_IP,
+                originator_port: 0,
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open native QUIC hostname DNS stream to {}:{}",
+                    remote.host, remote.port
+                )
+            })?;
+        query_dns_over_agent_tcp_stream(AgentIoStream::QuicNativeTcp(stream), query).await
     }
 }
 
@@ -3818,35 +4669,42 @@ async fn query_dns_over_agent_udp_stream(mut stream: AgentIoStream, query: &[u8]
 }
 
 async fn run_udp_association(
-    agent: ReconnectingAgentBridge,
+    transport: UdpAssociationTransport,
     key: UdpFlowKey,
     mut from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
 ) -> Result<()> {
-    let stream = agent
-        .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
-            destination_ip: key.dst_ip,
-            destination_port: key.dst_port,
-            originator_ip: key.src_ip,
-            originator_port: key.src_port,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "failed to open agent UDP association to {}:{}",
-                key.dst_ip, key.dst_port
-            )
-        })?;
+    let open = agent_proto::AgentOpenIpv4 {
+        destination_ip: key.dst_ip,
+        destination_port: key.dst_port,
+        originator_ip: key.src_ip,
+        originator_port: key.src_port,
+    };
+    let stream = match transport {
+        UdpAssociationTransport::Agent(agent) => agent
+            .open_udp_ipv4(open)
+            .await
+            .map(AgentIoStream::Bridge)
+            .with_context(|| {
+                format!(
+                    "failed to open agent UDP association to {}:{}",
+                    key.dst_ip, key.dst_port
+                )
+            })?,
+        UdpAssociationTransport::QuicNative(bridge) => bridge
+            .open_udp_ipv4(open)
+            .await
+            .map(AgentIoStream::QuicNativeUdp)
+            .with_context(|| {
+                format!(
+                    "failed to open native QUIC UDP association to {}:{}",
+                    key.dst_ip, key.dst_port
+                )
+            })?,
+    };
 
-    run_udp_association_stream(
-        AgentIoStream::Bridge(stream),
-        key,
-        &mut from_local,
-        events,
-        idle_timeout,
-    )
-    .await
+    run_udp_association_stream(stream, key, &mut from_local, events, idle_timeout).await
 }
 
 #[cfg(test)]
@@ -4032,6 +4890,47 @@ async fn write_udp_response_to_tun(
 enum BridgeRuntime {
     DirectTcpip(SshSessionPool),
     Agent(ReconnectingAgentBridge),
+    QuicNative(QuicNativeBridge),
+}
+
+#[derive(Clone)]
+struct QuicNativeBridge {
+    client: quic_agent::QuicBridgeClient,
+    _carrier: Option<Arc<QuicNativeCarrier>>,
+}
+
+struct QuicNativeCarrier {
+    _handle: Handle<Client>,
+    drain_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for QuicNativeCarrier {
+    fn drop(&mut self) {
+        self.drain_task.abort();
+    }
+}
+
+impl QuicNativeBridge {
+    async fn open_tcp_ipv4_optimistic(
+        &self,
+        open: agent_proto::AgentOpenIpv4,
+    ) -> Result<quic_agent::QuicBridgeStream> {
+        self.client.open_tcp_ipv4_optimistic(open).await
+    }
+
+    async fn open_udp_ipv4(
+        &self,
+        open: agent_proto::AgentOpenIpv4,
+    ) -> Result<quic_agent::QuicBridgeStream> {
+        self.client.open_udp_ipv4(open).await
+    }
+
+    async fn open_tcp_host(
+        &self,
+        open: agent_proto::AgentOpenHost,
+    ) -> Result<quic_agent::QuicBridgeStream> {
+        self.client.open_tcp_host(open).await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4081,13 +4980,13 @@ impl BridgeRuntime {
     fn admission_limits(&self) -> BridgeAdmissionLimits {
         match self {
             Self::DirectTcpip(_) => BridgeAdmissionLimits::direct_tcpip(),
-            Self::Agent(_) => BridgeAdmissionLimits::agent(),
+            Self::Agent(_) | Self::QuicNative(_) => BridgeAdmissionLimits::agent(),
         }
     }
 
     async fn agent_snapshot(&self) -> AgentBridgeSnapshot {
         match self {
-            Self::DirectTcpip(_) => AgentBridgeSnapshot::default(),
+            Self::DirectTcpip(_) | Self::QuicNative(_) => AgentBridgeSnapshot::default(),
             Self::Agent(agent) => agent.snapshot().await,
         }
     }
@@ -4095,6 +4994,7 @@ impl BridgeRuntime {
 
 enum AgentBridgeCarrier {
     Ssh(Handle<Client>),
+    Quic(QuicAgentCarrier),
     #[allow(dead_code)]
     Detached,
 }
@@ -4106,8 +5006,25 @@ impl AgentBridgeCarrier {
                 .disconnect(russh::Disconnect::ByApplication, reason, "en")
                 .await
                 .with_context(|| format!("failed to disconnect agent carrier: {reason}")),
+            Self::Quic(carrier) => carrier.disconnect(reason).await,
             Self::Detached => Ok(()),
         }
+    }
+}
+
+struct QuicAgentCarrier {
+    handle: Handle<Client>,
+    _session: quic_agent::QuicAgentSession,
+    drain_task: tokio::task::JoinHandle<()>,
+}
+
+impl QuicAgentCarrier {
+    async fn disconnect(&self, reason: &str) -> Result<()> {
+        self.drain_task.abort();
+        self.handle
+            .disconnect(russh::Disconnect::ByApplication, reason, "en")
+            .await
+            .with_context(|| format!("failed to disconnect QUIC agent SSH carrier: {reason}"))
     }
 }
 
@@ -5400,6 +6317,7 @@ fn ensure_bridges(
     runtime: &BridgeRuntime,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ready_flow_ids: &mut Vec<tcp_core::FlowId>,
+    now: SmolInstant,
 ) -> Result<BridgeAdmissionStats> {
     let mut stats = BridgeAdmissionStats::default();
     let limits = runtime.admission_limits();
@@ -5424,7 +6342,7 @@ fn ensure_bridges(
             }
         }
 
-        flow_manager.mark_flow_state(flow, tcp_core::FlowState::SshOpening)?;
+        flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::SshOpening, now)?;
         let bridge = match runtime {
             BridgeRuntime::DirectTcpip(ssh) => {
                 let ssh = ssh.clone();
@@ -5444,6 +6362,14 @@ fn ensure_bridges(
                     flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
                 );
                 spawn_agent_tcp_bridge(id, event_tx.clone(), agent)
+            }
+            BridgeRuntime::QuicNative(bridge) => {
+                let bridge = bridge.clone();
+                eprintln!(
+                    "quic-native: opening stream {}:{} for local {}:{} generation={}",
+                    flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
+                );
+                spawn_quic_native_tcp_bridge(id, event_tx.clone(), bridge)
             }
         };
         bridges.insert(bridge.id.key, bridge);
@@ -5482,7 +6408,9 @@ fn spawn_agent_tcp_bridge(
             }
         };
         let mut open_reported = false;
-        let open_timeout = tokio::time::sleep(ssh_bridge::BRIDGE_OPEN_TIMEOUT);
+        let mut pre_open_local = VecDeque::<Bytes>::new();
+        let mut pre_open_retries = 0_usize;
+        let open_timeout = tokio::time::sleep(ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT);
         tokio::pin!(open_timeout);
 
         loop {
@@ -5495,7 +6423,7 @@ fn spawn_agent_tcp_bridge(
                             phase: ssh_bridge::BridgeFailurePhase::Open,
                             message: format!(
                                 "timed out after {}ms waiting for agent stream open confirmation",
-                                ssh_bridge::BRIDGE_OPEN_TIMEOUT.as_millis()
+                                ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT.as_millis()
                             ),
                         },
                     )
@@ -5505,14 +6433,49 @@ fn spawn_agent_tcp_bridge(
                 local = local_rx.recv() => {
                     match local {
                         Some(bytes) => {
+                            if !open_reported {
+                                pre_open_local.push_back(bytes.clone());
+                            }
                             match tokio::time::timeout(
                                 ssh_bridge::BRIDGE_WRITE_TIMEOUT,
-                                stream.send_data(bytes),
+                                stream.send_data(bytes.clone()),
                             )
                             .await
                                 {
                                     Ok(Ok(())) => {}
                                     Ok(Err(err)) => {
+                                        if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                            pre_open_retries += 1;
+                                            match retry_agent_pre_open_stream(
+                                                &agent,
+                                                open,
+                                                stream,
+                                                &pre_open_local,
+                                            ).await {
+                                                Ok(replacement) => {
+                                                    stream = replacement;
+                                                    open_timeout.as_mut().reset(
+                                                        tokio::time::Instant::now()
+                                                            + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(retry_err) => {
+                                                    let _ = ssh_bridge::send_bridge_event(
+                                                        &event_tx,
+                                                        ssh_bridge::BridgeEvent::Failed {
+                                                            id,
+                                                            phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                            message: format!(
+                                                                "failed to reopen agent stream after pre-open write failure ({err:#}): {retry_err:#}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                            }
+                                        }
                                         let phase = if open_reported {
                                             ssh_bridge::BridgeFailurePhase::Write
                                         } else {
@@ -5567,6 +6530,7 @@ fn spawn_agent_tcp_bridge(
                                             return;
                                         }
                                         open_reported = true;
+                                        pre_open_local.clear();
                                     }
                                 }
                                 agent_proto::AgentFrameKind::Data => {
@@ -5576,6 +6540,7 @@ fn spawn_agent_tcp_bridge(
                                             return;
                                         }
                                         open_reported = true;
+                                        pre_open_local.clear();
                                     }
                                     if !ssh_bridge::send_bridge_event(
                                         &event_tx,
@@ -5599,6 +6564,38 @@ fn spawn_agent_tcp_bridge(
                                 }
                                 agent_proto::AgentFrameKind::Close => {
                                     if !open_reported {
+                                        if pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                            pre_open_retries += 1;
+                                            match retry_agent_pre_open_stream(
+                                                &agent,
+                                                open,
+                                                stream,
+                                                &pre_open_local,
+                                            ).await {
+                                                Ok(replacement) => {
+                                                    stream = replacement;
+                                                    open_timeout.as_mut().reset(
+                                                        tokio::time::Instant::now()
+                                                            + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(err) => {
+                                                    let _ = ssh_bridge::send_bridge_event(
+                                                        &event_tx,
+                                                        ssh_bridge::BridgeEvent::Failed {
+                                                            id,
+                                                            phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                            message: format!(
+                                                                "failed to reopen agent stream after pre-open close: {err:#}"
+                                                            ),
+                                                        },
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                            }
+                                        }
                                         let _ = ssh_bridge::send_bridge_event(
                                             &event_tx,
                                             ssh_bridge::BridgeEvent::Failed {
@@ -5613,6 +6610,38 @@ fn spawn_agent_tcp_bridge(
                                 }
                                 agent_proto::AgentFrameKind::Reset => {
                                     let message = String::from_utf8_lossy(&frame.payload).to_string();
+                                    if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                        pre_open_retries += 1;
+                                        match retry_agent_pre_open_stream(
+                                            &agent,
+                                            open,
+                                            stream,
+                                            &pre_open_local,
+                                        ).await {
+                                            Ok(replacement) => {
+                                                stream = replacement;
+                                                open_timeout.as_mut().reset(
+                                                    tokio::time::Instant::now()
+                                                        + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                );
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                let _ = ssh_bridge::send_bridge_event(
+                                                    &event_tx,
+                                                    ssh_bridge::BridgeEvent::Failed {
+                                                        id,
+                                                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                        message: format!(
+                                                            "failed to reopen agent stream after pre-open reset ({message}): {err:#}"
+                                                        ),
+                                                    },
+                                                )
+                                            .await;
+                                                return;
+                                            }
+                                        }
+                                    }
                                     let phase = if open_reported {
                                         ssh_bridge::BridgeFailurePhase::Write
                                     } else {
@@ -5631,7 +6660,41 @@ fn spawn_agent_tcp_bridge(
                             }
                             _ => {}
                         },
-                        None => break,
+                        None => {
+                            if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                pre_open_retries += 1;
+                                match retry_agent_pre_open_stream(
+                                    &agent,
+                                    open,
+                                    stream,
+                                    &pre_open_local,
+                                ).await {
+                                    Ok(replacement) => {
+                                        stream = replacement;
+                                        open_timeout.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                        );
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        let _ = ssh_bridge::send_bridge_event(
+                                            &event_tx,
+                                            ssh_bridge::BridgeEvent::Failed {
+                                                id,
+                                                phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                message: format!(
+                                                    "failed to reopen agent stream after pre-open EOF: {err:#}"
+                                                ),
+                                            },
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
+                            }
+                            break;
+                        },
                     }
                 }
             }
@@ -5641,6 +6704,219 @@ fn spawn_agent_tcp_bridge(
         let _ =
             ssh_bridge::send_bridge_event(&event_tx, ssh_bridge::BridgeEvent::Closed { id }).await;
     })
+}
+
+fn spawn_quic_native_tcp_bridge(
+    id: tcp_core::FlowId,
+    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    bridge: QuicNativeBridge,
+) -> ssh_bridge::FlowBridge {
+    ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
+        let open_started_at = StdInstant::now();
+        let open = agent_proto::AgentOpenIpv4 {
+            destination_ip: id.key.dst_ip,
+            destination_port: id.key.dst_port,
+            originator_ip: id.key.src_ip,
+            originator_port: id.key.src_port,
+        };
+        let mut stream = match bridge.open_tcp_ipv4_optimistic(open).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                let _ = ssh_bridge::send_bridge_event(
+                    &event_tx,
+                    ssh_bridge::BridgeEvent::Failed {
+                        id,
+                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                        message: format!("failed to open native QUIC stream: {err:#}"),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+        let mut open_reported = false;
+
+        loop {
+            if !open_reported {
+                tokio::select! {
+                    local = local_rx.recv() => {
+                        match local {
+                            Some(bytes) => {
+                                match tokio::time::timeout(
+                                    ssh_bridge::BRIDGE_WRITE_TIMEOUT,
+                                    stream.send_data(bytes),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => {
+                                        let _ = ssh_bridge::send_bridge_event(
+                                            &event_tx,
+                                            ssh_bridge::BridgeEvent::Failed {
+                                                id,
+                                                phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                message: format!("failed to write to pending native QUIC stream: {err:#}"),
+                                            },
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        let _ = ssh_bridge::send_bridge_event(
+                                            &event_tx,
+                                            ssh_bridge::BridgeEvent::Failed {
+                                                id,
+                                                phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                message: format!(
+                                                    "timed out after {}ms writing to pending native QUIC stream",
+                                                    ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
+                                                ),
+                                            },
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = stream.send_eof().await;
+                                break;
+                            }
+                        }
+                    }
+                    opened = stream.wait_opened() => {
+                        match opened {
+                            Ok(()) => {
+                                if !report_agent_stream_opened(&event_tx, id, open_started_at).await {
+                                    let _ = stream.send_eof().await;
+                                    return;
+                                }
+                                open_reported = true;
+                            }
+                            Err(err) => {
+                                let _ = ssh_bridge::send_bridge_event(
+                                    &event_tx,
+                                    ssh_bridge::BridgeEvent::Failed {
+                                        id,
+                                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                                        message: format!("failed to open native QUIC stream: {err:#}"),
+                                    },
+                                )
+                                .await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            tokio::select! {
+                local = local_rx.recv() => {
+                    match local {
+                        Some(bytes) => {
+                            match tokio::time::timeout(
+                                ssh_bridge::BRIDGE_WRITE_TIMEOUT,
+                                stream.send_data(bytes),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    let _ = ssh_bridge::send_bridge_event(
+                                        &event_tx,
+                                        ssh_bridge::BridgeEvent::Failed {
+                                            id,
+                                            phase: ssh_bridge::BridgeFailurePhase::Write,
+                                            message: format!("failed to write to native QUIC stream: {err:#}"),
+                                        },
+                                    )
+                                    .await;
+                                    break;
+                                }
+                                Err(_) => {
+                                    let _ = ssh_bridge::send_bridge_event(
+                                        &event_tx,
+                                        ssh_bridge::BridgeEvent::Failed {
+                                            id,
+                                            phase: ssh_bridge::BridgeFailurePhase::Write,
+                                            message: format!(
+                                                "timed out after {}ms writing to native QUIC stream",
+                                                ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
+                                            ),
+                                        },
+                                    )
+                                    .await;
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = stream.send_eof().await;
+                            break;
+                        }
+                    }
+                }
+                remote = stream.recv_chunk(quic_agent::QUIC_BRIDGE_TCP_CHUNK) => {
+                    match remote {
+                        Ok(Some(bytes)) => {
+                            if !ssh_bridge::send_bridge_event(
+                                &event_tx,
+                                ssh_bridge::BridgeEvent::RemoteData { id, bytes },
+                            )
+                            .await
+                            {
+                                break;
+                            }
+                        }
+                        Ok(None) => {
+                            let _ = ssh_bridge::send_bridge_event(
+                                &event_tx,
+                                ssh_bridge::BridgeEvent::RemoteEof { id },
+                            )
+                            .await;
+                            break;
+                        }
+                        Err(err) => {
+                            let _ = ssh_bridge::send_bridge_event(
+                                &event_tx,
+                                ssh_bridge::BridgeEvent::Failed {
+                                    id,
+                                    phase: ssh_bridge::BridgeFailurePhase::Write,
+                                    message: format!("failed to read native QUIC stream: {err:#}"),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        let _ =
+            ssh_bridge::send_bridge_event(&event_tx, ssh_bridge::BridgeEvent::Closed { id }).await;
+    })
+}
+
+async fn retry_agent_pre_open_stream(
+    agent: &ReconnectingAgentBridge,
+    open: agent_proto::AgentOpenIpv4,
+    old_stream: AgentBridgeStream,
+    replay: &VecDeque<Bytes>,
+) -> Result<AgentBridgeStream> {
+    let _ = old_stream.close().await;
+    let stream = agent
+        .open_tcp_ipv4_optimistic(open)
+        .await
+        .context("failed to reopen optimistic agent stream")?;
+    for bytes in replay {
+        stream
+            .send_data(bytes.clone())
+            .await
+            .context("failed to replay pre-open agent bytes")?;
+    }
+    Ok(stream)
 }
 
 async fn report_agent_stream_opened(
@@ -5778,7 +7054,7 @@ fn handle_bridge_event_into(
     match event {
         ssh_bridge::BridgeEvent::Opened { id, open_ms } => {
             let flow = id.key;
-            flow_manager.mark_flow_state(flow, tcp_core::FlowState::Relaying)?;
+            flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::Relaying, now)?;
             eprintln!(
                 "bridge: open for {flow:?} generation={} in {open_ms}ms",
                 id.generation
@@ -6236,34 +7512,63 @@ fn pump_lab_manager_to_clients(
     clients: &mut [BridgeLabClient],
 ) -> Result<usize> {
     let packets = flow_manager.poll(now);
-    route_lab_packets_to_clients(packets, clients)
+    route_lab_packets_to_clients(now, packets, clients, flow_manager)
 }
 
 fn route_lab_packets_to_clients(
-    packets: Vec<tcp_core::PacketBuf>,
+    now: SmolInstant,
+    mut packets: Vec<tcp_core::PacketBuf>,
     clients: &mut [BridgeLabClient],
+    flow_manager: &mut tcp_core::FlowManager,
 ) -> Result<usize> {
     let mut routed = 0_usize;
-    for packet in packets {
-        let Some(segment) = tcp_core::parse_ipv4_tcp_segment(packet.as_ref())
-            .context("failed to inspect lab TCP packet")?
-        else {
-            continue;
-        };
+    let mut pending = VecDeque::with_capacity(packets.len());
+    pending.extend(packets.drain(..));
+    let mut client_ack_packets = VecDeque::new();
+    let mut generated = Vec::new();
 
-        let Some(client) = clients.iter_mut().find(|client| {
-            client.client_ip == segment.flow.dst_ip && client.client_port == segment.flow.dst_port
-        }) else {
-            bail!(
-                "lab packet has no synthetic client: {}:{} -> {}:{}",
-                segment.flow.src_ip,
-                segment.flow.src_port,
-                segment.flow.dst_ip,
-                segment.flow.dst_port
-            );
-        };
-        client.device.inject(packet.as_ref())?;
-        routed = routed.saturating_add(1);
+    while !pending.is_empty() || !client_ack_packets.is_empty() {
+        while let Some(packet) = pending.pop_front() {
+            let Some(segment) = tcp_core::parse_ipv4_tcp_segment(packet.as_ref())
+                .context("failed to inspect lab TCP packet")?
+            else {
+                continue;
+            };
+
+            let Some(client_index) = clients.iter().position(|client| {
+                client.client_ip == segment.flow.dst_ip
+                    && client.client_port == segment.flow.dst_port
+            }) else {
+                bail!(
+                    "lab packet has no synthetic client: {}:{} -> {}:{}",
+                    segment.flow.src_ip,
+                    segment.flow.src_port,
+                    segment.flow.dst_ip,
+                    segment.flow.dst_port
+                );
+            };
+
+            {
+                let client = &mut clients[client_index];
+                client.device.inject(packet.as_ref())?;
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+                let _ = receive_lab_client_response(client)?;
+
+                for client_packet in client.device.drain_tx() {
+                    client_ack_packets.push_back(Bytes::copy_from_slice(client_packet.as_ref()));
+                }
+            }
+            routed = routed.saturating_add(1);
+        }
+
+        if let Some(client_packet) = client_ack_packets.pop_front() {
+            flow_manager
+                .ingest_packet_into(now, client_packet.as_ref(), &mut generated)
+                .context("failed to feed synthetic client response packet into FlowManager")?;
+            pending.extend(generated.drain(..));
+        }
     }
     Ok(routed)
 }
@@ -7125,7 +8430,7 @@ impl SshSessionSlot {
 #[derive(Clone, Debug)]
 struct PreparedSshConnection {
     target: SshTarget,
-    identity: Option<PathBuf>,
+    identity_files: Vec<PathBuf>,
     password: Option<String>,
     known_hosts: Option<PathBuf>,
     insecure_accept_host_key: bool,
@@ -7270,14 +8575,30 @@ fn prepare_ssh_connection(args: &SshArgs) -> Result<PreparedSshConnection> {
     if args.insecure_accept_host_key && args.accept_new_host_key {
         bail!("--accept-new-host-key cannot be combined with --insecure-accept-host-key");
     }
-    let target = parse_ssh_target(remote, args.ssh_user.as_deref())?;
+    let (target, ssh_config) = resolve_ssh_target_and_config(args)?;
+    let identity_files = match &args.identity {
+        Some(identity) => vec![identity.clone()],
+        None => ssh_config
+            .identity_files
+            .iter()
+            .map(|path| expand_ssh_config_path(path, &target, remote))
+            .collect::<Result<Vec<_>>>()?,
+    };
+    let known_hosts = match &args.known_hosts {
+        Some(path) => Some(path.clone()),
+        None => ssh_config
+            .user_known_hosts_file
+            .as_deref()
+            .map(|path| expand_ssh_config_path(path, &target, remote))
+            .transpose()?,
+    };
     let password = resolve_ssh_password(args)?;
 
     Ok(PreparedSshConnection {
         target,
-        identity: args.identity.clone(),
+        identity_files,
         password,
-        known_hosts: args.known_hosts.clone(),
+        known_hosts,
         insecure_accept_host_key: args.insecure_accept_host_key,
         accept_new_host_key: args.accept_new_host_key,
         connect_timeout: ssh_connect_timeout(args.ssh_connect_timeout_secs)?,
@@ -7364,12 +8685,17 @@ async fn authenticate(
     user: &str,
     prepared: &PreparedSshConnection,
 ) -> Result<()> {
-    if let Some(identity) = &prepared.identity {
+    for identity in &prepared.identity_files {
         let key = load_private_key(identity)?;
         let result = handle
             .authenticate_publickey(user.to_owned(), key)
             .await
-            .context("public-key authentication failed")?;
+            .with_context(|| {
+                format!(
+                    "public-key authentication failed for {}",
+                    identity.display()
+                )
+            })?;
         if matches!(result, AuthResult::Success) {
             return Ok(());
         }
@@ -7425,20 +8751,323 @@ struct SshTarget {
     port: u16,
 }
 
-fn parse_ssh_target(remote: &str, user_override: Option<&str>) -> Result<SshTarget> {
-    let (remote_user, host) = match remote.rsplit_once('@') {
-        Some((user, host)) if !user.is_empty() && !host.is_empty() => (Some(user), host),
-        Some(_) => bail!("invalid SSH remote {remote}; expected user@host"),
-        None => (None, remote),
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SshConfigMatch {
+    hostname: Option<String>,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_files: Vec<String>,
+    user_known_hosts_file: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshRemoteReference {
+    user: Option<String>,
+    host: String,
+}
+
+fn resolve_ssh_target(args: &SshArgs) -> Result<SshTarget> {
+    let (target, _) = resolve_ssh_target_and_config(args)?;
+    Ok(target)
+}
+
+fn resolve_ssh_target_and_config(args: &SshArgs) -> Result<(SshTarget, SshConfigMatch)> {
+    let Some(remote) = args.ssh_server.as_deref() else {
+        bail!("missing SSH remote; use -r user@host");
+    };
+    let reference = parse_ssh_remote_reference(remote)?;
+    let endpoint = parse_ssh_endpoint(&reference.host)?;
+    let config = resolve_ssh_config_for_host(&endpoint.host, args.ssh_config.as_deref())?;
+
+    let user = args
+        .ssh_user
+        .as_deref()
+        .or(reference.user.as_deref())
+        .or(config.user.as_deref())
+        .map(str::to_owned)
+        .or_else(default_username)
+        .ok_or_else(|| anyhow!("missing SSH user; use -r user@host, --user, or SSH config User"))?;
+    let host = config
+        .hostname
+        .clone()
+        .unwrap_or_else(|| endpoint.host.clone());
+    let port = if ssh_endpoint_port_is_explicit(&reference.host) {
+        endpoint.port
+    } else {
+        config.port.unwrap_or(endpoint.port)
+    };
+    let addr = ssh_socket_addr_string(&host, port);
+
+    Ok((
+        SshTarget {
+            user,
+            addr,
+            host,
+            port,
+        },
+        config,
+    ))
+}
+
+fn resolve_ssh_config_for_host(host: &str, path: Option<&Path>) -> Result<SshConfigMatch> {
+    let contents = match path {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read SSH config {}", path.display()))?,
+        None => {
+            let Some(path) = default_ssh_config_path() else {
+                return Ok(SshConfigMatch::default());
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(SshConfigMatch::default());
+                }
+                Err(err) => {
+                    return Err(err)
+                        .with_context(|| format!("failed to read SSH config {}", path.display()));
+                }
+            }
+        }
     };
 
+    parse_ssh_config_for_host(&contents, host)
+}
+
+fn parse_ssh_config_for_host(contents: &str, host: &str) -> Result<SshConfigMatch> {
+    let mut matched = SshConfigMatch::default();
+    let mut active = true;
+
+    for (line_index, line) in contents.lines().enumerate() {
+        let fields = split_ssh_config_line(line);
+        let Some((keyword, values)) = fields.split_first() else {
+            continue;
+        };
+        let keyword = keyword.to_ascii_lowercase();
+        match keyword.as_str() {
+            "host" => {
+                active = ssh_config_host_patterns_match(host, values);
+                continue;
+            }
+            "match" => {
+                active = false;
+                continue;
+            }
+            _ => {}
+        }
+        if !active {
+            continue;
+        }
+        let Some(value) = values.first() else {
+            continue;
+        };
+        match keyword.as_str() {
+            "hostname" if matched.hostname.is_none() => {
+                matched.hostname = Some(value.clone());
+            }
+            "user" if matched.user.is_none() => {
+                matched.user = Some(value.clone());
+            }
+            "port" if matched.port.is_none() => {
+                matched.port = Some(value.parse::<u16>().with_context(|| {
+                    format!("invalid Port in SSH config line {}", line_index + 1)
+                })?);
+            }
+            "identityfile" => {
+                matched.identity_files.push(value.clone());
+            }
+            "userknownhostsfile" if matched.user_known_hosts_file.is_none() => {
+                if !value.eq_ignore_ascii_case("none") {
+                    matched.user_known_hosts_file = Some(value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(matched)
+}
+
+fn split_ssh_config_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(quote_ch) = quote {
+            if ch == quote_ch {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '#' => break,
+            '\'' | '"' => quote = Some(ch),
+            '=' if fields.is_empty() && !current.is_empty() => {
+                fields.push(std::mem::take(&mut current));
+            }
+            ch if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    fields.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        fields.push(current);
+    }
+    fields
+}
+
+fn ssh_config_host_patterns_match(host: &str, patterns: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    let mut matched = false;
+    for pattern in patterns {
+        if let Some(pattern) = pattern.strip_prefix('!') {
+            if ssh_config_wildcard_match(&host, &pattern.to_ascii_lowercase()) {
+                return false;
+            }
+        } else if ssh_config_wildcard_match(&host, &pattern.to_ascii_lowercase()) {
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn ssh_config_wildcard_match(value: &str, pattern: &str) -> bool {
+    let value = value.as_bytes();
+    let pattern = pattern.as_bytes();
+    let mut matched = vec![false; value.len() + 1];
+    matched[0] = true;
+
+    for &token in pattern {
+        let mut next = vec![false; value.len() + 1];
+        match token {
+            b'*' => {
+                let mut reachable = false;
+                for index in 0..=value.len() {
+                    reachable |= matched[index];
+                    next[index] = reachable;
+                }
+            }
+            b'?' => {
+                next[1..(value.len() + 1)].copy_from_slice(&matched[..value.len()]);
+            }
+            literal => {
+                for index in 0..value.len() {
+                    next[index + 1] = matched[index] && value[index] == literal;
+                }
+            }
+        }
+        matched = next;
+    }
+
+    matched[value.len()]
+}
+
+fn default_ssh_config_path() -> Option<PathBuf> {
+    home_dir().map(|home| home.join(".ssh").join("config"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn expand_ssh_config_path(
+    value: &str,
+    target: &SshTarget,
+    original_remote: &str,
+) -> Result<PathBuf> {
+    let original_host = parse_ssh_remote_reference(original_remote)
+        .and_then(|reference| parse_ssh_endpoint(&reference.host).map(|endpoint| endpoint.host))
+        .unwrap_or_else(|_| target.host.clone());
+    let expanded = expand_ssh_config_tokens(value, target, &original_host)?;
+    Ok(expand_tilde_path(&expanded))
+}
+
+fn expand_ssh_config_tokens(
+    value: &str,
+    target: &SshTarget,
+    original_host: &str,
+) -> Result<String> {
+    let mut expanded = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            expanded.push(ch);
+            continue;
+        }
+        let token = chars
+            .next()
+            .context("SSH config token % must be followed by a character")?;
+        match token {
+            '%' => expanded.push('%'),
+            'h' => expanded.push_str(&target.host),
+            'n' => expanded.push_str(original_host),
+            'p' => expanded.push_str(&target.port.to_string()),
+            'r' => expanded.push_str(&target.user),
+            'd' => {
+                let home = home_dir().context("SSH config %d token requires a home directory")?;
+                expanded.push_str(&home.display().to_string());
+            }
+            'u' => {
+                let user = default_username().context("SSH config %u token requires a username")?;
+                expanded.push_str(&user);
+            }
+            other => {
+                expanded.push('%');
+                expanded.push(other);
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn expand_tilde_path(value: &str) -> PathBuf {
+    if value == "~" {
+        return home_dir().unwrap_or_else(|| PathBuf::from(value));
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+#[cfg(test)]
+fn parse_ssh_target(remote: &str, user_override: Option<&str>) -> Result<SshTarget> {
+    let reference = parse_ssh_remote_reference(remote)?;
+
     let user = user_override
-        .or(remote_user)
+        .or(reference.user.as_deref())
         .map(str::to_owned)
         .or_else(default_username)
         .ok_or_else(|| anyhow!("missing SSH user; use -r user@host or --user"))?;
 
-    let endpoint = parse_ssh_endpoint(host)?;
+    let endpoint = parse_ssh_endpoint(&reference.host)?;
 
     Ok(SshTarget {
         user,
@@ -7446,6 +9075,17 @@ fn parse_ssh_target(remote: &str, user_override: Option<&str>) -> Result<SshTarg
         host: endpoint.host,
         port: endpoint.port,
     })
+}
+
+fn parse_ssh_remote_reference(remote: &str) -> Result<SshRemoteReference> {
+    let (user, host) = match remote.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() && !host.is_empty() => {
+            (Some(user.to_owned()), host.to_owned())
+        }
+        Some(_) => bail!("invalid SSH remote {remote}; expected user@host"),
+        None => (None, remote.to_owned()),
+    };
+    Ok(SshRemoteReference { user, host })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -7483,13 +9123,26 @@ fn parse_ssh_endpoint(input: &str) -> Result<SshEndpoint> {
         (input.to_owned(), 22)
     };
 
-    let addr = if host.contains(':') {
+    let addr = ssh_socket_addr_string(&host, port);
+
+    Ok(SshEndpoint { host, port, addr })
+}
+
+fn ssh_endpoint_port_is_explicit(input: &str) -> bool {
+    if let Some(rest) = input.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .is_some_and(|(_, suffix)| suffix.starts_with(':') && suffix.len() > 1);
+    }
+    input.rsplit_once(':').is_some()
+}
+
+fn ssh_socket_addr_string(host: &str, port: u16) -> String {
+    if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
-    };
-
-    Ok(SshEndpoint { host, port, addr })
+    }
 }
 
 fn parse_port(port: &str, input: &str) -> Result<u16> {
@@ -7912,6 +9565,50 @@ mod tests {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";
     const OTHER_ED25519_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB9dG4kjRhQTtWTVzd2t27+t0DEHBPW7iOD23TUiYLio";
+    const TEST_ED25519_PRIVATE_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+        b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n\
+        QyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYgAAAJgAIAxdACAM\n\
+        XQAAAAtzc2gtZWQyNTUxOQAAACCzPq7zfqLffKoBDe/eo04kH2XxtSmk9D7RQyf1xUqrYg\n\
+        AAAEC2BsIi0QwW2uFscKTUUXNHLsYX4FxlaSDSblbAj7WR7bM+rvN+ot98qgEN796jTiQf\n\
+        ZfG1KaT0PtFDJ/XFSqtiAAAAEHVzZXJAZXhhbXBsZS5jb20BAgMEBQ==\n\
+        -----END OPENSSH PRIVATE KEY-----\n";
+
+    fn test_ssh_args(remote: &str) -> SshArgs {
+        SshArgs {
+            ssh_server: Some(remote.to_owned()),
+            ssh_user: Some("alice".to_owned()),
+            identity: None,
+            password: None,
+            password_file: None,
+            insecure_accept_host_key: false,
+            accept_new_host_key: false,
+            known_hosts: None,
+            ssh_config: None,
+            ssh_connect_timeout_secs: DEFAULT_SSH_CONNECT_TIMEOUT_SECS,
+        }
+    }
+
+    async fn test_quic_native_bridge() -> (QuicNativeBridge, tokio::task::JoinHandle<()>) {
+        let quic_server = quic_agent::start_quic_bridge_server(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            0,
+        ))
+        .expect("start native QUIC bridge");
+        let quic_addr = quic_server.local_addr().expect("QUIC local address");
+        let bootstrap = quic_server.bootstrap().clone();
+        let bridge_task =
+            tokio::spawn(async move { quic_server.run().await.expect("run native QUIC bridge") });
+        let client = quic_agent::connect_quic_bridge(quic_addr, &bootstrap)
+            .await
+            .expect("connect native QUIC bridge");
+        (
+            QuicNativeBridge {
+                client,
+                _carrier: None,
+            },
+            bridge_task,
+        )
+    }
 
     #[test]
     fn prefix_masks_are_big_endian_ipv4_masks() {
@@ -8037,7 +9734,7 @@ mod tests {
         let mut stats = TunnelStats::new();
 
         admit_udp_datagram(
-            bridge.clone(),
+            UdpAssociationTransport::Agent(bridge.clone()),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -8162,6 +9859,93 @@ mod tests {
         );
 
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ssh_password_file_authenticates_against_russh_server() {
+        struct PasswordAuthServer {
+            expected_user: String,
+            expected_password: String,
+            attempts: mpsc::Sender<(String, String)>,
+        }
+
+        impl russh::server::Handler for PasswordAuthServer {
+            type Error = anyhow::Error;
+
+            async fn auth_password(
+                &mut self,
+                user: &str,
+                password: &str,
+            ) -> Result<russh::server::Auth, Self::Error> {
+                let _ = self
+                    .attempts
+                    .try_send((user.to_owned(), password.to_owned()));
+                if user == self.expected_user && password == self.expected_password {
+                    Ok(russh::server::Auth::Accept)
+                } else {
+                    Ok(russh::server::Auth::reject())
+                }
+            }
+        }
+
+        let expected_user = "alice";
+        let expected_password = "file secret";
+        let password_path = env::temp_dir().join(format!(
+            "rustle-password-auth-test-{}-{}",
+            std::process::id(),
+            StdInstant::now().elapsed().as_nanos()
+        ));
+        std::fs::write(&password_path, format!("{expected_password}\n")).unwrap();
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test SSH server");
+        let server_addr = listener.local_addr().expect("test SSH server address");
+        let (attempts_tx, mut attempts_rx) = mpsc::channel(1);
+        let config = Arc::new(russh::server::Config {
+            auth_rejection_time: Duration::ZERO,
+            auth_rejection_time_initial: Some(Duration::ZERO),
+            keys: vec![PrivateKey::from_openssh(TEST_ED25519_PRIVATE_KEY)
+                .expect("parse test SSH host key")],
+            ..Default::default()
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept SSH client");
+            let session = russh::server::run_stream(
+                config,
+                stream,
+                PasswordAuthServer {
+                    expected_user: expected_user.to_owned(),
+                    expected_password: expected_password.to_owned(),
+                    attempts: attempts_tx,
+                },
+            )
+            .await
+            .expect("start russh test session");
+            let _ = tokio::time::timeout(Duration::from_secs(5), session).await;
+        });
+
+        let mut args = test_ssh_args(&format!("127.0.0.1:{}", server_addr.port()));
+        args.ssh_user = Some(expected_user.to_owned());
+        args.password_file = Some(password_path.clone());
+        args.insecure_accept_host_key = true;
+        args.ssh_connect_timeout_secs = 2;
+        let handle = connect_ssh(&args)
+            .await
+            .expect("connect with password-file authentication");
+
+        let attempt = tokio::time::timeout(Duration::from_secs(3), attempts_rx.recv())
+            .await
+            .expect("password auth attempt")
+            .expect("password auth attempt recorded");
+        assert_eq!(
+            attempt,
+            (expected_user.to_owned(), expected_password.to_owned())
+        );
+
+        drop(handle);
+        server.abort();
+        std::fs::remove_file(password_path).unwrap();
     }
 
     #[test]
@@ -8380,6 +10164,81 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
+            )
+        );
+    }
+
+    #[test]
+    fn windows_full_tunnel_routes_use_split_default_commands() {
+        let routes = expand_target_routes(&[parse_target_cidr("0.0.0.0/0").unwrap()])
+            .expect("full tunnel route expands");
+        let gateway = Ipv4Addr::new(10, 255, 255, 1);
+
+        assert_eq!(
+            routes,
+            vec![
+                "0.0.0.0/1".parse::<Ipv4Net>().unwrap(),
+                "128.0.0.0/1".parse::<Ipv4Net>().unwrap(),
+            ]
+        );
+        assert_eq!(
+            windows_route_command(RouteAction::Add, routes[0], 42, gateway),
+            (
+                "route".to_owned(),
+                vec![
+                    "ADD",
+                    "0.0.0.0",
+                    "MASK",
+                    "128.0.0.0",
+                    "10.255.255.1",
+                    "METRIC",
+                    "1",
+                    "IF",
+                    "42",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            )
+        );
+        assert_eq!(
+            windows_route_command(RouteAction::Add, routes[1], 42, gateway),
+            (
+                "route".to_owned(),
+                vec![
+                    "ADD",
+                    "128.0.0.0",
+                    "MASK",
+                    "128.0.0.0",
+                    "10.255.255.1",
+                    "METRIC",
+                    "1",
+                    "IF",
+                    "42",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            )
+        );
+        assert_eq!(
+            windows_route_command(RouteAction::Delete, routes[0], 42, gateway),
+            (
+                "route".to_owned(),
+                vec!["DELETE", "0.0.0.0", "MASK", "128.0.0.0", "10.255.255.1"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+        );
+        assert_eq!(
+            windows_route_command(RouteAction::Delete, routes[1], 42, gateway),
+            (
+                "route".to_owned(),
+                vec!["DELETE", "128.0.0.0", "MASK", "128.0.0.0", "10.255.255.1"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
             )
         );
     }
@@ -8695,6 +10554,20 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_shutdown_signals_include_hangup_and_terminate() {
+        let signals: Vec<_> = unix_shutdown_signals()
+            .into_iter()
+            .map(|signal| (signal.label(), signal.os_name()))
+            .collect();
+
+        assert_eq!(
+            signals,
+            vec![("terminate", "SIGTERM"), ("hangup", "SIGHUP")]
+        );
+    }
+
     #[test]
     fn validate_tun_args_accepts_full_tunnel_route() {
         let args = TunCaptureArgs {
@@ -8712,8 +10585,9 @@ mod tests {
     #[test]
     fn ssh_control_ip_to_protect_detects_captured_server() {
         let targets = expand_target_routes(&["0.0.0.0/0".parse().unwrap()]).unwrap();
+        let ssh = test_ssh_args("127.0.0.1:22");
         assert_eq!(
-            ssh_control_ip_to_protect("127.0.0.1:22", &targets).unwrap(),
+            ssh_control_ip_to_protect(&ssh, &targets).unwrap(),
             Some(Ipv4Addr::new(127, 0, 0, 1))
         );
     }
@@ -9818,6 +11692,63 @@ mod tests {
     }
 
     #[test]
+    fn compact_cli_accepts_hidden_quic_agent_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--bridge-transport",
+            "quic-agent",
+            "--agent-path",
+            "/tmp/rustle",
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with hidden QUIC agent transport");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.compact.bridge_transport, BridgeTransportKind::QuicAgent);
+        assert_eq!(
+            effective_bridge_agent_command(
+                cli.compact.bridge_transport,
+                cli.compact.agent_command.as_deref(),
+                cli.compact.agent_path.as_deref()
+            )
+            .expect("QUIC agent path becomes effective command"),
+            "'/tmp/rustle' quic-agent"
+        );
+    }
+
+    #[test]
+    fn compact_cli_accepts_hidden_quic_native_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--bridge-transport",
+            "quic-native",
+            "--agent-path",
+            "/tmp/rustle",
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with hidden native QUIC transport");
+
+        assert!(cli.command.is_none());
+        assert_eq!(
+            cli.compact.bridge_transport,
+            BridgeTransportKind::QuicNative
+        );
+        assert_eq!(
+            effective_bridge_agent_command(
+                cli.compact.bridge_transport,
+                cli.compact.agent_command.as_deref(),
+                cli.compact.agent_path.as_deref()
+            )
+            .expect("native QUIC bridge path becomes effective command"),
+            "'/tmp/rustle' quic-bridge-agent"
+        );
+    }
+
+    #[test]
     fn compact_cli_rejects_conflicting_agent_command_modes() {
         let err = Cli::try_parse_from([
             "rustle",
@@ -10060,6 +11991,98 @@ mod tests {
     }
 
     #[test]
+    fn bridge_lab_accepts_hidden_quic_agent_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "bridge-lab",
+            "-r",
+            "alice@example.com",
+            "--destination",
+            "127.0.0.1:8080",
+            "--bridge-transport",
+            "quic-agent",
+            "--agent-path",
+            "/tmp/rustle",
+        ])
+        .expect("bridge-lab QUIC agent transport subcommand must parse");
+
+        let Some(CommandKind::BridgeLab(args)) = cli.command else {
+            panic!("expected bridge-lab subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::QuicAgent);
+        assert_eq!(
+            effective_bridge_agent_command(
+                args.bridge_transport,
+                args.agent_command.as_deref(),
+                args.agent_path.as_deref()
+            )
+            .expect("bridge-lab QUIC agent path becomes effective command"),
+            "'/tmp/rustle' quic-agent"
+        );
+    }
+
+    #[test]
+    fn bridge_lab_accepts_hidden_quic_native_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "bridge-lab",
+            "-r",
+            "alice@example.com",
+            "--destination",
+            "127.0.0.1:8080",
+            "--bridge-transport",
+            "quic-native",
+            "--agent-path",
+            "/tmp/rustle",
+        ])
+        .expect("bridge-lab native QUIC transport subcommand must parse");
+
+        let Some(CommandKind::BridgeLab(args)) = cli.command else {
+            panic!("expected bridge-lab subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::QuicNative);
+        assert_eq!(
+            effective_bridge_agent_command(
+                args.bridge_transport,
+                args.agent_command.as_deref(),
+                args.agent_path.as_deref()
+            )
+            .expect("bridge-lab native QUIC path becomes effective command"),
+            "'/tmp/rustle' quic-bridge-agent"
+        );
+    }
+
+    #[test]
+    fn quic_agent_subcommand_accepts_bind_and_mtu() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "quic-agent",
+            "--bind",
+            "127.0.0.1:0",
+            "--mtu",
+            "1200",
+        ])
+        .expect("quic-agent subcommand must parse");
+
+        let Some(CommandKind::QuicAgent(args)) = cli.command else {
+            panic!("expected quic-agent subcommand");
+        };
+        assert_eq!(args.bind, "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+        assert_eq!(args.mtu, 1200);
+    }
+
+    #[test]
+    fn quic_bridge_agent_subcommand_accepts_bind() {
+        let cli = Cli::try_parse_from(["rustle", "quic-bridge-agent", "--bind", "127.0.0.1:0"])
+            .expect("quic-bridge-agent subcommand must parse");
+
+        let Some(CommandKind::QuicBridgeAgent(args)) = cli.command else {
+            panic!("expected quic-bridge-agent subcommand");
+        };
+        assert_eq!(args.bind, "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
     fn agent_lab_accepts_hidden_exec_transport_options() {
         let cli = Cli::try_parse_from([
             "rustle",
@@ -10138,6 +12161,46 @@ mod tests {
         assert_eq!(args.messages, 4);
         assert_eq!(args.pipeline, 2);
         assert!(args.summary);
+        assert_eq!(args.mtu, 1200);
+    }
+
+    #[test]
+    fn agent_dns_lab_accepts_transport_queries_and_remote() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "agent-dns-lab",
+            "-r",
+            "alice@example.com",
+            "--dns-remote",
+            "127.0.0.1:53",
+            "--name",
+            "rustle-smoke.example.com",
+            "--queries",
+            "4",
+            "--bridge-transport",
+            "quic-agent",
+            "--agent-command",
+            "/tmp/rustle quic-agent",
+            "--agent-sessions",
+            "1",
+            "--mtu",
+            "1200",
+        ])
+        .expect("agent-dns-lab subcommand must parse");
+
+        let Some(CommandKind::AgentDnsLab(args)) = cli.command else {
+            panic!("expected agent-dns-lab subcommand");
+        };
+        assert_eq!(args.dns_remote, "127.0.0.1:53");
+        assert_eq!(args.name, "rustle-smoke.example.com");
+        assert_eq!(args.queries, 4);
+        assert_eq!(args.bridge_transport, BridgeTransportKind::QuicAgent);
+        assert_eq!(
+            args.agent_command.as_deref(),
+            Some("/tmp/rustle quic-agent")
+        );
+        assert!(args.agent_path.is_none());
+        assert_eq!(args.agent_sessions, 1);
         assert_eq!(args.mtu, 1200);
     }
 
@@ -10336,6 +12399,29 @@ mod tests {
         };
         validate_tunnel_args(&args)
             .expect("agent supports hostname DNS remote through OpenTcpHost");
+    }
+
+    #[test]
+    fn quic_native_tunnel_accepts_hostname_dns_remote() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--bridge-transport",
+            "quic-native",
+            "--dns-remote",
+            "localhost:53",
+        ])
+        .expect("tunnel CLI with native QUIC hostname DNS remote");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        validate_tunnel_args(&args)
+            .expect("native QUIC supports hostname DNS remote through TCP host open");
     }
 
     #[test]
@@ -10819,6 +12905,75 @@ mod tests {
         assert!(bridge_lab_response_complete(complete));
         assert!(!bridge_lab_response_complete(incomplete));
         assert!(!bridge_lab_response_complete(b"raw bytes"));
+    }
+
+    #[test]
+    fn bridge_lab_cleanup_aborts_incomplete_client_socket() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 8080;
+        let client_port = 50_000;
+        let (iface, device, sockets, handle) = synthetic_lab_client(
+            client_ip,
+            DEFAULT_TUN_IP,
+            destination_ip,
+            destination_port,
+            client_port,
+        )
+        .expect("synthetic client");
+        let mut client = BridgeLabClient {
+            flow: tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port),
+            client_ip,
+            client_port,
+            iface,
+            device,
+            sockets,
+            handle,
+            sent_request: true,
+            request_sent_at: Some(StdInstant::now()),
+            response_complete_at: None,
+            saw_bridge_close: false,
+            response: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel".to_vec(),
+        };
+
+        assert!(!bridge_lab_client_complete(&client));
+        assert!(client
+            .sockets
+            .get_mut::<tcp::Socket>(client.handle)
+            .is_active());
+
+        assert!(abort_bridge_lab_client_socket(&mut client));
+        assert!(!client
+            .sockets
+            .get_mut::<tcp::Socket>(client.handle)
+            .is_active());
+        assert!(!abort_bridge_lab_client_socket(&mut client));
+    }
+
+    #[test]
+    fn remote_backlog_per_flow_has_agent_window_frame_headroom() {
+        let backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+
+        assert_eq!(
+            backlogs.max_bytes_per_flow(),
+            tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW
+        );
+        assert!(backlogs.max_bytes_per_flow() > agent_window::AGENT_STREAM_MAX_WINDOW_BYTES);
+        assert!(backlogs.max_bytes_per_flow() < REMOTE_BACKLOG_BYTES_TOTAL);
+    }
+
+    #[test]
+    fn bridge_lab_latency_percentiles_use_nearest_rank() {
+        let mut latencies = vec![900_u128, 100, 300, 500];
+
+        assert_eq!(
+            bridge_lab_latency_percentiles(&mut latencies),
+            BridgeLabLatencySummary {
+                p50_us: 300,
+                p95_us: 900,
+                max_us: 900,
+            }
+        );
     }
 
     #[test]
@@ -11385,6 +13540,8 @@ mod tests {
             sockets,
             handle,
             sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
             saw_bridge_close: false,
             response: Vec::new(),
         }];
@@ -11398,7 +13555,8 @@ mod tests {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, manager).expect("drain client")
             };
-            route_lab_packets_to_clients(packets, &mut clients).expect("route packets");
+            route_lab_packets_to_clients(now, packets, &mut clients, manager)
+                .expect("route packets");
             pump_lab_manager_to_clients(now, manager, &mut clients).expect("pump manager");
 
             if manager.snapshots().iter().any(|snapshot| {
@@ -11410,6 +13568,76 @@ mod tests {
         }
 
         panic!("synthetic flow did not reach TcpEstablished");
+    }
+
+    #[test]
+    fn bridge_lab_router_recycles_client_packet_buffers_for_full_send_window() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let (iface, device, sockets, handle) = synthetic_lab_client(
+            client_ip,
+            DEFAULT_TUN_IP,
+            destination_ip,
+            destination_port,
+            client_port,
+        )
+        .expect("synthetic client");
+        let mut clients = vec![BridgeLabClient {
+            flow,
+            client_ip,
+            client_port,
+            iface,
+            device,
+            sockets,
+            handle,
+            sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
+            saw_bridge_close: false,
+            response: Vec::new(),
+        }];
+        let mut now = SmolInstant::from_millis(0);
+
+        for _ in 0..256 {
+            let packets = {
+                let client = &mut clients[0];
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+                drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
+            };
+            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+                .expect("route packets");
+            pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
+
+            if manager.snapshots().iter().any(|snapshot| {
+                snapshot.key == flow && snapshot.state == tcp_core::FlowState::TcpEstablished
+            }) {
+                break;
+            }
+            now += smoltcp::time::Duration::from_millis(1);
+        }
+
+        let payload = vec![0x42; tcp_core::TCP_SEND_BUFFER_BYTES];
+        let sent = manager
+            .send_flow_bytes_at(flow, &payload, now)
+            .expect("enqueue full send window");
+        assert_eq!(sent, payload.len());
+
+        pump_lab_manager_to_clients(now, &mut manager, &mut clients)
+            .expect("full send window should route without exhausting packet buffers");
+        assert_eq!(clients[0].response.len(), payload.len());
+        assert_eq!(clients[0].response, payload);
     }
 
     #[tokio::test]
@@ -11443,6 +13671,8 @@ mod tests {
             sockets,
             handle,
             sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
             saw_bridge_close: false,
             response: Vec::new(),
         }];
@@ -11456,7 +13686,8 @@ mod tests {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
             };
-            route_lab_packets_to_clients(packets, &mut clients).expect("route packets");
+            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+                .expect("route packets");
             pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
 
             if manager.snapshots().iter().any(|snapshot| {
@@ -11484,7 +13715,8 @@ mod tests {
                 .poll(now, &mut client.device, &mut client.sockets);
             drain_lab_client_to_manager(now, client, &mut manager).expect("drain request")
         };
-        route_lab_packets_to_clients(packets, &mut clients).expect("route request packets");
+        route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+            .expect("route request packets");
 
         let mut bridges = HashMap::new();
         let mut flow_keys = Vec::new();
@@ -11625,6 +13857,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_over_quic_native_uses_udp_for_ipv4_remote() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP DNS socket");
+        let destination = socket.local_addr().expect("UDP DNS socket address");
+        let dns_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 512];
+            let (len, peer) = socket
+                .recv_from(&mut buf)
+                .await
+                .expect("recv native QUIC UDP DNS query");
+            assert_eq!(&buf[..len], b"\x12\x34native-query");
+            socket
+                .send_to(b"\x12\x34native-answer", peer)
+                .await
+                .expect("send native QUIC UDP DNS response");
+        });
+        let destination = match destination {
+            std::net::SocketAddr::V4(addr) => addr,
+            std::net::SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let remote = Destination {
+            host: destination.ip().to_string(),
+            port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+
+        let response = query_dns_over_transport(
+            DnsTransport::QuicNative(bridge.clone()),
+            &remote,
+            b"\x12\x34native-query",
+        )
+        .await
+        .expect("query DNS over native QUIC UDP");
+        assert_eq!(response.as_ref(), b"\x12\x34native-answer");
+
+        bridge.client.close("test complete");
+        bridge_task.await.expect("native bridge task");
+        dns_server.await.expect("DNS UDP server join");
+    }
+
+    #[tokio::test]
     async fn dns_over_agent_accepts_hostname_remote() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11688,6 +13962,63 @@ mod tests {
             .expect("agent exits")
             .expect("agent join")
             .expect("agent run");
+        dns_server.await.expect("DNS server join");
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_native_accepts_hostname_remote() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP DNS listener");
+        let destination = listener.local_addr().expect("TCP DNS listener address");
+        let dns_server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept native QUIC TCP DNS query");
+            let mut len = [0_u8; 2];
+            socket
+                .read_exact(&mut len)
+                .await
+                .expect("read native QUIC TCP DNS query length");
+            let query_len = usize::from(u16::from_be_bytes(len));
+            let mut query = vec![0_u8; query_len];
+            socket
+                .read_exact(&mut query)
+                .await
+                .expect("read native QUIC TCP DNS query");
+            assert_eq!(query, b"\xab\xcdnative-name-query");
+
+            let response = b"\xab\xcdnative-name-answer";
+            socket
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .expect("write native QUIC TCP DNS response length");
+            socket
+                .write_all(response)
+                .await
+                .expect("write native QUIC TCP DNS response");
+            socket.shutdown().await.expect("shutdown TCP DNS socket");
+        });
+        let remote = Destination {
+            host: "localhost".to_owned(),
+            port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+
+        let response = query_dns_over_transport(
+            DnsTransport::QuicNative(bridge.clone()),
+            &remote,
+            b"\xab\xcdnative-name-query",
+        )
+        .await
+        .expect("query DNS over native QUIC hostname");
+        assert_eq!(response.as_ref(), b"\xab\xcdnative-name-answer");
+
+        bridge.client.close("test complete");
+        bridge_task.await.expect("native bridge task");
         dns_server.await.expect("DNS server join");
     }
 
@@ -13653,6 +15984,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn udp_association_reuses_quic_native_stream_for_multiple_datagrams() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP target");
+        let destination = socket.local_addr().expect("UDP target address");
+        let udp_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            for _ in 0..2 {
+                let (len, peer) = socket.recv_from(&mut buf).await.expect("read UDP query");
+                let mut response = b"native-echo:".to_vec();
+                response.extend_from_slice(&buf[..len]);
+                socket
+                    .send_to(&response, peer)
+                    .await
+                    .expect("write UDP response");
+            }
+        });
+        let destination = match destination {
+            std::net::SocketAddr::V4(addr) => addr,
+            std::net::SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: *destination.ip(),
+            dst_port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let (close_tx, mut close_rx) = mpsc::channel(8);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let association = tokio::spawn(run_udp_association(
+            UdpAssociationTransport::QuicNative(bridge.clone()),
+            key,
+            from_local,
+            events,
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+        ));
+
+        to_remote
+            .send(Bytes::from_static(b"one"))
+            .await
+            .expect("send first datagram");
+        to_remote
+            .send(Bytes::from_static(b"two"))
+            .await
+            .expect("send second datagram");
+
+        let mut responses = Vec::new();
+        while responses.len() < 2 {
+            tokio::select! {
+                event = response_rx.recv() => {
+                    let event = event.expect("association response channel closed");
+                    assert_eq!(event.key, key);
+                    responses.push(event.payload);
+                }
+                event = close_rx.recv() => {
+                    let event = event.expect("association close channel closed");
+                    panic!("native QUIC UDP association closed before responses: {:?}", event.error);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!("timed out waiting for native QUIC UDP association event");
+                }
+            }
+        }
+        assert_eq!(
+            responses,
+            vec![
+                Bytes::from_static(b"native-echo:one"),
+                Bytes::from_static(b"native-echo:two")
+            ]
+        );
+
+        drop(to_remote);
+        tokio::time::timeout(std::time::Duration::from_secs(1), association)
+            .await
+            .expect("association exits")
+            .expect("association join")
+            .expect("association run");
+        bridge.client.close("test complete");
+        bridge_task.await.expect("native bridge task");
+        udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
     async fn udp_association_idle_timeout_emits_close_for_accounting() {
         let (transport, agent) = test_agent_transport().await;
         let bridge = ReconnectingAgentBridge::new(
@@ -13678,7 +16098,7 @@ mod tests {
         assert!(association_limit.try_admit());
 
         spawn_udp_association_with_idle_timeout(
-            bridge.clone(),
+            UdpAssociationTransport::Agent(bridge.clone()),
             key,
             from_local,
             events,
@@ -13738,6 +16158,8 @@ mod tests {
             sockets,
             handle,
             sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
             saw_bridge_close: false,
             response: Vec::new(),
         }];
@@ -13751,7 +16173,8 @@ mod tests {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
             };
-            route_lab_packets_to_clients(packets, &mut clients).expect("route packets");
+            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+                .expect("route packets");
             pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
 
             if manager.snapshots().iter().any(|snapshot| {
@@ -13776,7 +16199,8 @@ mod tests {
                 .poll(now, &mut client.device, &mut client.sockets);
             drain_lab_client_to_manager(now, client, &mut manager).expect("drain request")
         };
-        route_lab_packets_to_clients(packets, &mut clients).expect("route request packets");
+        route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+            .expect("route request packets");
 
         let mut bridges = HashMap::new();
         let mut flow_keys = Vec::new();
@@ -13829,6 +16253,8 @@ mod tests {
             sockets,
             handle,
             sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
             saw_bridge_close: false,
             response: Vec::new(),
         }];
@@ -13842,7 +16268,8 @@ mod tests {
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
             };
-            route_lab_packets_to_clients(packets, &mut clients).expect("route packets");
+            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+                .expect("route packets");
             pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
 
             if manager.snapshots().iter().any(|snapshot| {
@@ -13870,7 +16297,8 @@ mod tests {
                 .poll(now, &mut client.device, &mut client.sockets);
             drain_lab_client_to_manager(now, client, &mut manager).expect("drain request")
         };
-        route_lab_packets_to_clients(packets, &mut clients).expect("route request packets");
+        route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+            .expect("route request packets");
 
         let (event_tx, _event_rx) = mpsc::channel(1);
         let id = manager.flow_id(flow).expect("flow id");
@@ -13932,5 +16360,113 @@ mod tests {
                 port: 22,
             }
         );
+    }
+
+    #[test]
+    fn ssh_config_alias_resolves_target_user_port_and_paths() {
+        let config_path = write_temp_ssh_config(
+            "Host contabo\n\
+             HostName 203.0.113.10\n\
+             User deploy\n\
+             Port 2202\n\
+             IdentityFile ~/.ssh/%n-%r-%p\n\
+             UserKnownHostsFile ~/.ssh/known_hosts_%h_%p\n",
+        );
+        let mut args = test_ssh_args("contabo");
+        args.ssh_user = None;
+        args.ssh_config = Some(config_path.clone());
+
+        let prepared = prepare_ssh_connection(&args).expect("prepare SSH alias");
+
+        assert_eq!(
+            prepared.target,
+            SshTarget {
+                user: "deploy".to_owned(),
+                addr: "203.0.113.10:2202".to_owned(),
+                host: "203.0.113.10".to_owned(),
+                port: 2202,
+            }
+        );
+        let home = home_dir().expect("test requires home directory");
+        assert_eq!(
+            prepared.identity_files,
+            vec![home.join(".ssh").join("contabo-deploy-2202")]
+        );
+        assert_eq!(
+            prepared.known_hosts,
+            Some(home.join(".ssh").join("known_hosts_203.0.113.10_2202"))
+        );
+
+        std::fs::remove_file(config_path).expect("remove temp SSH config");
+    }
+
+    #[test]
+    fn ssh_config_alias_respects_cli_user_and_explicit_port_overrides() {
+        let config_path = write_temp_ssh_config(
+            "Host contabo\n\
+             HostName 203.0.113.10\n\
+             User deploy\n\
+             Port 2202\n",
+        );
+        let mut args = test_ssh_args("contabo:2222");
+        args.ssh_user = Some("root".to_owned());
+        args.ssh_config = Some(config_path.clone());
+
+        let target = resolve_ssh_target(&args).expect("resolve SSH alias with overrides");
+
+        assert_eq!(
+            target,
+            SshTarget {
+                user: "root".to_owned(),
+                addr: "203.0.113.10:2222".to_owned(),
+                host: "203.0.113.10".to_owned(),
+                port: 2222,
+            }
+        );
+
+        std::fs::remove_file(config_path).expect("remove temp SSH config");
+    }
+
+    #[test]
+    fn ssh_config_host_patterns_support_wildcards_and_negation() {
+        let config = "Host * !blocked\n\
+                      User fallback\n\
+                      Port 2200\n\
+                      Host prod-*\n\
+                      User deploy\n\
+                      IdentityFile ~/.ssh/%h\n\
+                      Host blocked\n\
+                      HostName 192.0.2.9\n";
+
+        assert_eq!(
+            parse_ssh_config_for_host(config, "prod-api").expect("parse wildcard config"),
+            SshConfigMatch {
+                hostname: None,
+                user: Some("fallback".to_owned()),
+                port: Some(2200),
+                identity_files: vec!["~/.ssh/%h".to_owned()],
+                user_known_hosts_file: None,
+            }
+        );
+        assert_eq!(
+            parse_ssh_config_for_host(config, "blocked").expect("parse negated config"),
+            SshConfigMatch {
+                hostname: Some("192.0.2.9".to_owned()),
+                user: None,
+                port: None,
+                identity_files: Vec::new(),
+                user_known_hosts_file: None,
+            }
+        );
+    }
+
+    fn write_temp_ssh_config(contents: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "rustle-ssh-config-test-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        std::fs::write(&path, contents).expect("write temp SSH config");
+        path
     }
 }

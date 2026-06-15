@@ -11,15 +11,47 @@ permissions:
 
 jobs:
   matrix-check:
-    name: Release matrix
+    name: Release preflight
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Test
+        run: cargo test
+
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Verify release matrix
         run: python3 scripts/verify-release-matrix.py
+
+      - name: Verify Windows TUN smoke assertions
+        run: python3 scripts/verify-windows-tun-smoke.py
+
+      - name: Verify live benchmark row gates
+        run: python3 scripts/verify-live-benchmark-rows.py --self-test
+
+      - name: Verify live fixture row gates
+        run: python3 scripts/verify-live-fixture-rows.py --self-test
+
+      - name: Verify release archive manifest self-test
+        run: python3 scripts/verify-release-archives.py --self-test
+
+      - name: Shell script syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
 
   build:
     name: ${{ matrix.target }}
@@ -124,6 +156,7 @@ jobs:
           cp README.md "dist/${{ matrix.package }}/"
           cp docs/architecture.md "dist/${{ matrix.package }}/ARCHITECTURE.md"
           cp docs/release.md "dist/${{ matrix.package }}/RELEASE.md"
+          cp docs/troubleshooting.md "dist/${{ matrix.package }}/TROUBLESHOOTING.md"
           tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.package }}"
 
       - name: Verify Unix archive
@@ -136,6 +169,7 @@ jobs:
           grep -Fx "${{ matrix.package }}/README.md" "dist/${{ matrix.package }}.contents"
           grep -Fx "${{ matrix.package }}/ARCHITECTURE.md" "dist/${{ matrix.package }}.contents"
           grep -Fx "${{ matrix.package }}/RELEASE.md" "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/TROUBLESHOOTING.md" "dist/${{ matrix.package }}.contents"
           rm -rf verify
           mkdir -p verify
           tar -xzf "dist/${{ matrix.archive }}" -C verify
@@ -143,6 +177,7 @@ jobs:
           test -f "verify/${{ matrix.package }}/README.md"
           test -f "verify/${{ matrix.package }}/ARCHITECTURE.md"
           test -f "verify/${{ matrix.package }}/RELEASE.md"
+          test -f "verify/${{ matrix.package }}/TROUBLESHOOTING.md"
           "verify/${{ matrix.package }}/rustle" --help >/dev/null
           if [[ "${{ matrix.target }}" == *"unknown-linux-musl" ]]; then
             ldd_output="$(ldd "verify/${{ matrix.package }}/rustle" 2>&1 || true)"
@@ -162,6 +197,7 @@ jobs:
           Copy-Item "README.md" "dist/${{ matrix.package }}/"
           Copy-Item "docs/architecture.md" "dist/${{ matrix.package }}/ARCHITECTURE.md"
           Copy-Item "docs/release.md" "dist/${{ matrix.package }}/RELEASE.md"
+          Copy-Item "docs/troubleshooting.md" "dist/${{ matrix.package }}/TROUBLESHOOTING.md"
           Compress-Archive -Path "dist/${{ matrix.package }}" -DestinationPath "dist/${{ matrix.archive }}"
 
       - name: Verify Windows archive
@@ -175,7 +211,8 @@ jobs:
           if (!(Test-Path "$package/README.md")) { throw "missing README.md" }
           if (!(Test-Path "$package/ARCHITECTURE.md")) { throw "missing ARCHITECTURE.md" }
           if (!(Test-Path "$package/RELEASE.md")) { throw "missing RELEASE.md" }
-          $expected = @("ARCHITECTURE.md", "README.md", "RELEASE.md", "rustle.exe")
+          if (!(Test-Path "$package/TROUBLESHOOTING.md")) { throw "missing TROUBLESHOOTING.md" }
+          $expected = @("ARCHITECTURE.md", "README.md", "RELEASE.md", "TROUBLESHOOTING.md", "rustle.exe")
           $actual = Get-ChildItem -LiteralPath $package -File | ForEach-Object Name | Sort-Object
           if (@($actual).Count -ne $expected.Count) {
             throw "unexpected Windows archive file count: $($actual -join ', ')"
@@ -235,6 +272,10 @@ jobs:
             exit 1
           fi
           cat SHA256SUMS
+
+      - name: Verify release archive manifest
+        shell: bash
+        run: python3 scripts/verify-release-archives.py dist SHA256SUMS
 
       - name: Verify agent sidecar store
         shell: bash

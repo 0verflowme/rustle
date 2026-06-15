@@ -13,7 +13,9 @@ use crate::tcp_core::FlowId;
 
 pub const FLOW_CHANNEL_DEPTH: usize = 64;
 pub const FLOW_CHANNEL_BYTES: usize = 128 * 1024;
-pub const BRIDGE_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DIRECT_TCPIP_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+pub const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
+pub const DNS_DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BRIDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const BRIDGE_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -203,7 +205,8 @@ where
 {
     spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
         let open_started_at = Instant::now();
-        let channel_result = tokio::time::timeout(BRIDGE_OPEN_TIMEOUT, open_channel(id)).await;
+        let channel_result =
+            tokio::time::timeout(DIRECT_TCPIP_OPEN_TIMEOUT, open_channel(id)).await;
 
         let channel_result = match channel_result {
             Ok(result) => result,
@@ -215,7 +218,7 @@ where
                         phase: BridgeFailurePhase::Open,
                         message: format!(
                             "timed out after {}ms opening SSH direct-tcpip channel",
-                            BRIDGE_OPEN_TIMEOUT.as_millis()
+                            DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
                         ),
                     },
                 )

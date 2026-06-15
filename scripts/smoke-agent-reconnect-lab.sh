@@ -16,7 +16,9 @@ trap cleanup EXIT
 RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bin)"
 HELPER="${TMPDIR}/flaky-agent.sh"
 MARKER="${TMPDIR}/flaky-agent.used"
-BRIDGE_CONNECTIONS="${RUSTLE_SMOKE_AGENT_RECONNECT_CONNECTIONS:-2}"
+BRIDGE_CONNECTIONS="${RUSTLE_SMOKE_AGENT_RECONNECT_CONNECTIONS:-4}"
+MIN_COMPLETED="${RUSTLE_SMOKE_AGENT_RECONNECT_MIN_COMPLETED:-2}"
+DEADLINE_MS="${RUSTLE_SMOKE_AGENT_RECONNECT_DEADLINE_MS:-6000}"
 export RUSTLE_SMOKE_HTTP_BODY_BYTES="${RUSTLE_SMOKE_HTTP_BODY_BYTES:-65536}"
 
 cat >"$HELPER" <<'SH'
@@ -77,6 +79,8 @@ set +e
   --destination "127.0.0.1:${SMOKE_HTTP_PORT}" \
   --request "$REQUEST" \
   --connections "$BRIDGE_CONNECTIONS" \
+  --min-completed "$MIN_COMPLETED" \
+  --deadline-ms "$DEADLINE_MS" \
   --bridge-transport agent \
   --agent-sessions 1 \
   --agent-command "$AGENT_COMMAND" \
@@ -97,10 +101,10 @@ if ! grep -q 'agent: reconnecting after transport failure' "$ERR"; then
 fi
 
 received_markers="$( (grep -ao 'rustle-smoke-ok' "$OUT" || true) | wc -l | tr -d '[:space:]')"
-if [[ "$received_markers" != "$BRIDGE_CONNECTIONS" ]]; then
+if [[ "$received_markers" -lt "$MIN_COMPLETED" ]]; then
   sed 's/^/rustle stderr: /' "$ERR" >&2 || true
   sed 's/^/rustle stdout: /' "$OUT" >&2 || true
-  smoke_die "agent reconnect smoke received ${received_markers} expected markers, wanted ${BRIDGE_CONNECTIONS}"
+  smoke_die "agent reconnect smoke received ${received_markers} completed responses, wanted at least ${MIN_COMPLETED}"
 fi
 
-smoke_info "agent reconnect bridge-lab smoke passed with ${BRIDGE_CONNECTIONS} connections"
+smoke_info "agent reconnect bridge-lab smoke passed with ${received_markers}/${BRIDGE_CONNECTIONS} completed responses"

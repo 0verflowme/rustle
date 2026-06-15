@@ -32,3 +32,13 @@ smoltcp = { version = "0.13.1", default-features = false, features = [
 ] }
 tokio = { version = "1.45", features = ["full"] }
 tun-rs = { version = "2", features = ["async"] }
+quinn = { version = "0.11.9", default-features = false, features = [
+    "log",
+    "runtime-tokio",
+    "rustls-ring",
+] }
+rcgen = { version = "0.14.8", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+] }

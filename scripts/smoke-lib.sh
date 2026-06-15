@@ -565,6 +565,112 @@ smoke_children_of() {
   fi
 }
 
+smoke_descendants_of() {
+  local root="$1"
+  "$(smoke_python)" - "$root" <<'PY'
+import collections
+import subprocess
+import sys
+
+root = int(sys.argv[1])
+try:
+    output = subprocess.check_output(["ps", "-axo", "pid=,ppid="], text=True)
+except Exception:
+    sys.exit(0)
+
+children = collections.defaultdict(list)
+for line in output.splitlines():
+    parts = line.split()
+    if len(parts) < 2:
+        continue
+    try:
+        pid = int(parts[0])
+        ppid = int(parts[1])
+    except ValueError:
+        continue
+    children[ppid].append(pid)
+
+stack = list(reversed(children.get(root, [])))
+seen = set()
+while stack:
+    pid = stack.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    print(pid)
+    stack.extend(reversed(children.get(pid, [])))
+PY
+}
+
+smoke_wait_for_no_descendants() {
+  local pid="$1"
+  local seconds="${2:-5}"
+  local label="${3:-process tree}"
+  local attempts=$((seconds * 10))
+  local descendants
+
+  for ((i = 0; i <= attempts; i++)); do
+    descendants="$(smoke_descendants_of "$pid" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    if [[ -z "$descendants" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  smoke_info "${label} descendants remain under pid ${pid}: ${descendants}"
+  # shellcheck disable=SC2086
+  ps -o pid=,ppid=,stat=,command= -p $descendants >&2 2>/dev/null || true
+  smoke_die "${label} leaked descendant process(es)"
+}
+
+smoke_process_fd_count() {
+  local pid="$1"
+  if [[ -d "/proc/${pid}/fd" ]]; then
+    find "/proc/${pid}/fd" -maxdepth 1 -mindepth 1 -print 2>/dev/null | wc -l | tr -d '[:space:]'
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -p "$pid" 2>/dev/null | awk 'NR > 1 { count++ } END { print count + 0 }'
+    return 0
+  fi
+  return 1
+}
+
+smoke_process_tree_fd_count() {
+  local root="$1"
+  local total=0
+  local pid
+  local count
+
+  if ! smoke_process_running "$root"; then
+    return 1
+  fi
+
+  count="$(smoke_process_fd_count "$root")" || return 1
+  total=$((total + count))
+  while read -r pid; do
+    [[ -n "$pid" ]] || continue
+    smoke_process_running "$pid" || continue
+    count="$(smoke_process_fd_count "$pid")" || return 1
+    total=$((total + count))
+  done < <(smoke_descendants_of "$root")
+
+  printf '%s\n' "$total"
+}
+
+smoke_require_process_tree_fd_count_at_most() {
+  local root="$1"
+  local maximum="$2"
+  local label="${3:-process tree}"
+  local count
+
+  count="$(smoke_process_tree_fd_count "$root")" || return 0
+  if [[ "$count" -gt "$maximum" ]]; then
+    smoke_info "${label} fd count ${count} exceeded max ${maximum}"
+    smoke_die "${label} leaked file descriptor(s)"
+  fi
+}
+
 smoke_interrupt_process_tree() {
   local pid="${1:-}"
   [[ -n "$pid" ]] || return 0

@@ -13,18 +13,27 @@ The release workflow builds native archives for:
 - `x86_64-pc-windows-msvc`
 - `aarch64-pc-windows-msvc`
 
-Each archive contains the Rustle binary, the README, the architecture notes, and
-this release note. The workflow verifies that each archive contains those files,
-extracts the archive, runs the extracted packaged binary with `--help`, checks
-musl archives for static linkage, requires all eight native archives before
-publishing, and publishes a `SHA256SUMS` file with one entry per archive.
+Each archive contains the Rustle binary, the README, the architecture notes,
+this release note, and the troubleshooting guide. Before any archive builds,
+the release workflow runs a preflight with `cargo fmt --check`, `cargo test`,
+`cargo clippy --all-targets -- -D warnings`, `scripts/verify-release-matrix.py`,
+`scripts/verify-windows-tun-smoke.py`,
+`scripts/verify-live-benchmark-rows.py --self-test`,
+`scripts/verify-live-fixture-rows.py --self-test`,
+`scripts/verify-release-archives.py --self-test`, and shell syntax checks for
+all `scripts/*.sh`. The workflow then verifies that each archive contains the
+expected files, extracts the archive, runs the extracted packaged binary with
+`--help`, checks musl archives for static linkage, requires all eight native
+archives before publishing, writes `SHA256SUMS`, and runs
+`scripts/verify-release-archives.py` against the assembled archives and checksum
+manifest.
 The checksum job also runs `scripts/prepare-agent-sidecars.sh` against the
 assembled release archives with `RUSTLE_AGENT_REQUIRE_ALL=1`, proving the release
 can produce the full `RUSTLE_AGENT_DIR` sidecar store used by automatic
 remote-agent bootstrap.
 `scripts/verify-release-matrix.py` keeps this target list, the release workflow
-matrix, archive naming, checksum count, CI operating-system matrix, and required
-smoke coverage in sync.
+matrix, archive naming, checksum/archive manifest gate, CI operating-system matrix,
+and required smoke coverage in sync.
 
 The same extracted package shape is used by automatic remote-agent bootstrap.
 For example, a macOS operator can place `rustle-x86_64-unknown-linux-musl/rustle`
@@ -112,8 +121,8 @@ self-extracting single binaries. Development and CI builds can still use the
 external DLL lookup order above.
 
 Windows release archive verification rejects sidecar `wintun.dll` files. The
-zip may contain `rustle.exe`, `README.md`, `ARCHITECTURE.md`, and `RELEASE.md`;
-the Wintun bytes must be embedded into `rustle.exe`.
+zip may contain `rustle.exe`, `README.md`, `ARCHITECTURE.md`, `RELEASE.md`, and
+`TROUBLESHOOTING.md`; the Wintun bytes must be embedded into `rustle.exe`.
 
 ## Verification Tiers
 
@@ -123,19 +132,35 @@ Use the aggregate local verifier as the preflight on every development host:
 scripts/verify-local.sh
 ```
 
-For release-candidate evidence, run it on privileged Linux with
-`RUSTLE_VERIFY_REQUIRE_PRIVILEGED=1`, and run it with `RUSTLE_VERIFY_LIVE=1`
-after setting the documented live smoke and benchmark environment variables.
-The live verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
+For release-candidate evidence on a privileged macOS or Linux host, set the
+documented live remote variables and run:
+
+```sh
+scripts/verify-release-candidate.sh
+```
+
+That wrapper runs `scripts/verify-local.sh` with
+`RUSTLE_VERIFY_REQUIRE_PRIVILEGED=1`, `RUSTLE_VERIFY_PRIVILEGED=1`,
+`RUSTLE_VERIFY_DNS_TAKEOVER=1`, `RUSTLE_VERIFY_LIVE=1`,
+`RUSTLE_VERIFY_LIVE_FIXTURE=1`, and `RUSTLE_VERIFY_LIVE_UDP=1`, so privileged
+TUN, DNS takeover, live TCP, controlled live fixture, and live UDP skips fail
+the release-candidate run. Linux network namespace gates remain required on Linux
+but are treated as platform-inapplicable on macOS after the macOS privileged
+TUN and DNS takeover gates pass. It also requires `sshuttle`, forces
+`RUSTLE_BENCH_TOOLS="rustle sshuttle"`, and sets
+`RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO=1.00`, proving the primary
+`rustle-agent` live benchmark matches or beats sshuttle average p50 latency on
+the same SSH server, target URL, request count, and concurrency. The live
+verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
-intentionally narrowing that matrix for diagnostics. Set
-`RUSTLE_VERIFY_LIVE_FIXTURE=1` on release performance runs to prove the
-controlled 1 MiB / 10 MiB / 100 MiB live fixture path as well; the fixture
-wrapper captures each nested benchmark TSV and rejects missing, failed, or
-wrong-byte rows for every configured body size. Set
-`RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged release runs to include the system
-resolver takeover smoke. Skips are useful diagnostics, but they are not release
-evidence for the skipped platform or path.
+intentionally narrowing that matrix for diagnostics. Skips are useful
+diagnostics, but they are not release evidence for the skipped platform or path.
+The live benchmark harness can also emit `rustle-quic-agent` and
+`rustle-quic-native` rows. Set `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` or
+`RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` to require live native QUIC to
+meet the configured throughput or p50 ratio against the primary `rustle-agent`
+row; the release-candidate wrapper automatically adds `quic-native` to the live
+benchmark transport matrix when either native/agent ratio gate is requested.
 
 Required before tagging a release:
 
@@ -144,6 +169,14 @@ Required before tagging a release:
   CI still covers the required OS matrix and smoke gates.
 - CI passes on Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64,
   and Windows arm64.
+- Ubuntu CI runs the deterministic release-mode rootless benchmark gates:
+  `scripts/verify-live-benchmark-rows.py --self-test`, the tiny-response
+  `bench-bridge-lab.sh` p50 gate, the 100 MiB `agent` throughput gate, the
+  100 MiB `quic-agent` throughput gate, and DNS p50 gates for both `agent` and
+  `quic-agent`, plus the native `quic-native` DNS p50 gate when the local
+  verifier runs. This makes PR CI cover the same rootless latency, throughput,
+  DNS, and optional QUIC data-plane regressions that `scripts/verify-local.sh`
+  enforces locally.
 - SSH host-key UX checks pass:
   `host_key_verifier_accept_new_records_missing_host_key`,
   `host_key_verifier_accept_new_rejects_changed_known_host`, and
@@ -152,10 +185,13 @@ Required before tagging a release:
   failures for changed keys and staying mutually exclusive with
   `--insecure-accept-host-key`.
 - SSH password handling checks pass:
-  `ssh_password_file_option_reads_password_without_argv_secret` and
+  `ssh_password_file_option_reads_password_without_argv_secret`,
+  `ssh_password_file_authenticates_against_russh_server`, and
   `compact_cli_rejects_conflicting_password_sources` must prove automation can
   use `--password-file` without putting secrets in argv and that it cannot be
-  combined with inline or prompt-based `--password`.
+  combined with inline or prompt-based `--password`. The russh-server test
+  proves the password read from the file is sent through the real encrypted SSH
+  password-auth path instead of only being parsed.
 - Remote agent command handling checks pass:
   `effective_agent_command_quotes_literal_agent_path`,
   `compact_cli_accepts_hidden_agent_path_switch`, and
@@ -200,6 +236,10 @@ Required before tagging a release:
   extracted `rustle.exe`, proving the packaged binary can materialize embedded
   Wintun, create a TUN, add/delete a /32 route, capture one packet, and restore
   the route table before the archive is uploaded.
+- `windows_full_tunnel_routes_use_split_default_commands` passes, proving
+  Windows full-tunnel targets expand to `0.0.0.0/1` and `128.0.0.0/1` and use
+  matching `route.exe` add/delete commands with the TUN gateway and interface
+  index.
 - Embedded Wintun extraction remains content-addressed by target architecture
   and DLL SHA-256, and identical already-materialized DLLs are reused without a
   rewrite.
@@ -207,13 +247,28 @@ Required before tagging a release:
   still checks administrator mode, /32 target validation, route add/delete logs,
   packet capture, fallback route cleanup, and final route-table restoration.
 - `scripts/smoke-bridge-lab.sh` passes on at least one Unix host with `sshd`.
+- `scripts/smoke-ssh-config-alias-lab.sh` passes on at least one Unix host with
+  `sshd`, proving OpenSSH `Host` aliases can supply `HostName`, `Port`, `User`,
+  `IdentityFile`, and `UserKnownHostsFile` for `rustle -r contabo`-style usage.
 - `scripts/smoke-agent-lab.sh` passes on at least one Unix host with `sshd`.
 - `scripts/smoke-agent-bridge-lab.sh` passes on at least one Unix host with
   `sshd`, proving the requested multi-lane framed agent bridge can move
   multiple synthetic TCP flows.
+- `scripts/smoke-quic-agent-lab.sh` passes on at least one Unix host with
+  `sshd`, proving the experimental QUIC carrier authenticates helper bootstrap
+  through SSH, pins the helper certificate, opens a UDP/QUIC data plane, and
+  moves synthetic TCP flows over the existing Rustle agent protocol. This is
+  release evidence for the authenticated QUIC carrier, not proof that the
+  optional data plane is faster than SSH-agent; that claim needs the native
+  per-flow QUIC stream protocol and same-host ratio gates.
 - `scripts/smoke-agent-reconnect-lab.sh` passes on at least one Unix host with
   `sshd`, proving a dead SSH exec agent can be replaced without adding user
   flags.
+- `scripts/bench-agent-reconnect-lab.sh` passes on at least one Unix host with
+  `sshd`, proving reconnect behavior is bounded as a benchmark gate: the first
+  exec agent completes `Hello` and exits, Rustle logs an agent reconnect, later
+  flows complete through the replacement agent, and the summary reports bounded
+  `elapsed_ms` and `p50_us`.
 - `scripts/smoke-agent-active-failure-lab.sh` passes on at least one Unix host
   with `sshd`, proving an agent that dies after accepting an active TCP stream
   resets that flow, reconnects the exec transport, and completes later flows
@@ -252,13 +307,24 @@ Required before tagging a release:
   Fallback opens repair failed alternate lanes instead of stranding usable
   capacity in the agent pool.
 - Source inspection through `scripts/verify-release-matrix.py` proves agent
-  lanes are opened by `connect_agent_bridge_transport_fresh_ssh_command`, which
-  creates a fresh SSH connection for each exec lane instead of multiplexing all
-  lanes over one SSH carrier.
+  lanes are opened by
+  `connect_agent_bridge_transport_fresh_prepared_ssh_command`, which reuses
+  prepared credentials while creating a fresh SSH connection for each exec lane
+  instead of multiplexing all lanes over one SSH carrier.
 - `agent_writer_clears_reused_buffers_between_bursts` and
   `transport_writer_clears_reused_buffers_between_bursts` pass, proving the
   remote runtime and local controller writers can reuse burst buffers across
   flushes without leaking stale frames.
+- `credit_window_grows_after_sustained_full_window_consumption`,
+  `stream_recv_grows_receive_window_after_sustained_consumption`, and
+  `runtime_receive_credit_grows_after_sustained_window_consumption` pass,
+  proving agent receive windows start at the latency-friendly 1 MiB window and
+  adapt to a bounded 2 MiB cap on sustained streams on both sides of the agent
+  protocol.
+- `remote_backlog_per_flow_has_agent_window_frame_headroom` passes, proving the
+  per-flow remote backlog is sized from the local TCP send window with multiple
+  windows of burst headroom, while the global backlog cap still bounds aggregate
+  memory across flows.
 - `packet_queue_device_drain_tx_into_reuses_output_vector` passes, proving the
   smoltcp packet adapter can drain TX packets into caller-owned scratch storage
   while still recycling packet buffers back into the bounded pool.
@@ -284,17 +350,62 @@ Required before tagging a release:
   stale remote payload chunks are counted without creating a stderr log storm.
 - `scripts/stress-bridge-lab.sh` passes with its default both-transport
   256 x 1 MiB matrix, proving the framed agent path and direct-tcpip fallback
-  survive the high-fanout TCP lifecycle workload.
+  survive the high-fanout TCP lifecycle workload. The underlying bridge
+  benchmark now fails if completed runs leave `active_flows`, `active_bridges`,
+  `backlog_flows`, or `backlog_bytes` nonzero, so this stress gate also proves
+  the synthetic TCP lifecycle drains flow, bridge, and backlog state instead of
+  only proving response delivery. `bridge_lab_cleanup_aborts_incomplete_client_socket`
+  must pass so chaos runs that stop after `--min-completed` also tear down
+  incomplete synthetic clients before the summary is accepted. The same
+  benchmark also waits for the lab `sshd` process tree to have no descendants
+  after each run and checks the `sshd` process-tree fd count when the platform
+  exposes descriptor data. Any leaked SSH session, remote-agent, or descriptor state fails the stress gate.
 - Performance benchmark rows used for release claims are produced by release
   binaries. The benchmark scripts resolve `target/release/rustle` by default;
   `RUSTLE_BENCH_PROFILE=debug` is only for harness diagnosis and must not be
   used as throughput evidence.
+- `scripts/bench-live-compare.sh` includes
+  `RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO`, proving live sshuttle
+  replacement latency can be gated directly from successful `rustle-agent` and
+  `sshuttle` rows on the same target instead of relying only on absolute
+  environment-specific p50 thresholds. It also includes
+  `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` and
+  `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO`, so the optional live
+  native-QUIC data-plane claim can be gated directly against the primary
+  SSH-agent data path when the remote UDP path supports QUIC.
+  `scripts/verify-live-benchmark-rows.py --self-test` must pass so the
+  sshuttle throughput ratio, sshuttle p50 ratio, native QUIC throughput ratio,
+  native QUIC p50 ratio, and live row threshold gates are checked locally before
+  a live target is available.
 - `scripts/verify-local.sh` includes release-mode 1-flow bridge benchmarks:
-  a tiny-response gate with `RUSTLE_BENCH_MAX_ELAPSED_MS=2000` and a 1 MiB gate
-  with `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`. Together they prove the
-  low-concurrency path is not accidentally measured with a debug binary,
-  regressed into multi-second startup latency, or regressed into serial frame
-  stalls.
+  a tiny-response gate with `RUSTLE_BENCH_MAX_ELAPSED_MS=2000` and
+  `RUSTLE_BENCH_MAX_P50_US=500000`, plus
+  `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` so native QUIC latency is
+  compared to the primary `agent` path on the same fixture. It also runs a 1 MiB gate with
+  `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, and a hard
+  100 MiB single-flow `agent` throughput gate. The 100 MiB local gate includes
+  `quic-native` with `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` so the native
+  data plane must meet or beat the primary agent path on the same-host fixture. The same 100 MiB throughput gate
+  also runs with `RUSTLE_BENCH_BRIDGE_TRANSPORTS="quic-agent"`, proving the
+  optional SSH-bootstrap/UDP-QUIC data plane can sustain a large response with
+  release-mode code. The large-response gates use
+  `RUSTLE_BENCH_BODY_BYTES=104857600`. Together they prove the low-concurrency path
+  is not accidentally measured with a debug binary, regressed into
+  multi-second startup latency, lost bounded tiny-response `p50_us`, regressed
+  into serial frame stalls, or unable to sustain a large response over the
+  primary framed agent transport or experimental QUIC carrier.
+- `scripts/verify-local.sh` also includes a rootless DNS latency gate through
+  `scripts/bench-agent-dns-lab.sh` with
+  `RUSTLE_BENCH_AGENT_DNS_MAX_P50_US`, proving sequential DNS queries through
+  the primary `agent` transport and the `quic-agent` transport produce bounded `p50_us` latency
+  against the local DNS fixture without relying on TUN
+  privileges or OS resolver takeover.
+- `scripts/verify-local.sh` includes a release-mode reconnect behavior gate
+  through `scripts/bench-agent-reconnect-lab.sh` with
+  `RUSTLE_BENCH_AGENT_RECONNECT_MAX_ELAPSED_MS` and
+  `RUSTLE_BENCH_AGENT_RECONNECT_MAX_P50_US`, proving reconnect behavior is not
+  allowed to silently regress into a hang, unbounded retry, or leaked bridge
+  lifecycle state.
 - `udp_admission_moves_parsed_payload_bytes_into_association_queue` passes,
   proving generic UDP request admission moves the parsed `Bytes` payload into
   the per-association agent queue without copying it into another owned buffer.
@@ -322,6 +433,10 @@ Required before tagging a release:
   framed agent path. Linux CI attempts this smoke when `/dev/net/tun` is
   available; a CI skip due to runner TUN limitations is not release evidence by
   itself.
+- `RUSTLE_SMOKE_TARGET_CIDR=0.0.0.0/0 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent
+  RUSTLE_SMOKE_ROUTE_ONLY=1 scripts/smoke-tun-dns.sh` passes on a privileged
+  macOS or Linux host, proving the local TUN smoke also covers full-tunnel split route setup
+  (`0.0.0.0/1` and `128.0.0.0/1`) and route-table restoration after shutdown.
 - `RUSTLE_SMOKE_CONFIGURE_DNS=1 RUSTLE_SMOKE_BRIDGE_TRANSPORT=agent
   scripts/smoke-tun-dns.sh` passes on at least one privileged macOS or Linux
   host, proving resolver takeover points the OS at the Rustle virtual DNS
@@ -369,10 +484,14 @@ Required before tagging a release:
   movement, transport-specific open logs for requested direct or agent mode, and
   zero SSH open failures, agent reconnect failures, bridge send failures, and
   remote backlog overflows in the final stats.
-- Route, DNS, and process cleanup checks show no Rustle-owned leftovers.
-  `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` must also
-  pass so the generated upload wrapper is proven to keep one staged helper alive
-  across concurrent initial agent lanes and remove it after the last lane exits.
+- Route, DNS, and process cleanup checks show no Rustle-owned leftovers. On
+  Unix, the tunnel and capture loops must treat Ctrl-C, SIGTERM, and SIGHUP as
+  graceful shutdown signals so normal route, DNS, TUN, local DNS proxy, and
+  uploaded-agent cleanup guards can run; `unix_shutdown_signals_include_hangup_and_terminate`
+  must pass. `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits`
+  must also pass so the generated upload wrapper is proven to keep one staged
+  helper alive across concurrent initial agent lanes and remove it after the last
+  lane exits.
 - Uploaded-agent temp staging checks are covered before release:
   `remote_agent_upload_commands_stage_in_private_temp_dirs` and
   `posix_remote_agent_upload_command_creates_private_executable_file` must pass

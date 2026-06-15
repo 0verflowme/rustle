@@ -119,6 +119,29 @@ Rustle keeps three transport choices, but only one is the normal path:
   Fallback alternate-lane traversal scans the fixed lane array by `(load, index)`
   and tracks tried lanes in a small bitset instead of allocating and sorting a
   temporary lane snapshot while the pool is already degraded.
+- Experimental QUIC agent carrier: a hidden `quic-agent` helper and
+  `--bridge-transport quic-agent` path carry the same framed Rustle agent
+  protocol over a QUIC bidirectional stream. SSH is used only to authenticate
+  and start the remote helper. The helper emits a one-line bootstrap record
+  containing its UDP port, self-signed certificate DER, and certificate
+  SHA-256; the local client verifies the hash and pins that certificate before
+  establishing the QUIC connection. This is the first v2 data-plane slice, not
+  yet the public default: it preserves existing agent flow-control, DNS, UDP,
+  and reconnect semantics while moving the byte carrier from SSH to QUIC. The
+  QUIC transport profile is explicit: the helper accepts one client-opened
+  bidirectional carrier stream, disables unidirectional streams, uses a 16 MiB
+  stream receive window, and caps connection receive/send windows at 64 MiB so
+  Quinn's default 100 Mbps / 100 ms stream window does not undercut Rustle's own
+  adaptive agent credit. This carrier is correctness and bootstrap groundwork.
+- Experimental native QUIC bridge: a hidden `quic-bridge-agent` helper and
+  `--bridge-transport quic-native` path reuse the same SSH-authenticated
+  certificate-pinned bootstrap, then map each TCP flow or UDP association to
+  its own QUIC bidirectional stream with a compact open header. TCP uses raw
+  stream bytes, hostname TCP opens carry a bounded hostname payload, and UDP
+  preserves datagram boundaries with a compact length prefix. IPv4 DNS remotes,
+  hostname DNS remotes, and generic IPv4 UDP can now use this native QUIC data
+  plane. Same-host bridge and DNS benchmarks must compare `quic-native` against
+  `agent` before making a faster-than-SSH-agent claim.
 - `direct-tcpip` compatibility mode: an explicit hidden transport requiring only
   a normal remote SSH server with TCP forwarding enabled. This path is the
   closest to sshuttle's zero-install behavior, but it is intentionally not the
@@ -147,15 +170,19 @@ maps to one stream id, remote payload is admitted only into bounded local
 buffers, and backpressure is represented by explicit byte credit instead of
 hidden SSH channel behavior alone. `Opened` frames grant initial send credit,
 `Window` frames replenish credit as bytes are consumed or written downstream, and
-senders wait before emitting `Data` frames when credit is exhausted. The local
-agent transport segments oversized caller buffers into bounded `Data` frames no
-larger than the negotiated/local protocol maximum. Writer tasks flush bounded
-batches; within a batch, only zero-stream heartbeat `Ping`/`Pong` frames may move
-ahead of data, and protocol `Hello` remains first. Stream open/data/EOF/close
-ordering is not reordered. Each writer task reuses one burst frame buffer and
-one encoded-byte buffer across bursts, so sustained traffic does not allocate a
-fresh burst vector and encoded buffer for every flush. Agent transport failure
-is sticky: once the underlying
+senders wait before emitting `Data` frames when credit is exhausted. Each
+direction starts with a 1 MiB receive window, then sustained streams grow that
+window to a bounded 2 MiB cap after the receiver consumes a full current window.
+That keeps tiny flows at the low-latency initial window while giving large
+responses more in-flight credit without unbounded SSH-channel buffering. The
+local agent transport segments oversized caller buffers into bounded `Data`
+frames no larger than the negotiated/local protocol maximum. Writer tasks flush
+bounded batches; within a batch, only zero-stream heartbeat `Ping`/`Pong` frames
+may move ahead of data, and protocol `Hello` remains first. Stream
+open/data/EOF/close ordering is not reordered. Each writer task reuses one burst
+frame buffer and one encoded-byte buffer across bursts, so sustained traffic
+does not allocate a fresh burst vector and encoded buffer for every flush. Agent
+transport failure is sticky: once the underlying
 SSH exec channel reports EOF or a frame write failure, current streams are reset
 and later stream opens fail immediately instead of occupying bridge admission
 slots until timeout. Active stream wrappers also observe carrier-level reset or
@@ -200,6 +227,11 @@ all configured agent lanes instead of pinning every flow to one SSH exec channel
 sends are gated by explicit credit, and
 `agent_transport::tests::transport_flow_control_moves_large_responses_across_streams`
 proves multiple streams can move responses larger than the initial window.
+`agent_window::tests::credit_window_grows_after_sustained_full_window_consumption`,
+`agent_transport::tests::stream_recv_grows_receive_window_after_sustained_consumption`,
+and `agent_runtime::tests::runtime_receive_credit_grows_after_sustained_window_consumption`
+prove the adaptive window growth logic is shared by the controller and remote
+agent runtime.
 `agent_transport::tests::transport_opens_udp_stream_and_relays_datagram` proves
 the high-level transport API can run the UDP association through the real agent
 runtime. `agent_transport::tests::transport_rejects_new_streams_after_agent_disconnect`
@@ -592,6 +624,11 @@ Before a release build is considered shippable:
   bridge behavior without TUN privileges. `scripts/smoke-agent-lab.sh`,
   `scripts/smoke-agent-udp-lab.sh`, and `scripts/smoke-agent-bridge-lab.sh` run
   in Unix CI when `sshd` is available.
+- A rootless DNS latency gate must pass through
+  `scripts/bench-agent-dns-lab.sh` with `RUSTLE_BENCH_AGENT_DNS_MAX_P50_US`,
+  proving DNS queries over the primary framed agent transport and optional QUIC
+  data planes have bounded `p50_us` latency before any privileged resolver
+  takeover evidence is counted.
 - A privileged TUN DNS smoke must prove UDP/53 interception through the virtual
   DNS IP. `scripts/smoke-tun-dns.sh` runs on Linux CI when `/dev/net/tun` is
   available and remains the local privileged proof for macOS and Linux.

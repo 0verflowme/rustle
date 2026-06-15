@@ -27,7 +27,37 @@ are still required before treating Rustle as production-ready pivoting software.
 
 IPv6 is not part of the current MVP.
 
-## Build
+## Install
+
+Download the archive matching your platform from a Rustle release, extract it,
+and put the binary on your `PATH`.
+
+Unix and macOS:
+
+```sh
+tar -xzf rustle-<target>.tar.gz
+sudo install -m 0755 rustle-<target>/rustle /usr/local/bin/rustle
+rustle --help
+```
+
+Windows PowerShell:
+
+```powershell
+Expand-Archive .\rustle-<target>.zip
+New-Item -ItemType Directory -Force -Path "$env:USERPROFILE\bin"
+Copy-Item .\rustle-<target>\rustle.exe $env:USERPROFILE\bin\rustle.exe
+rustle.exe --help
+```
+
+Windows requires an architecture-matching Wintun driver. Release Windows
+binaries are intended to embed Wintun; development builds can also load it from
+`RUSTLE_WINTUN_DLL`, the binary directory, or the current directory.
+
+The remote host must accept SSH and either have `rustle` available on `PATH` or
+be compatible with Rustle's automatic sidecar upload. See
+[`docs/release.md`](docs/release.md) for sidecar preparation.
+
+## Build From Source
 
 ```sh
 cargo build --release
@@ -74,6 +104,19 @@ Full-tunnel shorthand is accepted:
 sudo rustle -r alice@example.com 0/0
 ```
 
+Use an OpenSSH config alias:
+
+```sshconfig
+Host contabo
+  HostName 203.0.113.10
+  User alice
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+```sh
+sudo rustle -r contabo 10.0.0.0/8
+```
+
 Rustle verifies SSH host keys by default through OpenSSH `known_hosts`. To
 record a new trusted host on first connection while still rejecting later key
 changes, use `--accept-new-host-key`. For temporary development labs only, use
@@ -83,6 +126,9 @@ For password authentication, prefer `--password` with no value for an
 interactive prompt, or `--password-file /path/to/private-file` for automation.
 Avoid inline `--password=...` values because local process listings and shell
 history can expose them.
+
+For operational diagnosis, see
+[`docs/troubleshooting.md`](docs/troubleshooting.md).
 
 ## Development
 
@@ -101,12 +147,53 @@ Run the local smoke suite:
 scripts/verify-local.sh
 ```
 
+Run the full macOS/Linux release-candidate verifier on a privileged host with a
+real SSH target and `sshuttle` installed:
+
+```sh
+RUSTLE_LIVE_REMOTE=alice@ssh.example.com \
+RUSTLE_LIVE_TARGET_CIDR=0.0.0.0/0 \
+RUSTLE_LIVE_URL=https://192.168.190.45/ \
+RUSTLE_FIXTURE_HOST=192.168.190.45 \
+RUSTLE_LIVE_UDP_HOST=192.168.190.45 \
+scripts/verify-release-candidate.sh
+```
+
+This fails on privileged/live skips, includes DNS takeover and live UDP, runs
+the controlled 1 MiB / 10 MiB / 100 MiB fixture benchmarks, and compares `rustle-agent` p50 latency against sshuttle.
+
+Run the rootless DNS latency benchmark:
+
+```sh
+scripts/bench-agent-dns-lab.sh
+```
+
+Run the rootless agent reconnect benchmark:
+
+```sh
+scripts/bench-agent-reconnect-lab.sh
+```
+
+Run the rootless SSH config alias smoke, which proves a `Host contabo`-style
+alias can supply the SSH host, port, user, identity, and known-hosts file:
+
+```sh
+scripts/smoke-ssh-config-alias-lab.sh
+```
+
 Run the high-fanout bridge stress gate. By default this exercises 256
 concurrent 1 MiB responses over the primary agent transport and the
 `direct-tcpip` compatibility path:
 
 ```sh
 scripts/stress-bridge-lab.sh
+```
+
+Run the experimental QUIC data-plane smoke, which authenticates through SSH and
+then carries the Rustle agent protocol over UDP/QUIC:
+
+```sh
+scripts/smoke-quic-agent-lab.sh
 ```
 
 Run live tunnel benchmarks, including optional sshuttle comparison:
@@ -116,6 +203,19 @@ RUSTLE_BENCH_REMOTE=alice@ssh.example.com \
 RUSTLE_BENCH_TARGET_CIDR=192.168.0.0/16 \
 RUSTLE_BENCH_URL=https://192.168.190.45/ \
 RUSTLE_BENCH_TOOLS="rustle sshuttle" \
+scripts/bench-live-compare.sh
+```
+
+Add native-QUIC rows and make them a hard same-target comparison against the
+primary agent path when the remote UDP path is reachable:
+
+```sh
+RUSTLE_BENCH_REMOTE=alice@ssh.example.com \
+RUSTLE_BENCH_TARGET_CIDR=192.168.0.0/16 \
+RUSTLE_BENCH_URL=https://192.168.190.45/ \
+RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent quic-native" \
+RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO=1.00 \
+RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO=1.00 \
 scripts/bench-live-compare.sh
 ```
 
@@ -133,6 +233,8 @@ scripts/bench-live-fixture.sh
 - [`docs/architecture.md`](docs/architecture.md): architecture and protocol notes
 - [`docs/performance.md`](docs/performance.md): benchmarking methodology
 - [`docs/release.md`](docs/release.md): release and platform packaging
+- [`docs/troubleshooting.md`](docs/troubleshooting.md): install, runtime, DNS,
+  and performance troubleshooting
 
 ## License
 

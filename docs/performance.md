@@ -36,7 +36,7 @@ framed `agent` bridge first and the compatibility `direct-tcpip` bridge second
 unless narrowed with `RUSTLE_BENCH_BRIDGE_TRANSPORTS`. Output is tab-separated:
 
 ```text
-transport  body_bytes  connections  run  elapsed_ms  response_bytes  throughput_mib_s
+transport  body_bytes  connections  run  elapsed_ms  response_bytes  throughput_mib_s  p50_us  p95_us  max_us
 ```
 
 Tune the matrix with environment variables:
@@ -44,12 +44,30 @@ Tune the matrix with environment variables:
 ```sh
 RUSTLE_BENCH_BODY_BYTES="65536 1048576" \
 RUSTLE_BENCH_CONNECTIONS="1 8 32 64" \
-RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip auto" \
+RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip auto quic-agent quic-native" \
 RUSTLE_BENCH_AGENT_SESSIONS=2 \
 RUSTLE_BENCH_RUNS=5 \
 RUSTLE_BENCH_WARMUP_RUNS=1 \
 scripts/bench-bridge-lab.sh
 ```
+
+Set `RUSTLE_BENCH_QUIC_AGENT_COMMAND` when the remote QUIC helper is not the
+same binary path as the benchmarked local `rustle`. The `quic-agent` transport
+still uses SSH for helper authentication and bootstrap, then carries the framed
+agent protocol over UDP/QUIC. Its release gate proves that this authenticated
+carrier can sustain large responses; it is not yet the final v2 speed claim.
+Local 100 MiB lab rows should be compared against `agent` on the same machine
+before making any "faster than SSH-agent" assertion. The remaining high-speed
+data-plane work is to replace the single framed carrier stream with native
+per-flow QUIC streams.
+
+Set `RUSTLE_BENCH_QUIC_NATIVE_COMMAND` to override the hidden native helper
+command. The `quic-native` transport runs `rustle quic-bridge-agent` by default,
+uses SSH only for authenticated bootstrap, and maps each TCP flow or UDP
+association to its own QUIC stream. This is the current v2 native data-plane
+slice for TCP, hostname TCP opens, IPv4 DNS over UDP, hostname DNS over TCP, and
+generic IPv4 UDP; it still needs faster same-host rows before it should be
+promoted over the primary `agent` transport.
 
 For local regression preflights, the benchmark can also enforce a conservative
 agent/direct sanity ratio for matching body-size and connection-count rows:
@@ -60,12 +78,30 @@ RUSTLE_BENCH_RATIO_MIN_CONNECTIONS=32 \
 scripts/bench-bridge-lab.sh
 ```
 
-Use `RUSTLE_BENCH_MAX_ELAPSED_MS` for a low-concurrency elapsed-time ceiling
-and `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a release-mode throughput floor.
+Use `RUSTLE_BENCH_MAX_ELAPSED_MS` for a low-concurrency elapsed-time ceiling,
+`RUSTLE_BENCH_MAX_P50_US` for a tiny-response p50 request-latency ceiling, and
+`RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a release-mode throughput floor. Set
+`RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` to require native QUIC throughput to
+stay above a fraction of the primary `agent` path on the same body/connection
+matrix, and `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` to bound native QUIC
+tiny-response p50 against `agent`.
 `scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
-plus a 1 MiB / 1-flow gate so a debug binary, multi-second startup
-regression, or serious serial data-path regression cannot masquerade as
-performance evidence.
+with both elapsed and `p50_us` ceilings, compares `quic-native` p50 against
+`agent`, runs a 1 MiB / 1-flow gate, and runs a 100 MiB single-flow throughput gate
+through both the primary `agent` transport and `quic-native`
+(`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
+proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
+release-mode code. Together these guard against a debug binary, multi-second
+startup regression, serious serial data-path regression, or large-response
+throughput collapse masquerading as performance evidence. They do not prove the
+optional QUIC carrier is faster than the primary SSH-agent carrier on real
+remote networks; the local same-host gate now requires native QUIC 100 MiB
+throughput to meet or beat `agent` and tiny-response p50 to stay within 10% of
+`agent`. The v2 faster-data-plane claim still requires the same ratios on live
+remote matrices, with the p50 ratio tightened to `1.00` before release.
+Ubuntu CI also runs the deterministic release-mode subset: tiny-response p50,
+100 MiB `agent`, 100 MiB `quic-agent`, and DNS p50 for `agent`, `quic-agent`,
+and `quic-native`.
 
 Those checks are intentionally coarse guardrails, not release claims. They
 catch obvious agent-path and single-flow regressions while leaving detailed
@@ -79,8 +115,9 @@ This benchmark is useful for bridge regressions because it exercises:
 - SSH channel admission and `direct-tcpip`
 - local-to-remote and remote-to-local bridge queues
 - bounded remote backlog flushing
-- auto, direct-tcpip, and framed agent scheduling under the same response sizes
-  and connection counts
+- auto, direct-tcpip, framed agent, experimental quic-agent scheduling, and
+  native quic-native scheduling under the same response sizes and connection
+  counts
 - one-lane versus multi-lane framed agent behavior with
   `RUSTLE_BENCH_AGENT_SESSIONS`
 
@@ -92,6 +129,47 @@ warms remaining lanes in background to reduce first-request latency.
 
 It does not exercise host route injection, TUN driver behavior, DNS takeover, or
 generic UDP datagram behavior.
+
+## Rootless Agent Reconnect Benchmark
+
+Build first:
+
+```sh
+cargo build --release
+```
+
+Run the default reconnect behavior gate:
+
+```sh
+scripts/bench-agent-reconnect-lab.sh
+```
+
+The script starts a temporary local `sshd`, starts a local HTTP server, then
+uses a deterministic flaky remote agent command: the first exec agent completes
+the Rustle agent `Hello` handshake and exits, while the next exec starts the
+real agent. This forces the framed-agent bridge to detect the failed transport,
+reconnect through SSH, and complete later synthetic TCP flows. Output is
+tab-separated:
+
+```text
+connections  min_completed  run  completed  elapsed_ms  response_bytes  p50_us  p95_us  max_us
+```
+
+Tune the reconnect gate with environment variables:
+
+```sh
+RUSTLE_BENCH_AGENT_RECONNECT_CONNECTIONS=4 \
+RUSTLE_BENCH_AGENT_RECONNECT_MIN_COMPLETED=2 \
+RUSTLE_BENCH_AGENT_RECONNECT_MAX_ELAPSED_MS=6000 \
+RUSTLE_BENCH_AGENT_RECONNECT_MAX_P50_US=2000000 \
+RUSTLE_BENCH_RUNS=3 \
+RUSTLE_BENCH_WARMUP_RUNS=1 \
+scripts/bench-agent-reconnect-lab.sh
+```
+
+`scripts/verify-local.sh` runs this as a release-mode reconnect behavior gate.
+The gate also fails if the run does not log an agent reconnect or if the bridge
+summary leaves active flow, bridge, or backlog state behind.
 
 ## Rootless Agent UDP Benchmark
 
@@ -138,6 +216,56 @@ It does not exercise the full TUN UDP path. Use
 network-namespace proof, and use `scripts/smoke-live-udp.sh` against a real SSH
 host for live generic UDP-over-TUN proof.
 
+## Rootless Agent DNS Latency Benchmark
+
+Build first:
+
+```sh
+cargo build --release
+```
+
+Run the default DNS latency gate:
+
+```sh
+scripts/bench-agent-dns-lab.sh
+```
+
+The script starts a temporary local `sshd`, starts the Rustle DNS fixture with
+both UDP and TCP listeners, then runs `rustle agent-dns-lab` through the selected
+bridge transport. Output is tab-separated:
+
+```text
+transport  queries  run  elapsed_ms  response_bytes  p50_us  p95_us  max_us
+```
+
+Tune the matrix and hard p50 ceiling with environment variables:
+
+```sh
+RUSTLE_BENCH_AGENT_DNS_QUERIES="32 128" \
+RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="agent direct-tcpip quic-agent quic-native" \
+RUSTLE_BENCH_AGENT_DNS_REMOTE_HOST=127.0.0.1 \
+RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
+RUSTLE_BENCH_RUNS=5 \
+RUSTLE_BENCH_WARMUP_RUNS=1 \
+scripts/bench-agent-dns-lab.sh
+```
+
+`scripts/verify-local.sh` runs this as a release-mode DNS latency gate with
+`RUSTLE_BENCH_AGENT_DNS_MAX_P50_US` for the primary `agent` transport, the
+experimental `quic-agent` carrier, and the native `quic-native` UDP data plane.
+The default transport is the primary
+`agent` transport, so standalone runs measure IPv4 DNS over the framed agent UDP
+path without relying on host routes, TUN driver behavior, or OS resolver
+takeover. Use `RUSTLE_BENCH_AGENT_DNS_TRANSPORTS` when comparing compatibility
+`direct-tcpip` DNS or additional experimental transport rows. `quic-native`
+uses native QUIC UDP for IPv4 resolver addresses and native QUIC TCP for
+hostname resolver targets; set `RUSTLE_BENCH_AGENT_DNS_REMOTE_HOST=localhost`
+to force the benchmark through the hostname-open path.
+
+This benchmark is not a DNS leak or cleanup proof. Use `scripts/smoke-tun-dns.sh`
+with `RUSTLE_SMOKE_CONFIGURE_DNS=1` for DNS resolver takeover, normal system
+resolver delivery through Rustle, and exact resolver restoration.
+
 ## Full Tunnel Benchmark
 
 Use the live smoke as the correctness gate first:
@@ -174,14 +302,21 @@ tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  byte
 
 By default the live harness benchmarks Rustle with the primary `agent` transport
 first, then the `direct-tcpip` compatibility path, producing `rustle-agent` and
-`rustle-direct-tcpip` rows. To pin the transport matrix explicitly, use:
+`rustle-direct-tcpip` rows. It can also collect experimental `rustle-quic-agent`
+and `rustle-quic-native` rows when the remote network allows the SSH-bootstrapped
+UDP/QUIC data plane. To pin the transport matrix explicitly, use:
 
 ```sh
-RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent direct-tcpip" \
-RUSTLE_BENCH_AGENT_COMMAND="/opt/rustle/rustle agent" \
+RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent direct-tcpip quic-native" \
+RUSTLE_BENCH_AGENT_PATH="/opt/rustle/rustle" \
 RUSTLE_BENCH_AGENT_SESSIONS=2 \
 scripts/bench-live-compare.sh
 ```
+
+`RUSTLE_BENCH_AGENT_PATH` appends the helper subcommand needed by the selected
+transport (`agent`, `quic-agent`, or `quic-bridge-agent`). Use
+`RUSTLE_BENCH_AGENT_COMMAND` only when you need to provide the complete remote
+helper command yourself.
 
 By default the harness benchmarks Rustle only. Add sshuttle with:
 
@@ -202,6 +337,37 @@ scripts/bench-live-compare.sh
 This fails the benchmark if `rustle-agent` does not meet the configured
 fraction of sshuttle throughput on the same SSH server, target URL, request
 count, and concurrency.
+
+To make the tiny-response latency replacement goal a hard gate, set a maximum
+average p50 latency ratio for `rustle-agent` over successful sshuttle rows:
+
+```sh
+RUSTLE_BENCH_TOOLS="rustle sshuttle" \
+RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent" \
+RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO=1.00 \
+scripts/bench-live-compare.sh
+```
+
+This fails the benchmark if `rustle-agent` has a higher average p50 latency
+than sshuttle on the same SSH server, target URL, request count, and
+concurrency. `scripts/verify-release-candidate.sh` enables this gate by default
+while running the privileged and live release-candidate matrix.
+
+To make the live native-QUIC data-plane claim a hard gate, compare
+`rustle-quic-native` to `rustle-agent` on the same target:
+
+```sh
+RUSTLE_BENCH_RUSTLE_TRANSPORTS="agent quic-native" \
+RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO=1.00 \
+RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO=1.00 \
+scripts/bench-live-compare.sh
+```
+
+This fails unless native QUIC meets the configured average throughput ratio and
+average p50 latency ratio against the primary SSH-agent path. The release
+candidate wrapper includes `quic-native` automatically when either native/agent
+ratio gate is set, but it leaves those gates opt-in until the remote UDP path is
+known to be reachable and stable.
 
 For environment-specific regression checks, match the output `tool` column with
 a shell-style pattern and set either or both live thresholds:
@@ -348,6 +514,24 @@ TUN route with agent `OpenUdp`, waits for idle cleanup, and requires final
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 
+For release-candidate evidence on a privileged macOS or Linux host, use:
+
+```sh
+RUSTLE_LIVE_REMOTE=alice@ssh.example.com \
+RUSTLE_LIVE_TARGET_CIDR=0.0.0.0/0 \
+RUSTLE_LIVE_URL=https://192.168.190.45/ \
+RUSTLE_FIXTURE_HOST=192.168.190.45 \
+RUSTLE_LIVE_UDP_HOST=192.168.190.45 \
+scripts/verify-release-candidate.sh
+```
+
+The wrapper fails instead of skipping privileged gates, enables DNS takeover,
+live TCP smoke, controlled 1 MiB / 10 MiB / 100 MiB fixture benchmarks, live
+generic UDP, and `RUSTLE_BENCH_TOOLS="rustle sshuttle"`. By default it also sets
+`RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO=1.00`, so Rustle's primary
+`rustle-agent` row matches or beats sshuttle average p50 latency on the same
+live target.
+
 ## Agent Promotion Criteria
 
 The compact command already defaults to the framed agent transport and fails
@@ -360,7 +544,15 @@ mode on the same machines:
   synthetic flows with 64 KiB and 1 MiB response bodies; the high-fanout stress
   gate defaults to both `agent` and `direct-tcpip` at 256 x 1 MiB. That stress
   run is a lifecycle gate for TCP cleanup, stale remote-data handling, and
-  bridge survival under fanout; it is not throughput evidence unless the
+  bridge survival under fanout. The bridge benchmark summary must report
+  `active_flows=0`, `active_bridges=0`, `backlog_flows=0`, and
+  `backlog_bytes=0`; otherwise the harness fails the run as leaked lifecycle
+  state. Chaos runs that stop after `--min-completed` abort incomplete synthetic clients
+  during cleanup before the summary is accepted. Bridge benchmark rows
+  also report per-flow response latency as `p50_us`, `p95_us`, and `max_us`.
+  After each benchmark run, the harness also requires the lab `sshd` process tree to have no descendants
+  and checks the process-tree fd count where `/proc`
+  or `lsof` can expose descriptors. It is not throughput evidence unless the
   benchmark is explicitly run with a release binary and recorded as such.
 - rootless framed-agent UDP benchmarks pass at 64, 512, and 1200 byte responses
   with pipeline depths 1, 32, and 128
@@ -446,8 +638,14 @@ Performance work must preserve these invariants:
 - agent streams use explicit byte-credit windows instead of unbounded SSH-channel
   buffering
 - single-flow remote-to-local throughput depends on both the smoltcp proxy
-  response buffer and the agent stream response window; they are kept aligned at
-  1 MiB so one high-latency flow is not capped by the old 256 KiB credit window
+  response buffer and the agent stream response window; the agent window starts
+  aligned at 1 MiB and sustained streams adapt up to a bounded 2 MiB cap, so one
+  high-latency flow is not capped by the old 256 KiB credit window while tiny
+  flows keep the lower initial window
+- each remote backlog admits multiple local TCP send windows so high-throughput
+  agent or native QUIC bursts are not reset solely because the event loop
+  receives faster than the local TCP side drains; the global remote-backlog cap
+  still bounds aggregate memory across flows
 - agent senders segment oversized local buffers into bounded protocol frames
   instead of relying on callers to respect frame-size limits
 - agent writer tasks must reuse per-task burst frame and encoded-byte buffers
@@ -501,5 +699,8 @@ Performance work must preserve these invariants:
 - SSH channel opens are admission controlled
 - full-tunnel `0.0.0.0/0` expands to two split routes and must protect the SSH
   control connection with a temporary host route when needed
+- Unix Ctrl-C, SIGTERM, and SIGHUP shutdowns must all return through the normal
+  tunnel/capture cleanup path so route, DNS, TUN, local DNS proxy, and
+  uploaded-agent cleanup guards can run
 - every benchmark run must leave no stale routes, resolver settings, or helper
   processes
