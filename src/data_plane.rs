@@ -23,16 +23,14 @@ use crate::{ssh_bridge, tcp_core};
 mod dns;
 mod stream;
 mod tcp;
+#[cfg(test)]
+mod test_support;
 mod udp;
 
-#[cfg(test)]
-pub(crate) use dns::{query_dns_over_agent, query_dns_over_agent_udp, send_dns_response_event};
 pub(crate) use dns::{query_dns_over_transport, spawn_dns_query_on_data_plane};
 pub(crate) use tcp::spawn_agent_tcp_bridge;
 use tcp::{spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge};
 pub(crate) use udp::spawn_udp_association_with_idle_timeout;
-#[cfg(test)]
-pub(crate) use udp::{query_udp_over_agent, run_udp_association, run_udp_association_transport};
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;

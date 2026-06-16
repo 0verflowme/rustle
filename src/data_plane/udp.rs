@@ -224,3 +224,303 @@ pub(crate) async fn query_udp_over_agent(
         )
     })?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{
+        detached_reconnecting_agent_bridge, test_agent_transport, test_quic_native_bridge,
+    };
+    use super::*;
+    use crate::dns as dns_proto;
+    use crate::packet_engine::DnsInflight;
+    use crate::transport_model::{UdpAssociation, UDP_DATAGRAMS_PER_ASSOCIATION};
+    use crate::DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS;
+    use std::collections::HashMap;
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
+        Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
+
+    #[tokio::test]
+    async fn udp_over_agent_round_trips_datagram() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP target");
+        let destination = socket.local_addr().expect("UDP target address");
+        let udp_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("read UDP query");
+            assert_eq!(&buf[..len], b"ping");
+            socket
+                .send_to(b"pong", peer)
+                .await
+                .expect("write UDP response");
+        });
+
+        let (transport, agent) = test_agent_transport().await;
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+
+        let response = query_udp_over_agent(
+            transport.clone(),
+            &dns_proto::UdpPacket {
+                src_ip: Ipv4Addr::new(10, 255, 255, 1),
+                dst_ip: *destination.ip(),
+                src_port: 49152,
+                dst_port: destination.port(),
+                payload: Bytes::from_static(b"ping"),
+            },
+        )
+        .await
+        .expect("query UDP over agent");
+        assert_eq!(response, b"pong");
+
+        drop(transport);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_reuses_agent_stream_for_multiple_datagrams() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP target");
+        let destination = socket.local_addr().expect("UDP target address");
+        let udp_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            for _ in 0..2 {
+                let (len, peer) = socket.recv_from(&mut buf).await.expect("read UDP query");
+                let mut response = b"echo:".to_vec();
+                response.extend_from_slice(&buf[..len]);
+                socket
+                    .send_to(&response, peer)
+                    .await
+                    .expect("write UDP response");
+            }
+        });
+
+        let (transport, agent) = test_agent_transport().await;
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: *destination.ip(),
+            dst_port: destination.port(),
+        };
+
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let (close_tx, mut close_rx) = mpsc::channel(8);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let association = tokio::spawn(run_udp_association_transport(
+            transport.clone(),
+            key,
+            from_local,
+            events,
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+        ));
+
+        to_remote
+            .send(Bytes::from_static(b"one"))
+            .await
+            .expect("send first datagram");
+        to_remote
+            .send(Bytes::from_static(b"two"))
+            .await
+            .expect("send second datagram");
+
+        let mut responses = Vec::new();
+        while responses.len() < 2 {
+            tokio::select! {
+                event = response_rx.recv() => {
+                    let event = event.expect("association response channel closed");
+                    let event_key = event.key;
+                    let payload = event.payload;
+                    assert_eq!(event_key, key);
+                    responses.push(payload);
+                }
+                event = close_rx.recv() => {
+                    let event = event.expect("association close channel closed");
+                    panic!("UDP association closed before responses: {:?}", event.error);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!("timed out waiting for UDP association event");
+                }
+            }
+        }
+        assert_eq!(
+            responses,
+            vec![
+                Bytes::from_static(b"echo:one"),
+                Bytes::from_static(b"echo:two")
+            ]
+        );
+
+        drop(to_remote);
+        tokio::time::timeout(std::time::Duration::from_secs(1), association)
+            .await
+            .expect("association exits")
+            .expect("association join")
+            .expect("association run");
+        drop(transport);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_reuses_quic_native_stream_for_multiple_datagrams() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP target");
+        let destination = socket.local_addr().expect("UDP target address");
+        let udp_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            for _ in 0..2 {
+                let (len, peer) = socket.recv_from(&mut buf).await.expect("read UDP query");
+                let mut response = b"native-echo:".to_vec();
+                response.extend_from_slice(&buf[..len]);
+                socket
+                    .send_to(&response, peer)
+                    .await
+                    .expect("write UDP response");
+            }
+        });
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: *destination.ip(),
+            dst_port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(8);
+        let (close_tx, mut close_rx) = mpsc::channel(8);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let association = tokio::spawn(run_udp_association(
+            UdpAssociationTransport::QuicNative(bridge.clone()),
+            key,
+            from_local,
+            events,
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+        ));
+
+        to_remote
+            .send(Bytes::from_static(b"one"))
+            .await
+            .expect("send first datagram");
+        to_remote
+            .send(Bytes::from_static(b"two"))
+            .await
+            .expect("send second datagram");
+
+        let mut responses = Vec::new();
+        while responses.len() < 2 {
+            tokio::select! {
+                event = response_rx.recv() => {
+                    let event = event.expect("association response channel closed");
+                    assert_eq!(event.key, key);
+                    responses.push(event.payload);
+                }
+                event = close_rx.recv() => {
+                    let event = event.expect("association close channel closed");
+                    panic!("native QUIC UDP association closed before responses: {:?}", event.error);
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                    panic!("timed out waiting for native QUIC UDP association event");
+                }
+            }
+        }
+        assert_eq!(
+            responses,
+            vec![
+                Bytes::from_static(b"native-echo:one"),
+                Bytes::from_static(b"native-echo:two")
+            ]
+        );
+
+        drop(to_remote);
+        tokio::time::timeout(std::time::Duration::from_secs(1), association)
+            .await
+            .expect("association exits")
+            .expect("association join")
+            .expect("association run");
+        bridge.close_for_test("test complete");
+        bridge_task.await.expect("native bridge task");
+        udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn udp_association_idle_timeout_emits_close_for_accounting() {
+        let (transport, agent) = test_agent_transport().await;
+        let bridge = detached_reconnecting_agent_bridge(transport);
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(127, 0, 0, 1),
+            dst_port: 5353,
+        };
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let mut association_limit = DnsInflight::new(1);
+        assert!(association_limit.try_admit());
+
+        spawn_udp_association_with_idle_timeout(
+            UdpAssociationTransport::Agent(bridge.clone()),
+            key,
+            from_local,
+            events,
+            std::time::Duration::from_millis(10),
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx.recv())
+            .await
+            .expect("idle association closes")
+            .expect("close event");
+        assert_eq!(closed.key, key);
+        assert!(closed.error.is_none());
+        assert!(response_rx.try_recv().is_err());
+
+        associations.remove(&closed.key);
+        association_limit.complete();
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(association_limit.completed(), 1);
+        assert!(associations.is_empty());
+
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+    }
+}

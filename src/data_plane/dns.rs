@@ -434,3 +434,310 @@ async fn query_dns_over_agent_udp_stream(mut stream: AgentIoStream, query: &[u8]
     let _ = stream.close().await;
     Ok(response)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{test_agent_transport, test_quic_native_bridge};
+    use super::*;
+    use crate::dns as dns_proto;
+    use crate::supervisor::virtual_dns_ip;
+    use crate::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn dns_response_event_keeps_remote_payload_as_bytes() {
+        let request = dns_proto::UdpDnsRequest {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            dst_ip: virtual_dns_ip(DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX).unwrap(),
+            src_port: 49152,
+            dst_port: dns_proto::DNS_PORT,
+            payload: Bytes::from_static(b"\x12\x34query"),
+        };
+        let payload = Bytes::from_static(b"\x12\x34answer");
+        let ptr = payload.as_ptr();
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        assert!(send_dns_response_event(
+            &event_tx,
+            DnsResponseEvent {
+                request: request.clone(),
+                result: Ok(payload),
+            },
+        ));
+        let event = event_rx.try_recv().expect("queued DNS response");
+
+        assert_eq!(event.request, request);
+        let response = event.result.expect("DNS response payload");
+        assert_eq!(response.as_ref(), b"\x12\x34answer");
+        assert_eq!(response.as_ptr(), ptr);
+    }
+
+    #[tokio::test]
+    async fn dns_over_agent_round_trips_tcp_dns_payload() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP DNS listener");
+        let destination = listener.local_addr().expect("TCP DNS listener address");
+        let dns_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP DNS query");
+            let mut len = [0_u8; 2];
+            socket
+                .read_exact(&mut len)
+                .await
+                .expect("read TCP DNS query length");
+            let query_len = usize::from(u16::from_be_bytes(len));
+            let mut query = vec![0_u8; query_len];
+            socket
+                .read_exact(&mut query)
+                .await
+                .expect("read TCP DNS query");
+            assert_eq!(query, b"\x12\x34query");
+
+            let response = b"\x12\x34answer";
+            socket
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .expect("write TCP DNS response length");
+            socket
+                .write_all(response)
+                .await
+                .expect("write TCP DNS response");
+            socket.shutdown().await.expect("shutdown TCP DNS socket");
+        });
+
+        let (transport, agent) = test_agent_transport().await;
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let remote = Destination {
+            host: destination.ip().to_string(),
+            port: destination.port(),
+        };
+
+        let response =
+            query_dns_over_agent(transport.clone(), &remote, b"\x12\x34query", DEFAULT_TUN_IP)
+                .await
+                .expect("query DNS over agent");
+        assert_eq!(response.as_ref(), b"\x12\x34answer");
+
+        drop(transport);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        dns_server.await.expect("DNS server join");
+    }
+
+    #[tokio::test]
+    async fn dns_over_agent_prefers_udp_for_ipv4_remote() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP DNS socket");
+        let destination = socket.local_addr().expect("UDP DNS socket address");
+        let dns_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 512];
+            let (len, peer) = socket
+                .recv_from(&mut buf)
+                .await
+                .expect("recv UDP DNS query");
+            assert_eq!(&buf[..len], b"\x12\x34udp-query");
+            socket
+                .send_to(b"\x12\x34udp-answer", peer)
+                .await
+                .expect("send UDP DNS response");
+        });
+
+        let (transport, agent) = test_agent_transport().await;
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let remote = Destination {
+            host: destination.ip().to_string(),
+            port: destination.port(),
+        };
+
+        let response = query_dns_over_agent_udp(
+            transport.clone(),
+            &remote,
+            b"\x12\x34udp-query",
+            DEFAULT_TUN_IP,
+        )
+        .await
+        .expect("query DNS over agent UDP");
+        assert_eq!(response.as_ref(), b"\x12\x34udp-answer");
+
+        drop(transport);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        dns_server.await.expect("DNS UDP server join");
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_native_uses_udp_for_ipv4_remote() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP DNS socket");
+        let destination = socket.local_addr().expect("UDP DNS socket address");
+        let dns_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 512];
+            let (len, peer) = socket
+                .recv_from(&mut buf)
+                .await
+                .expect("recv native QUIC UDP DNS query");
+            assert_eq!(&buf[..len], b"\x12\x34native-query");
+            socket
+                .send_to(b"\x12\x34native-answer", peer)
+                .await
+                .expect("send native QUIC UDP DNS response");
+        });
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let remote = Destination {
+            host: destination.ip().to_string(),
+            port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+
+        let response = query_dns_over_transport(
+            DnsTransport::QuicNative(bridge.clone()),
+            &remote,
+            b"\x12\x34native-query",
+            DEFAULT_TUN_IP,
+        )
+        .await
+        .expect("query DNS over native QUIC UDP");
+        assert_eq!(response.as_ref(), b"\x12\x34native-answer");
+
+        bridge.close_for_test("test complete");
+        bridge_task.await.expect("native bridge task");
+        dns_server.await.expect("DNS UDP server join");
+    }
+
+    #[tokio::test]
+    async fn dns_over_agent_accepts_hostname_remote() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP DNS listener");
+        let destination = listener.local_addr().expect("TCP DNS listener address");
+        let dns_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP DNS query");
+            let mut len = [0_u8; 2];
+            socket
+                .read_exact(&mut len)
+                .await
+                .expect("read TCP DNS query length");
+            let query_len = usize::from(u16::from_be_bytes(len));
+            let mut query = vec![0_u8; query_len];
+            socket
+                .read_exact(&mut query)
+                .await
+                .expect("read TCP DNS query");
+            assert_eq!(query, b"\xab\xcdname-query");
+
+            let response = b"\xab\xcdname-answer";
+            socket
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .expect("write TCP DNS response length");
+            socket
+                .write_all(response)
+                .await
+                .expect("write TCP DNS response");
+            socket.shutdown().await.expect("shutdown TCP DNS socket");
+        });
+
+        let (transport, agent) = test_agent_transport().await;
+        let remote = Destination {
+            host: "localhost".to_owned(),
+            port: destination.port(),
+        };
+
+        let response = query_dns_over_agent(
+            transport.clone(),
+            &remote,
+            b"\xab\xcdname-query",
+            DEFAULT_TUN_IP,
+        )
+        .await
+        .expect("query DNS over agent hostname");
+        assert_eq!(response.as_ref(), b"\xab\xcdname-answer");
+
+        drop(transport);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        dns_server.await.expect("DNS server join");
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_native_accepts_hostname_remote() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP DNS listener");
+        let destination = listener.local_addr().expect("TCP DNS listener address");
+        let dns_server = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("accept native QUIC TCP DNS query");
+            let mut len = [0_u8; 2];
+            socket
+                .read_exact(&mut len)
+                .await
+                .expect("read native QUIC TCP DNS query length");
+            let query_len = usize::from(u16::from_be_bytes(len));
+            let mut query = vec![0_u8; query_len];
+            socket
+                .read_exact(&mut query)
+                .await
+                .expect("read native QUIC TCP DNS query");
+            assert_eq!(query, b"\xab\xcdnative-name-query");
+
+            let response = b"\xab\xcdnative-name-answer";
+            socket
+                .write_all(&(response.len() as u16).to_be_bytes())
+                .await
+                .expect("write native QUIC TCP DNS response length");
+            socket
+                .write_all(response)
+                .await
+                .expect("write native QUIC TCP DNS response");
+            socket.shutdown().await.expect("shutdown TCP DNS socket");
+        });
+        let remote = Destination {
+            host: "localhost".to_owned(),
+            port: destination.port(),
+        };
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+
+        let response = query_dns_over_transport(
+            DnsTransport::QuicNative(bridge.clone()),
+            &remote,
+            b"\xab\xcdnative-name-query",
+            DEFAULT_TUN_IP,
+        )
+        .await
+        .expect("query DNS over native QUIC hostname");
+        assert_eq!(response.as_ref(), b"\xab\xcdnative-name-answer");
+
+        bridge.close_for_test("test complete");
+        bridge_task.await.expect("native bridge task");
+        dns_server.await.expect("DNS server join");
+    }
+}
