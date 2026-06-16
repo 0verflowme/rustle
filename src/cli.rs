@@ -5,8 +5,8 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use ipnet::Ipv4Net;
 
 use crate::bridge_lab::BridgeLabArgs;
+use crate::routing::parse_target_cidr;
 use crate::ssh_control::DEFAULT_SSH_CONNECT_TIMEOUT_SECS;
-use crate::supervisor::parse_target_cidr;
 use crate::transport_model::{BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION};
 use crate::{
     DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX,
