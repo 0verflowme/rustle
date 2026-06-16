@@ -389,6 +389,251 @@ impl TunnelStats {
     }
 }
 
+pub(crate) struct TunnelEngine {
+    flow_manager: tcp_core::FlowManager,
+    bridges: HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    udp_associations: HashMap<UdpFlowKey, UdpAssociation>,
+    remote_backlogs: RemoteBacklogs,
+    dns_inflight: DnsInflight,
+    udp_inflight: DnsInflight,
+    stats: TunnelStats,
+    started_at: StdInstant,
+    outbound_packets: Vec<tcp_core::PacketBuf>,
+    ready_flow_ids: Vec<tcp_core::FlowId>,
+    flow_keys: Vec<tcp_core::FlowKey>,
+    backlog_flow_ids: Vec<tcp_core::FlowId>,
+    backlog_closed_flows: Vec<tcp_core::FlowKey>,
+    bridge_event_closed_flows: Vec<tcp_core::FlowKey>,
+    expired_flows: Vec<tcp_core::FlowKey>,
+    removable_flows: Vec<tcp_core::FlowKey>,
+}
+
+impl TunnelEngine {
+    pub(crate) fn new(flow_manager: tcp_core::FlowManager) -> Self {
+        Self {
+            flow_manager,
+            bridges: HashMap::new(),
+            udp_associations: HashMap::new(),
+            remote_backlogs: RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW),
+            dns_inflight: DnsInflight::new(MAX_IN_FLIGHT_DNS_QUERIES),
+            udp_inflight: DnsInflight::new(MAX_ACTIVE_UDP_ASSOCIATIONS),
+            stats: TunnelStats::new(),
+            started_at: StdInstant::now(),
+            outbound_packets: Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY),
+            ready_flow_ids: Vec::new(),
+            flow_keys: Vec::new(),
+            backlog_flow_ids: Vec::new(),
+            backlog_closed_flows: Vec::new(),
+            bridge_event_closed_flows: Vec::new(),
+            expired_flows: Vec::new(),
+            removable_flows: Vec::new(),
+        }
+    }
+
+    pub(crate) fn record_tun_rx(&mut self, len: usize) {
+        self.stats.record_tun_rx(len);
+    }
+
+    pub(crate) fn record_tun_write(&mut self, write: TunWriteStats) {
+        self.stats.record_tun_write(write);
+    }
+
+    pub(crate) fn outbound_packets_mut(&mut self) -> &mut Vec<tcp_core::PacketBuf> {
+        &mut self.outbound_packets
+    }
+
+    pub(crate) fn try_admit_dns(&mut self) -> bool {
+        self.dns_inflight.try_admit()
+    }
+
+    pub(crate) fn complete_dns(&mut self) {
+        self.dns_inflight.complete();
+    }
+
+    pub(crate) fn dns_inflight_limit(&self) -> usize {
+        self.dns_inflight.max()
+    }
+
+    pub(crate) fn record_dns_forwarded(&mut self) {
+        self.stats.dns_forwarded = self.stats.dns_forwarded.saturating_add(1);
+    }
+
+    pub(crate) fn record_dns_drop(&mut self) {
+        self.stats.dns_dropped = self.stats.dns_dropped.saturating_add(1);
+        self.stats.record_dns_response(false);
+    }
+
+    pub(crate) fn record_dns_delivery(&mut self, remote_ok: bool, write: TunWriteStats) {
+        self.stats.record_dns_delivery(remote_ok, write);
+    }
+
+    pub(crate) fn record_udp_delivery(&mut self, write: TunWriteStats) {
+        self.stats.record_udp_delivery(write);
+    }
+
+    pub(crate) fn close_udp_association(&mut self, key: UdpFlowKey) {
+        self.udp_associations.remove(&key);
+        self.udp_inflight.complete();
+    }
+
+    pub(crate) fn record_udp_close_error(&mut self) {
+        self.stats.record_udp_response(false);
+    }
+
+    pub(crate) fn should_pause_bridge_events(&self) -> bool {
+        self.remote_backlogs.should_pause_bridge_events()
+    }
+
+    pub(crate) fn status_line(&self, agent: DataPlaneRuntimeSnapshot) -> String {
+        self.stats.status_line(
+            self.flow_manager.active_flow_count(),
+            self.bridges.len(),
+            &self.remote_backlogs,
+            &self.dns_inflight,
+            &self.udp_inflight,
+            agent,
+        )
+    }
+
+    pub(crate) fn ingest_tcp_packet(&mut self, packet: &[u8]) -> Result<()> {
+        let now = self.now();
+        self.flow_manager
+            .ingest_packet_into(now, packet, &mut self.outbound_packets)?;
+        Ok(())
+    }
+
+    pub(crate) fn poll_tcp(&mut self) {
+        let now = self.now();
+        self.flow_manager.poll_into(now, &mut self.outbound_packets);
+    }
+
+    pub(crate) fn ensure_bridges<F>(
+        &mut self,
+        limits: BridgeAdmissionLimits,
+        spawn_bridge: F,
+        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    ) -> Result<BridgeAdmissionStats>
+    where
+        F: FnMut(tcp_core::FlowId, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
+    {
+        let now = self.now();
+        let admission_stats = ensure_bridges(
+            &mut self.flow_manager,
+            &mut self.bridges,
+            limits,
+            spawn_bridge,
+            event_tx,
+            &mut self.ready_flow_ids,
+            now,
+        )?;
+        self.stats.record_bridge_admission(admission_stats);
+        Ok(admission_stats)
+    }
+
+    pub(crate) fn drain_local_bytes_to_bridges(&mut self) -> Result<LocalDrainStats> {
+        let drain_stats = drain_local_bytes_to_bridges(
+            &mut self.flow_manager,
+            &mut self.bridges,
+            &mut self.flow_keys,
+        )?;
+        self.stats.record_local_drain(drain_stats);
+        Ok(drain_stats)
+    }
+
+    pub(crate) fn flush_remote_backlogs(&mut self) -> Result<()> {
+        let now = self.now();
+        self.remote_backlogs.flush_all_into(
+            &mut self.flow_manager,
+            now,
+            &mut self.backlog_flow_ids,
+            &mut self.backlog_closed_flows,
+        )?;
+        for closed_flow in self.backlog_closed_flows.drain(..) {
+            self.bridges.remove(&closed_flow);
+        }
+        self.flow_manager.poll_into(now, &mut self.outbound_packets);
+        Ok(())
+    }
+
+    pub(crate) fn expire_and_prune(&mut self) -> Result<()> {
+        let now = self.now();
+        self.stats.expired_flows = self.stats.expired_flows.saturating_add(expire_stale_flows(
+            &mut self.flow_manager,
+            &mut self.bridges,
+            &mut self.remote_backlogs,
+            now,
+            &mut self.expired_flows,
+        ) as u64);
+        self.stats.pruned_flows = self.stats.pruned_flows.saturating_add(prune_closed_flows(
+            &mut self.flow_manager,
+            &mut self.bridges,
+            &mut self.remote_backlogs,
+            &mut self.removable_flows,
+        )? as u64);
+        Ok(())
+    }
+
+    pub(crate) fn handle_bridge_event(
+        &mut self,
+        event: ssh_bridge::BridgeEvent,
+    ) -> Result<BridgeEventStats> {
+        self.stats.record_bridge_event(&event);
+        let now = self.now();
+        let outcome = handle_bridge_event_into(
+            event,
+            &mut self.flow_manager,
+            &mut self.remote_backlogs,
+            now,
+            &mut self.bridge_event_closed_flows,
+        )?;
+        self.stats.remote_backlog_overflows = self
+            .stats
+            .remote_backlog_overflows
+            .saturating_add(outcome.remote_backlog_overflows);
+        self.stats.stale_bridge_events = self
+            .stats
+            .stale_bridge_events
+            .saturating_add(outcome.stale_bridge_events);
+        for flow in self.bridge_event_closed_flows.drain(..) {
+            self.bridges.remove(&flow);
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn handle_udp_datagram<T, F>(
+        &mut self,
+        transport: Option<UdpAssociationTransportPlan<T>>,
+        request: dns::UdpPacket,
+        events: UdpAssociationEvents,
+        idle_timeout: Duration,
+        actions: &mut Vec<UdpIngressAction<T>>,
+        spawn_association: &mut F,
+    ) where
+        F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
+    {
+        plan_udp_datagram_actions(
+            transport,
+            request,
+            &mut self.udp_associations,
+            &mut self.udp_inflight,
+            events,
+            idle_timeout,
+            actions,
+        );
+        execute_udp_ingress_actions(
+            actions,
+            &mut self.udp_associations,
+            &mut self.udp_inflight,
+            &mut self.stats,
+            spawn_association,
+        );
+    }
+
+    fn now(&self) -> SmolInstant {
+        smol_now(self.started_at)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct BridgeAdmissionStats {
     pub(crate) deferred_active_limit: u64,
