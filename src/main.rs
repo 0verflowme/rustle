@@ -47,6 +47,7 @@ mod supervisor;
 #[allow(dead_code)]
 mod tcp_core;
 mod transport_model;
+mod tun_io;
 mod tunnel_lifecycle;
 
 #[cfg(test)]

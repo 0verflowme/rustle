@@ -3,13 +3,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 
 use crate::control_plane::connect_bridge_runtime;
 use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
-    TunWriteStats, TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
+    TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
     MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
 };
 use crate::remote_helper::bridge_agent_command_plan;
@@ -19,8 +18,9 @@ use crate::routing::{
 use crate::ssh_control::{validate_agent_session_request_count, validate_ssh_session_count};
 use crate::transport_model::{
     parse_destination, BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsResponseEvent,
-    UdpAssociationEvents, UdpFlowKey,
+    UdpAssociationEvents,
 };
+use crate::tun_io::TunWriter;
 #[cfg(all(unix, test))]
 pub(crate) use crate::tunnel_lifecycle::unix_shutdown_signals;
 pub(crate) use crate::tunnel_lifecycle::virtual_dns_ip;
@@ -28,7 +28,7 @@ use crate::tunnel_lifecycle::{
     open_tun, open_tunnel_host, shutdown_signal, ShutdownSignalFuture, TunConfig, TunnelCleanup,
     TunnelHostConfig,
 };
-use crate::{dns, platform, tcp_core, TunCaptureArgs, TunnelArgs, DEFAULT_TUN_IP};
+use crate::{platform, tcp_core, TunCaptureArgs, TunnelArgs, DEFAULT_TUN_IP};
 
 const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
 const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
@@ -36,7 +36,6 @@ const UDP_CLOSE_EVENT_CHANNEL_DEPTH: usize = MAX_ACTIVE_UDP_ASSOCIATIONS;
 const _: () = assert!(DNS_EVENT_CHANNEL_DEPTH >= MAX_IN_FLIGHT_DNS_QUERIES);
 const _: () = assert!(UDP_CLOSE_EVENT_CHANNEL_DEPTH >= MAX_ACTIVE_UDP_ASSOCIATIONS);
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
-const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
     validate_tun_args(&args)?;
@@ -193,6 +192,7 @@ impl TunnelSupervisor {
             mut shutdown,
         } = self;
 
+        let tun = TunWriter::new(dev);
         let mut buf = vec![0_u8; PACKET_BUF_SIZE];
         let mut udp_actions = Vec::new();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
@@ -222,8 +222,8 @@ impl TunnelSupervisor {
                     );
                     return Ok(());
                 }
-                result = dev.recv(&mut buf) => {
-                    let len = result.context("failed to read packet from TUN device")?;
+                result = tun.recv(&mut buf) => {
+                    let len = result?;
                     engine.record_tun_rx(len);
                     let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
                         continue;
@@ -254,14 +254,12 @@ impl TunnelSupervisor {
                                 engine.dns_inflight_limit()
                             );
                             engine.record_dns_drop();
-                            let tun_write = write_dns_event_to_tun(
-                                &dev,
-                                DnsResponseEvent {
+                            let tun_write = tun
+                                .write_dns_event(DnsResponseEvent {
                                     request,
                                     result: Err("DNS in-flight limit reached".to_owned()),
-                                },
-                            )
-                            .await?;
+                                })
+                                .await?;
                             engine.record_tun_write(tun_write);
                         }
                         continue;
@@ -289,7 +287,7 @@ impl TunnelSupervisor {
                     engine
                         .ingest_tcp_packet(packet)
                         .context("failed to feed packet into userspace TCP engine")?;
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.ensure_bridges(
                         data_plane.admission_limits(),
                         |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
@@ -297,20 +295,20 @@ impl TunnelSupervisor {
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.flush_remote_backlogs()?;
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.expire_and_prune()?;
                 }
                 event = dns_rx.recv() => {
                     if let Some(event) = event {
                         engine.complete_dns();
                         let remote_ok = event.result.is_ok();
-                        let tun_write = write_dns_event_to_tun(&dev, event).await?;
+                        let tun_write = tun.write_dns_event(event).await?;
                         engine.record_dns_delivery(remote_ok, tun_write);
                     }
                 }
                 event = udp_response_rx.recv() => {
                     if let Some(event) = event {
-                        let tun_write = write_udp_response_to_tun(&dev, event.key, event.payload).await?;
+                        let tun_write = tun.write_udp_response(event.key, event.payload).await?;
                         engine.record_udp_delivery(tun_write);
                     }
                 }
@@ -335,9 +333,9 @@ impl TunnelSupervisor {
                     };
                     engine.handle_bridge_event(event)?;
                     engine.poll_tcp();
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.flush_remote_backlogs()?;
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.expire_and_prune()?;
                 }
                 _ = stats_tick.tick() => {
@@ -348,9 +346,9 @@ impl TunnelSupervisor {
                 }
                 _ = tick.tick() => {
                     engine.poll_tcp();
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.flush_remote_backlogs()?;
-                    write_engine_packets_to_tun(&dev, &mut engine).await?;
+                    tun.write_engine_packets(&mut engine).await?;
                     engine.ensure_bridges(
                         data_plane.admission_limits(),
                         |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
@@ -364,89 +362,12 @@ impl TunnelSupervisor {
     }
 }
 
-async fn write_engine_packets_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    engine: &mut TunnelEngine,
-) -> Result<()> {
-    let tun_write = write_packets_to_tun(dev, engine.outbound_packets_mut()).await?;
-    engine.record_tun_write(tun_write);
-    Ok(())
-}
-
-pub(crate) async fn write_dns_event_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    event: DnsResponseEvent,
-) -> Result<TunWriteStats> {
-    let payload = match event.result {
-        Ok(payload) => payload,
-        Err(err) => {
-            eprintln!("dns: remote query failed: {err}");
-            let Some(payload) = dns::build_dns_servfail_response(event.request.payload.as_ref())
-            else {
-                return Ok(TunWriteStats::default());
-            };
-            Bytes::from(payload)
-        }
-    };
-
-    let packet = dns::build_udp_dns_response(&event.request, &payload)
-        .context("failed to synthesize DNS UDP response packet")?;
-    write_packet_to_tun(dev, &packet, "DNS response").await
-}
-
-pub(crate) async fn write_udp_response_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    key: UdpFlowKey,
-    payload: Bytes,
-) -> Result<TunWriteStats> {
-    let request = key.response_template();
-    let packet = dns::build_udp_response(&request, &payload)
-        .context("failed to synthesize UDP response packet")?;
-    write_packet_to_tun(dev, &packet, "UDP response").await
-}
-
-pub(crate) async fn write_packets_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    packets: &mut Vec<tcp_core::PacketBuf>,
-) -> Result<TunWriteStats> {
-    let mut stats = TunWriteStats::default();
-    for packet in packets.drain(..) {
-        stats.combine(write_packet_to_tun(dev, packet.as_ref(), "userspace TCP packet").await?);
-    }
-    Ok(stats)
-}
-
-pub(crate) async fn write_packet_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    packet: &[u8],
-    description: &'static str,
-) -> Result<TunWriteStats> {
-    let len = packet.len();
-    let mut stats = TunWriteStats::default();
-    match tokio::time::timeout(TUN_WRITE_TIMEOUT, dev.send(packet)).await {
-        Ok(Ok(_)) => {
-            stats.record_written(len);
-        }
-        Ok(Err(err)) => {
-            return Err(err)
-                .with_context(|| format!("failed to write {description} to TUN device"));
-        }
-        Err(_) => {
-            eprintln!(
-                "tun: dropping {len}-byte {description} after {}ms waiting for TUN write",
-                TUN_WRITE_TIMEOUT.as_millis()
-            );
-            stats.record_dropped(len);
-        }
-    }
-    Ok(stats)
-}
-
 pub(crate) async fn capture_packets(
     dev: tun_rs::AsyncDevice,
     mut flow_manager: tcp_core::FlowManager,
     exit_after_packets: Option<u64>,
 ) -> Result<()> {
+    let tun = TunWriter::new(dev);
     let mut buf = vec![0_u8; PACKET_BUF_SIZE];
     let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
     let started_at = StdInstant::now();
@@ -459,8 +380,8 @@ pub(crate) async fn capture_packets(
                 eprintln!("signal: {} received", signal?);
                 return Ok(());
             }
-            result = dev.recv(&mut buf) => {
-                let len = result.context("failed to read packet from TUN device")?;
+            result = tun.recv(&mut buf) => {
+                let len = result?;
                 captured_packets = captured_packets.saturating_add(1);
                 let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
                     eprintln!("packet: len={len} non_ipv4");
@@ -505,7 +426,7 @@ pub(crate) async fn capture_packets(
                                 &mut outbound_packets,
                             )
                             .context("failed to feed packet into userspace TCP engine")?;
-                        let _ = write_packets_to_tun(&dev, &mut outbound_packets).await?;
+                        let _ = tun.write_packets(&mut outbound_packets).await?;
                         for snapshot in flow_manager.snapshots() {
                             eprintln!(
                                 "flow: {:?} state={:?} buffered_rx={}",
