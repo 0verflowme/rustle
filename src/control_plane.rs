@@ -25,7 +25,7 @@ pub(crate) use agent_startup::{
     connect_auto_agent_bridge_transports_from_connector, resolve_agent_session_count,
     should_fast_start_agent_lanes, validate_agent_session_request_count,
 };
-use helper_startup::{connect_helper_with_upload_fallback, connect_uploaded_helper};
+use helper_startup::connect_prepared_helper_with_upload_fallback;
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -47,19 +47,16 @@ impl SshAgentBridgeConnector {
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        connect_helper_with_upload_fallback(
+        let mtu = self.mtu;
+        connect_prepared_helper_with_upload_fallback(
+            &self.prepared,
             &self.helper_plan,
-            connect_agent_bridge_transport_fresh_prepared_ssh_command(
-                &self.prepared,
-                &self.helper_plan.command,
-                self.mtu,
-            ),
-            || {
-                connect_uploaded_agent_bridge_transport_prepared(
-                    &self.prepared,
-                    &self.helper_plan,
-                    self.mtu,
-                )
+            HelperKind::StdioAgent,
+            move |handle, command| async move {
+                connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
+            },
+            move |handle, command| async move {
+                connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
             },
             "Rustle agent",
             Some("agent: bootstrapped remote agent from local binary"),
@@ -130,23 +127,6 @@ async fn connect_agent_bridge_transport_on_handle(
     }
 
     Ok(AgentBridgeTransport::ssh(handle, transport, agent_command))
-}
-
-async fn connect_uploaded_agent_bridge_transport_prepared(
-    prepared: &PreparedSshConnection,
-    helper_plan: &HelperCommandPlan,
-    mtu: u16,
-) -> Result<AgentBridgeTransport> {
-    let (transport, _) = connect_uploaded_helper(
-        prepared,
-        helper_plan,
-        HelperKind::StdioAgent,
-        |handle, command| async move {
-            connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
-        },
-    )
-    .await?;
-    Ok(transport)
 }
 
 pub(crate) async fn connect_bridge_runtime(

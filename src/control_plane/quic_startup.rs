@@ -18,8 +18,7 @@ use crate::ssh_control::{
 use crate::{quic_agent, quic_agent_runtime, SshArgs};
 
 use super::{
-    connect_agent_bridge_transports_from_connector, connect_helper_with_upload_fallback,
-    connect_uploaded_helper,
+    connect_agent_bridge_transports_from_connector, connect_prepared_helper_with_upload_fallback,
 };
 
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -41,19 +40,30 @@ impl SshQuicAgentBridgeConnector {
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        connect_helper_with_upload_fallback(
+        let primary_remote_host = self.prepared.remote_host().to_owned();
+        let uploaded_remote_host = primary_remote_host.clone();
+        let mtu = self.mtu;
+        connect_prepared_helper_with_upload_fallback(
+            &self.prepared,
             &self.helper_plan,
-            connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
-                &self.prepared,
-                &self.helper_plan.command,
-                self.mtu,
-            ),
-            || {
-                connect_uploaded_quic_agent_bridge_transport_prepared(
-                    &self.prepared,
-                    &self.helper_plan,
-                    self.mtu,
+            HelperKind::QuicAgent,
+            move |handle, command| async move {
+                connect_quic_agent_bridge_transport_on_handle(
+                    handle,
+                    &primary_remote_host,
+                    &command,
+                    mtu,
                 )
+                .await
+            },
+            move |handle, command| async move {
+                connect_quic_agent_bridge_transport_on_handle(
+                    handle,
+                    &uploaded_remote_host,
+                    &command,
+                    mtu,
+                )
+                .await
             },
             "Rustle QUIC agent",
             Some("quic-agent: bootstrapped remote helper from local binary"),
@@ -130,13 +140,13 @@ async fn connect_quic_agent_bridge_transport_on_handle(
     }
     let bootstrap = quic_agent::QuicAgentBootstrap::decode_line(&line)
         .context("invalid QUIC agent bootstrap line")?;
-    let remote_addr = resolve_quic_agent_addr(remote_host, bootstrap.port)?;
+    let remote_addr = resolve_quic_helper_addr("quic-agent", remote_host, bootstrap.port)?;
     eprintln!(
         "quic-agent: connecting UDP data plane to {remote_addr} cert_sha256={}",
         bootstrap.cert_sha256
     );
 
-    let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
+    let drain_task = tokio::spawn(drain_quic_helper_ssh_output("quic-agent", reader));
     let client = connect_quic_data_plane(
         "quic-agent",
         remote_addr,
@@ -159,11 +169,18 @@ pub(super) async fn connect_quic_native_bridge_fresh_ssh_command(
     helper_plan: &HelperCommandPlan,
 ) -> Result<QuicNativeBridge> {
     let prepared = prepare_ssh_connection(ssh)?;
-    let handle = connect_prepared_ssh(&prepared).await?;
-    connect_helper_with_upload_fallback(
+    let primary_remote_host = prepared.remote_host().to_owned();
+    let uploaded_remote_host = primary_remote_host.clone();
+    connect_prepared_helper_with_upload_fallback(
+        &prepared,
         helper_plan,
-        connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &helper_plan.command),
-        || connect_uploaded_quic_native_bridge_prepared(&prepared, helper_plan),
+        HelperKind::QuicBridgeNative,
+        move |handle, command| async move {
+            connect_quic_native_bridge_on_handle(handle, &primary_remote_host, &command).await
+        },
+        move |handle, command| async move {
+            connect_quic_native_bridge_on_handle(handle, &uploaded_remote_host, &command).await
+        },
         "native QUIC bridge",
         None,
     )
@@ -197,13 +214,13 @@ async fn connect_quic_native_bridge_on_handle(
     }
     let bootstrap = quic_agent::QuicAgentBootstrap::decode_bridge_line(&line)
         .context("invalid native QUIC bridge bootstrap line")?;
-    let remote_addr = resolve_quic_agent_addr(remote_host, bootstrap.port)?;
+    let remote_addr = resolve_quic_helper_addr("quic-native", remote_host, bootstrap.port)?;
     eprintln!(
         "quic-native: connecting UDP data plane to {remote_addr} cert_sha256={}",
         bootstrap.cert_sha256
     );
 
-    let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
+    let drain_task = tokio::spawn(drain_quic_helper_ssh_output("quic-native", reader));
     let client = connect_quic_data_plane(
         "quic-native",
         remote_addr,
@@ -214,41 +231,6 @@ async fn connect_quic_native_bridge_on_handle(
     Ok(QuicNativeBridge::with_ssh_carrier(
         client, handle, drain_task,
     ))
-}
-
-async fn connect_uploaded_quic_agent_bridge_transport_prepared(
-    prepared: &PreparedSshConnection,
-    helper_plan: &HelperCommandPlan,
-    mtu: u16,
-) -> Result<AgentBridgeTransport> {
-    let remote_host = prepared.remote_host().to_owned();
-    let (transport, _) = connect_uploaded_helper(
-        prepared,
-        helper_plan,
-        HelperKind::QuicAgent,
-        |handle, command| async move {
-            connect_quic_agent_bridge_transport_on_handle(handle, &remote_host, &command, mtu).await
-        },
-    )
-    .await?;
-    Ok(transport)
-}
-
-async fn connect_uploaded_quic_native_bridge_prepared(
-    prepared: &PreparedSshConnection,
-    helper_plan: &HelperCommandPlan,
-) -> Result<QuicNativeBridge> {
-    let remote_host = prepared.remote_host().to_owned();
-    let (bridge, _) = connect_uploaded_helper(
-        prepared,
-        helper_plan,
-        HelperKind::QuicBridgeNative,
-        |handle, command| async move {
-            connect_quic_native_bridge_on_handle(handle, &remote_host, &command).await
-        },
-    )
-    .await?;
-    Ok(bridge)
 }
 
 async fn connect_quic_data_plane<T, F>(
@@ -303,7 +285,7 @@ fn quic_data_plane_timeout_context(
     )
 }
 
-async fn drain_quic_agent_ssh_output<R>(mut reader: BufReader<R>)
+async fn drain_quic_helper_ssh_output<R>(label: &'static str, mut reader: BufReader<R>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -315,23 +297,27 @@ where
             Ok(_) => {
                 let line = line.trim_end_matches(['\r', '\n']);
                 if !line.is_empty() {
-                    eprintln!("quic-agent: remote output: {line}");
+                    eprintln!("{label}: remote output: {line}");
                 }
             }
             Err(err) => {
-                eprintln!("quic-agent: failed to drain remote output: {err:#}");
+                eprintln!("{label}: failed to drain remote output: {err:#}");
                 break;
             }
         }
     }
 }
 
-fn resolve_quic_agent_addr(remote_host: &str, port: u16) -> Result<SocketAddr> {
+fn resolve_quic_helper_addr(
+    label: &'static str,
+    remote_host: &str,
+    port: u16,
+) -> Result<SocketAddr> {
     (remote_host, port)
         .to_socket_addrs()
-        .with_context(|| format!("failed to resolve QUIC agent address for {remote_host}:{port}"))?
+        .with_context(|| format!("failed to resolve {label} address for {remote_host}:{port}"))?
         .next()
-        .ok_or_else(|| anyhow!("no socket addresses found for QUIC agent {remote_host}:{port}"))
+        .ok_or_else(|| anyhow!("no socket addresses found for {label} {remote_host}:{port}"))
 }
 
 #[cfg(test)]
@@ -342,11 +328,12 @@ mod tests {
 
     use anyhow::{anyhow, Result};
 
-    use super::{connect_quic_data_plane_with_timeout, resolve_quic_agent_addr};
+    use super::{connect_quic_data_plane_with_timeout, resolve_quic_helper_addr};
 
     #[test]
-    fn resolve_quic_agent_addr_preserves_loopback_port() {
-        let addr = resolve_quic_agent_addr("127.0.0.1", 4433).expect("loopback should resolve");
+    fn resolve_quic_helper_addr_preserves_loopback_port() {
+        let addr = resolve_quic_helper_addr("quic-native", "127.0.0.1", 4433)
+            .expect("loopback should resolve");
 
         assert_eq!(
             addr,

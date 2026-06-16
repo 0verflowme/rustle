@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use russh::client::Handle;
 
 use crate::remote_helper::{bootstrap_helper, HelperCommandPlan, HelperKind};
-use crate::ssh_control::{Client, PreparedSshConnection};
+use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 
 pub(super) async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
     helper_plan: &HelperCommandPlan,
@@ -52,6 +52,45 @@ where
     }
 }
 
+pub(super) async fn connect_prepared_helper_with_upload_fallback<
+    T,
+    PrimaryFn,
+    PrimaryFut,
+    UploadFn,
+    UploadFut,
+>(
+    prepared: &PreparedSshConnection,
+    helper_plan: &HelperCommandPlan,
+    expected: HelperKind,
+    primary: PrimaryFn,
+    uploaded: UploadFn,
+    helper_name: &str,
+    upload_success_log: Option<&str>,
+) -> Result<T>
+where
+    PrimaryFn: FnOnce(Handle<Client>, String) -> PrimaryFut,
+    PrimaryFut: Future<Output = Result<T>>,
+    UploadFn: FnOnce(Handle<Client>, String) -> UploadFut,
+    UploadFut: Future<Output = Result<T>>,
+{
+    ensure_helper_plan_kind(helper_plan, expected)?;
+    connect_helper_with_upload_fallback(
+        helper_plan,
+        async move {
+            let handle = connect_prepared_ssh(prepared).await?;
+            primary(handle, helper_plan.command.clone()).await
+        },
+        move || async move {
+            let (connected, _) =
+                connect_uploaded_helper(prepared, helper_plan, expected, uploaded).await?;
+            Ok(connected)
+        },
+        helper_name,
+        upload_success_log,
+    )
+    .await
+}
+
 pub(super) async fn connect_uploaded_helper<T, ConnectFn, ConnectFut>(
     prepared: &PreparedSshConnection,
     helper_plan: &HelperCommandPlan,
@@ -89,11 +128,16 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use std::time::Duration;
 
     use anyhow::{anyhow, Result};
 
-    use super::{connect_helper_with_upload_fallback, ensure_helper_plan_kind};
+    use super::{
+        connect_helper_with_upload_fallback, connect_prepared_helper_with_upload_fallback,
+        ensure_helper_plan_kind,
+    };
     use crate::remote_helper::{HelperCommandPlan, HelperKind};
+    use crate::ssh_control::{PreparedSshConnection, SshTarget};
 
     #[tokio::test]
     async fn primary_success_does_not_try_upload_fallback() {
@@ -231,5 +275,57 @@ mod tests {
         assert!(detail
             .contains("helper startup plan kind mismatch: expected StdioAgent, got QuicAgent"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn prepared_helper_kind_mismatch_fails_before_primary_or_upload() -> Result<()> {
+        let prepared = dummy_prepared_ssh_connection();
+        let plan = HelperCommandPlan::from_command_options(HelperKind::QuicAgent, None, None)?;
+        let primary_attempts = Arc::new(AtomicUsize::new(0));
+        let upload_attempts = Arc::new(AtomicUsize::new(0));
+        let primary_attempts_for_closure = Arc::clone(&primary_attempts);
+        let upload_attempts_for_closure = Arc::clone(&upload_attempts);
+
+        let err = connect_prepared_helper_with_upload_fallback(
+            &prepared,
+            &plan,
+            HelperKind::StdioAgent,
+            move |_handle, _command| {
+                primary_attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>(()) }
+            },
+            move |_handle, _command| {
+                upload_attempts_for_closure.fetch_add(1, Ordering::SeqCst);
+                async { Ok::<_, anyhow::Error>(()) }
+            },
+            "Rustle agent",
+            None,
+        )
+        .await
+        .expect_err("mismatched helper kind should fail before opening SSH");
+        let detail = format!("{err:#}");
+
+        assert!(detail
+            .contains("helper startup plan kind mismatch: expected StdioAgent, got QuicAgent"));
+        assert_eq!(primary_attempts.load(Ordering::SeqCst), 0);
+        assert_eq!(upload_attempts.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn dummy_prepared_ssh_connection() -> PreparedSshConnection {
+        PreparedSshConnection {
+            target: SshTarget {
+                user: "test".to_owned(),
+                addr: "127.0.0.1:1".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: 1,
+            },
+            identity_files: Vec::new(),
+            password: None,
+            known_hosts: None,
+            insecure_accept_host_key: true,
+            accept_new_host_key: false,
+            connect_timeout: Duration::from_millis(1),
+        }
     }
 }
