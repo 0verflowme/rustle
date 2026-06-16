@@ -79,7 +79,7 @@ use data_plane::{
 };
 use packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, tun_ipv4_packet,
-    write_packet_to_tun, write_packets_to_tun, TunWriteStats, PACKET_BUF_SIZE,
+    write_packet_to_tun, write_packets_to_tun, DnsInflight, TunWriteStats, PACKET_BUF_SIZE,
 };
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
 
@@ -2636,61 +2636,6 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1}KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes}B")
-    }
-}
-
-#[derive(Debug)]
-struct DnsInflight {
-    max: usize,
-    current: usize,
-    dropped: u64,
-    completed: u64,
-}
-
-impl DnsInflight {
-    fn new(max: usize) -> Self {
-        assert!(max > 0, "in-flight limit must be greater than zero");
-        Self {
-            max,
-            current: 0,
-            dropped: 0,
-            completed: 0,
-        }
-    }
-
-    fn max(&self) -> usize {
-        self.max
-    }
-
-    fn current(&self) -> usize {
-        self.current
-    }
-
-    #[cfg(test)]
-    fn dropped(&self) -> u64 {
-        self.dropped
-    }
-
-    #[cfg(test)]
-    fn completed(&self) -> u64 {
-        self.completed
-    }
-
-    fn try_admit(&mut self) -> bool {
-        if self.current >= self.max {
-            self.dropped = self.dropped.saturating_add(1);
-            return false;
-        }
-
-        self.current += 1;
-        true
-    }
-
-    fn complete(&mut self) {
-        if self.current > 0 {
-            self.current -= 1;
-            self.completed = self.completed.saturating_add(1);
-        }
     }
 }
 

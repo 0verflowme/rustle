@@ -81,6 +81,61 @@ impl TunWriteStats {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct DnsInflight {
+    max: usize,
+    current: usize,
+    dropped: u64,
+    completed: u64,
+}
+
+impl DnsInflight {
+    pub(crate) fn new(max: usize) -> Self {
+        assert!(max > 0, "in-flight limit must be greater than zero");
+        Self {
+            max,
+            current: 0,
+            dropped: 0,
+            completed: 0,
+        }
+    }
+
+    pub(crate) fn max(&self) -> usize {
+        self.max
+    }
+
+    pub(crate) fn current(&self) -> usize {
+        self.current
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed(&self) -> u64 {
+        self.completed
+    }
+
+    pub(crate) fn try_admit(&mut self) -> bool {
+        if self.current >= self.max {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+
+        self.current += 1;
+        true
+    }
+
+    pub(crate) fn complete(&mut self) {
+        if self.current > 0 {
+            self.current -= 1;
+            self.completed = self.completed.saturating_add(1);
+        }
+    }
+}
+
 pub(crate) async fn write_packets_to_tun(
     dev: &tun_rs::AsyncDevice,
     packets: &mut Vec<tcp_core::PacketBuf>,
