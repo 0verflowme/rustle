@@ -49,6 +49,7 @@ mod supervisor;
 #[allow(dead_code)]
 mod tcp_core;
 mod transport_model;
+mod tunnel_lifecycle;
 
 #[cfg(test)]
 use agent_bridge::{
