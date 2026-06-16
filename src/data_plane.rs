@@ -12,7 +12,10 @@ use crate::agent_bridge::{
 #[cfg(test)]
 use crate::agent_transport;
 use crate::ssh_control::SshSessionPool;
-use crate::transport_model::Destination;
+use crate::transport_model::{
+    DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent,
+    UdpAssociationEvents, UdpFlowKey,
+};
 use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core};
 
 pub(crate) const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
@@ -25,47 +28,25 @@ pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DataPlaneReconnectSnapshot {
-    pub(crate) attempts: u64,
-    pub(crate) successes: u64,
-    pub(crate) failures: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct DataPlaneRuntimeSnapshot {
-    pub(crate) reconnects: DataPlaneReconnectSnapshot,
-    pub(crate) lanes_total: usize,
-    pub(crate) lanes_desired: usize,
-    pub(crate) lanes_available: usize,
-    pub(crate) lanes_failed: usize,
-    pub(crate) lanes_missing: usize,
-    pub(crate) lanes_quarantined: usize,
-    pub(crate) lanes_repairing: usize,
-    pub(crate) active_streams: usize,
-    pub(crate) max_lane_load: usize,
-    pub(crate) max_quarantine_ms: u64,
-}
-
-impl From<AgentBridgeSnapshot> for DataPlaneRuntimeSnapshot {
-    fn from(snapshot: AgentBridgeSnapshot) -> Self {
-        Self {
-            reconnects: DataPlaneReconnectSnapshot {
-                attempts: snapshot.reconnects.attempts,
-                successes: snapshot.reconnects.successes,
-                failures: snapshot.reconnects.failures,
-            },
-            lanes_total: snapshot.lanes_total,
-            lanes_desired: snapshot.lanes_desired,
-            lanes_available: snapshot.lanes_available,
-            lanes_failed: snapshot.lanes_failed,
-            lanes_missing: snapshot.lanes_missing,
-            lanes_quarantined: snapshot.lanes_quarantined,
-            lanes_repairing: snapshot.lanes_repairing,
-            active_streams: snapshot.active_streams,
-            max_lane_load: snapshot.max_lane_load,
-            max_quarantine_ms: snapshot.max_quarantine_ms,
-        }
+fn data_plane_runtime_snapshot_from_agent(
+    snapshot: AgentBridgeSnapshot,
+) -> DataPlaneRuntimeSnapshot {
+    DataPlaneRuntimeSnapshot {
+        reconnects: DataPlaneReconnectSnapshot {
+            attempts: snapshot.reconnects.attempts,
+            successes: snapshot.reconnects.successes,
+            failures: snapshot.reconnects.failures,
+        },
+        lanes_total: snapshot.lanes_total,
+        lanes_desired: snapshot.lanes_desired,
+        lanes_available: snapshot.lanes_available,
+        lanes_failed: snapshot.lanes_failed,
+        lanes_missing: snapshot.lanes_missing,
+        lanes_quarantined: snapshot.lanes_quarantined,
+        lanes_repairing: snapshot.lanes_repairing,
+        active_streams: snapshot.active_streams,
+        max_lane_load: snapshot.max_lane_load,
+        max_quarantine_ms: snapshot.max_quarantine_ms,
     }
 }
 
@@ -86,7 +67,7 @@ impl BridgeRuntime {
     pub(crate) async fn snapshot(&self) -> DataPlaneRuntimeSnapshot {
         match self {
             Self::DirectTcpip(_) | Self::QuicNative(_) => DataPlaneRuntimeSnapshot::default(),
-            Self::Agent(agent) => agent.snapshot().await.into(),
+            Self::Agent(agent) => data_plane_runtime_snapshot_from_agent(agent.snapshot().await),
         }
     }
 
@@ -719,82 +700,6 @@ impl UdpAssociationTransport {
             Self::QuicNative(_) => "quic-native",
         }
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct DnsResponseEvent {
-    pub(crate) request: dns::UdpDnsRequest,
-    pub(crate) result: std::result::Result<Bytes, String>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct UdpFlowKey {
-    pub(crate) src_ip: Ipv4Addr,
-    pub(crate) src_port: u16,
-    pub(crate) dst_ip: Ipv4Addr,
-    pub(crate) dst_port: u16,
-}
-
-impl UdpFlowKey {
-    pub(crate) fn from_packet(packet: &dns::UdpPacket) -> Self {
-        Self {
-            src_ip: packet.src_ip,
-            src_port: packet.src_port,
-            dst_ip: packet.dst_ip,
-            dst_port: packet.dst_port,
-        }
-    }
-
-    pub(crate) fn response_template(self) -> dns::UdpPacket {
-        dns::UdpPacket {
-            src_ip: self.src_ip,
-            src_port: self.src_port,
-            dst_ip: self.dst_ip,
-            dst_port: self.dst_port,
-            payload: Bytes::new(),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct UdpAssociation {
-    pub(crate) to_remote: mpsc::Sender<Bytes>,
-}
-
-#[derive(Clone)]
-pub(crate) struct UdpAssociationEvents {
-    pub(crate) response_tx: mpsc::Sender<UdpResponseEvent>,
-    pub(crate) close_tx: mpsc::Sender<UdpClosedEvent>,
-}
-
-impl UdpAssociationEvents {
-    pub(crate) fn try_send_response(&self, key: UdpFlowKey, payload: Bytes) -> bool {
-        match self.response_tx.try_send(UdpResponseEvent { key, payload }) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => false,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    }
-
-    pub(crate) fn try_send_closed(&self, key: UdpFlowKey, error: Option<String>) -> bool {
-        match self.close_tx.try_send(UdpClosedEvent { key, error }) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => false,
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct UdpResponseEvent {
-    pub(crate) key: UdpFlowKey,
-    pub(crate) payload: Bytes,
-}
-
-#[derive(Debug)]
-pub(crate) struct UdpClosedEvent {
-    pub(crate) key: UdpFlowKey,
-    pub(crate) error: Option<String>,
 }
 
 enum AgentIoStream {

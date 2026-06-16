@@ -68,8 +68,7 @@ use data_plane::{
     bridge_admission_decision, query_dns_over_agent, query_dns_over_agent_udp,
     query_udp_over_agent, run_udp_association, run_udp_association_transport,
     send_dns_response_event, spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot,
-    DnsResponseEvent, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
+    BridgeAdmissionDecision, UdpAssociationTransport,
 };
 use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
@@ -107,9 +106,12 @@ use supervisor::{
     RouteCommandExecutor,
 };
 use supervisor::{parse_target_cidr, run_tun_capture, run_tunnel};
-#[cfg(test)]
-use transport_model::Destination;
 use transport_model::{parse_destination, BridgeRuntimeOptions, BridgeTransportKind};
+#[cfg(test)]
+use transport_model::{
+    DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent,
+    UdpAssociation, UdpAssociationEvents, UdpFlowKey,
+};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;

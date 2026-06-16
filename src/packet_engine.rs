@@ -10,11 +10,13 @@ use tokio::sync::mpsc;
 
 use crate::data_plane::{
     bridge_admission_decision, spawn_dns_query, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, BridgeRuntime, DataPlaneRuntimeSnapshot, DnsResponseEvent,
-    DnsTransport, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
+    BridgeAdmissionDecision, BridgeRuntime, DnsTransport, UdpAssociationTransport,
     UDP_DATAGRAMS_PER_ASSOCIATION,
 };
-use crate::transport_model::Destination;
+use crate::transport_model::{
+    DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent, UdpAssociation, UdpAssociationEvents,
+    UdpFlowKey,
+};
 use crate::{dns, ssh_bridge, tcp_core, DEFAULT_TUN_IP};
 
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;
