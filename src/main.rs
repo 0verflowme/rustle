@@ -19,6 +19,7 @@ mod data_plane;
 mod defaults;
 mod dns;
 mod helper_runtime;
+mod known_hosts;
 mod lab_support;
 mod packet_engine;
 mod platform;

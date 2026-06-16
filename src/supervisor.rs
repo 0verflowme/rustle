@@ -4,7 +4,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::control_plane::connect_bridge_runtime;
+use crate::control_plane::{connect_bridge_runtime, validate_agent_session_request_count};
 use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
@@ -16,7 +16,7 @@ use crate::remote_helper::bridge_agent_command_plan;
 use crate::routing::{
     add_target_routes, expand_target_routes, ssh_control_ip_to_protect, target_route_parts,
 };
-use crate::ssh_control::{validate_agent_session_request_count, validate_ssh_session_count};
+use crate::ssh_control::validate_ssh_session_count;
 use crate::transport_model::{
     parse_destination, BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsResponseEvent,
     UdpAssociationEvents,

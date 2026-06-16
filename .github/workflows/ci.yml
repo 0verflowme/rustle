@@ -216,7 +216,7 @@ jobs:
           RUSTLE_BENCH_WARMUP_RUNS: 0
           RUSTLE_BENCH_BODY_BYTES: 1024
           RUSTLE_BENCH_CONNECTIONS: 1
-          RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent direct-tcpip quic-native
+          RUSTLE_BENCH_BRIDGE_TRANSPORTS: agent quic-native
           RUSTLE_BENCH_MAX_ELAPSED_MS: 2000
           RUSTLE_BENCH_MAX_P50_US: 25000
         run: bash scripts/bench-bridge-lab.sh

@@ -86,10 +86,10 @@ stay above a fraction of the primary `agent` path on the same body/connection
 matrix, and `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` to bound native QUIC
 tiny-response p50 against `agent`.
 `scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
-with both elapsed and median measured `p50_us` ceilings across `agent`,
-`direct-tcpip`, and `quic-native`, runs a 1 MiB / 1-flow gate, and runs a
-100 MiB single-flow throughput gate through both the primary `agent` transport
-and `quic-native`
+with both elapsed and median measured `p50_us` ceilings across the fast-path
+transports, `agent` and `quic-native`, runs a 1 MiB / 1-flow gate that keeps
+`direct-tcpip` under compatibility throughput coverage, and runs a 100 MiB single-flow throughput gate
+through both the primary `agent` transport and `quic-native`
 (`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
 proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
 release-mode code. Together these guard against a debug binary, multi-second

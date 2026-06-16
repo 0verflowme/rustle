@@ -11,8 +11,7 @@ use crate::agent_bridge::{
 use crate::bridge_runtime::{BridgeRuntime, DnsTransport};
 use crate::remote_helper::{HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
-    connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, resolve_agent_session_count,
-    Client, PreparedSshConnection,
+    connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, Client, PreparedSshConnection,
 };
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destination};
 use crate::{agent_proto, agent_transport, SshArgs};
@@ -23,7 +22,8 @@ mod quic_startup;
 
 pub(crate) use agent_startup::{
     connect_agent_bridge_transports_from_connector,
-    connect_auto_agent_bridge_transports_from_connector, should_fast_start_agent_lanes,
+    connect_auto_agent_bridge_transports_from_connector, resolve_agent_session_count,
+    should_fast_start_agent_lanes, validate_agent_session_request_count,
 };
 use helper_startup::{connect_helper_with_upload_fallback, connect_uploaded_helper};
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
