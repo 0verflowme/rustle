@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
@@ -10,10 +11,10 @@ use crate::agent_bridge::{
     AgentBridgeTransport, QuicNativeBridge, ReconnectingAgentBridge,
 };
 use crate::bridge_runtime::{BridgeRuntime, DnsTransport};
-use crate::remote_helper::{stage_uploaded_helper_command, HelperCommandPlan, HelperKind};
+use crate::remote_helper::{bootstrap_helper, HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
-    connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,
-    resolve_agent_session_count, resolve_ssh_target, Client, PreparedSshConnection,
+    connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, resolve_agent_session_count,
+    Client, PreparedSshConnection,
 };
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destination};
 use crate::{agent_proto, agent_transport, quic_agent, quic_agent_runtime, SshArgs};
@@ -45,41 +46,24 @@ impl SshAgentBridgeConnector {
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        match connect_agent_bridge_transport_fresh_prepared_ssh_command(
-            &self.prepared,
-            &self.helper_plan.command,
-            self.mtu,
+        connect_helper_with_upload_fallback(
+            &self.helper_plan,
+            connect_agent_bridge_transport_fresh_prepared_ssh_command(
+                &self.prepared,
+                &self.helper_plan.command,
+                self.mtu,
+            ),
+            || {
+                connect_uploaded_agent_bridge_transport_prepared(
+                    &self.prepared,
+                    &self.helper_plan,
+                    self.mtu,
+                )
+            },
+            "Rustle agent",
+            Some("agent: bootstrapped remote agent from local binary"),
         )
         .await
-        {
-            Ok(agent) => Ok(agent),
-            Err(initial_err) => {
-                if !self.helper_plan.allows_upload_fallback() {
-                    return Err(initial_err).with_context(|| {
-                        format!(
-                            "failed to start Rustle agent via explicit command: {}",
-                            self.helper_plan.command
-                        )
-                    });
-                }
-                eprintln!(
-                    "agent: remote command failed ({initial_err:#}); trying upload bootstrap"
-                );
-                match connect_uploaded_agent_bridge_transport_prepared(&self.prepared, self.mtu)
-                    .await
-                {
-                    Ok(agent) => {
-                        eprintln!("agent: bootstrapped remote agent from local binary");
-                        Ok(agent)
-                    }
-                    Err(bootstrap_err) => Err(bootstrap_err).with_context(|| {
-                        format!(
-                            "failed to start Rustle agent via command ({initial_err:#}) or upload bootstrap"
-                        )
-                    }),
-                }
-            }
-        }
     }
 }
 
@@ -126,44 +110,24 @@ impl SshQuicAgentBridgeConnector {
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        match connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
-            &self.prepared,
-            &self.helper_plan.command,
-            self.mtu,
-        )
-        .await
-        {
-            Ok(agent) => Ok(agent),
-            Err(initial_err) => {
-                if !self.helper_plan.allows_upload_fallback() {
-                    return Err(initial_err).with_context(|| {
-                        format!(
-                            "failed to start Rustle QUIC agent via explicit command: {}",
-                            self.helper_plan.command
-                        )
-                    });
-                }
-                eprintln!(
-                    "quic-agent: remote command failed ({initial_err:#}); trying upload bootstrap"
-                );
-                match connect_uploaded_quic_agent_bridge_transport_prepared(
+        connect_helper_with_upload_fallback(
+            &self.helper_plan,
+            connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
+                &self.prepared,
+                &self.helper_plan.command,
+                self.mtu,
+            ),
+            || {
+                connect_uploaded_quic_agent_bridge_transport_prepared(
                     &self.prepared,
+                    &self.helper_plan,
                     self.mtu,
                 )
-                .await
-                {
-                    Ok(agent) => {
-                        eprintln!("quic-agent: bootstrapped remote helper from local binary");
-                        Ok(agent)
-                    }
-                    Err(bootstrap_err) => Err(bootstrap_err).with_context(|| {
-                        format!(
-                            "failed to start Rustle QUIC agent via command ({initial_err:#}) or upload bootstrap"
-                        )
-                    }),
-                }
-            }
-        }
+            },
+            "Rustle QUIC agent",
+            Some("quic-agent: bootstrapped remote helper from local binary"),
+        )
+        .await
     }
 }
 
@@ -295,31 +259,16 @@ async fn connect_quic_native_bridge_fresh_ssh_command(
     ssh: &SshArgs,
     helper_plan: &HelperCommandPlan,
 ) -> Result<QuicNativeBridge> {
-    let target = resolve_ssh_target(ssh)?;
-    let handle = connect_ssh(ssh).await?;
-    match connect_quic_native_bridge_on_handle(handle, &target.host, &helper_plan.command).await {
-        Ok(bridge) => Ok(bridge),
-        Err(initial_err) => {
-            if !helper_plan.allows_upload_fallback() {
-                return Err(initial_err).with_context(|| {
-                    format!(
-                        "failed to start native QUIC bridge via explicit command: {}",
-                        helper_plan.command
-                    )
-                });
-            }
-            eprintln!(
-                "quic-native: remote command failed ({initial_err:#}); trying upload bootstrap"
-            );
-            connect_uploaded_quic_native_bridge(ssh)
-                .await
-                .map_err(|bootstrap_err| {
-                    bootstrap_err.context(format!(
-                        "failed to start native QUIC bridge via command ({initial_err:#}) or upload bootstrap"
-                    ))
-                })
-        }
-    }
+    let prepared = prepare_ssh_connection(ssh)?;
+    let handle = connect_prepared_ssh(&prepared).await?;
+    connect_helper_with_upload_fallback(
+        helper_plan,
+        connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &helper_plan.command),
+        || connect_uploaded_quic_native_bridge_prepared(&prepared, helper_plan),
+        "native QUIC bridge",
+        None,
+    )
+    .await
 }
 
 async fn connect_quic_native_bridge_on_handle(
@@ -394,51 +343,120 @@ fn resolve_quic_agent_addr(remote_host: &str, port: u16) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("no socket addresses found for QUIC agent {remote_host}:{port}"))
 }
 
+async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
+    helper_plan: &HelperCommandPlan,
+    primary: PrimaryFut,
+    upload: UploadFn,
+    helper_name: &str,
+    upload_success_log: Option<&str>,
+) -> Result<T>
+where
+    PrimaryFut: Future<Output = Result<T>>,
+    UploadFn: FnOnce() -> UploadFut,
+    UploadFut: Future<Output = Result<T>>,
+{
+    match primary.await {
+        Ok(started) => Ok(started),
+        Err(initial_err) => {
+            if !helper_plan.allows_upload_fallback() {
+                return Err(initial_err).with_context(|| {
+                    format!(
+                        "failed to start {helper_name} via explicit command: {}",
+                        helper_plan.command
+                    )
+                });
+            }
+
+            let initial_err_detail = format!("{initial_err:#}");
+            eprintln!(
+                "{}: remote command failed ({initial_err_detail}); trying upload bootstrap",
+                helper_plan.kind.controller_log_prefix()
+            );
+            match upload().await {
+                Ok(started) => {
+                    if let Some(message) = upload_success_log {
+                        eprintln!("{message}");
+                    }
+                    Ok(started)
+                }
+                Err(bootstrap_err) => Err(bootstrap_err).with_context(|| {
+                    format!(
+                        "failed to start {helper_name} via command ({initial_err_detail}) or upload bootstrap"
+                    )
+                }),
+            }
+        }
+    }
+}
+
 async fn connect_uploaded_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
+    helper_plan: &HelperCommandPlan,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    connect_uploaded_stdio_agent_bridge_transport_prepared(prepared, mtu)
+    connect_uploaded_stdio_agent_bridge_transport_prepared(prepared, helper_plan, mtu)
         .await
         .map(|(transport, _)| transport)
 }
 
 async fn connect_uploaded_stdio_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
+    helper_plan: &HelperCommandPlan,
     mtu: u16,
 ) -> Result<(AgentBridgeTransport, String)> {
-    let handle = connect_prepared_ssh(prepared).await?;
     let kind = HelperKind::StdioAgent;
-    let helper = stage_uploaded_helper_command(&handle, kind).await?;
-    let transport = connect_agent_bridge_transport_on_handle(handle, &helper.command, mtu)
-        .await
-        .with_context(|| kind.uploaded_start_context(&helper.remote_path))?;
-    Ok((transport, helper.command))
+    ensure_helper_plan_kind(helper_plan, kind)?;
+    let started = bootstrap_helper(prepared, helper_plan).await?;
+    let transport =
+        connect_agent_bridge_transport_on_handle(started.handle, &started.helper.command, mtu)
+            .await
+            .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))?;
+    Ok((transport, started.helper.command))
 }
 
 async fn connect_uploaded_quic_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
+    helper_plan: &HelperCommandPlan,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    let handle = connect_prepared_ssh(prepared).await?;
-    let helper = stage_uploaded_helper_command(&handle, HelperKind::QuicAgent).await?;
+    let kind = HelperKind::QuicAgent;
+    ensure_helper_plan_kind(helper_plan, kind)?;
+    let started = bootstrap_helper(prepared, helper_plan).await?;
     connect_quic_agent_bridge_transport_on_handle(
-        handle,
+        started.handle,
         prepared.remote_host(),
-        &helper.command,
+        &started.helper.command,
         mtu,
     )
     .await
-    .with_context(|| HelperKind::QuicAgent.uploaded_start_context(&helper.remote_path))
+    .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))
 }
 
-async fn connect_uploaded_quic_native_bridge(ssh: &SshArgs) -> Result<QuicNativeBridge> {
-    let prepared = prepare_ssh_connection(ssh)?;
-    let handle = connect_prepared_ssh(&prepared).await?;
-    let helper = stage_uploaded_helper_command(&handle, HelperKind::QuicBridgeNative).await?;
-    connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &helper.command)
-        .await
-        .with_context(|| HelperKind::QuicBridgeNative.uploaded_start_context(&helper.remote_path))
+async fn connect_uploaded_quic_native_bridge_prepared(
+    prepared: &PreparedSshConnection,
+    helper_plan: &HelperCommandPlan,
+) -> Result<QuicNativeBridge> {
+    let kind = HelperKind::QuicBridgeNative;
+    ensure_helper_plan_kind(helper_plan, kind)?;
+    let started = bootstrap_helper(prepared, helper_plan).await?;
+    connect_quic_native_bridge_on_handle(
+        started.handle,
+        prepared.remote_host(),
+        &started.helper.command,
+    )
+    .await
+    .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))
+}
+
+fn ensure_helper_plan_kind(plan: &HelperCommandPlan, expected: HelperKind) -> Result<()> {
+    if plan.kind != expected {
+        bail!(
+            "helper startup plan kind mismatch: expected {:?}, got {:?}",
+            expected,
+            plan.kind
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn connect_bridge_runtime(

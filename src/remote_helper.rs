@@ -10,7 +10,7 @@ use ring::digest;
 use russh::client::Handle;
 use tokio::io::AsyncReadExt;
 
-use crate::ssh_control::Client;
+use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 use crate::transport_model::BridgeTransportKind;
 
 pub(crate) const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
@@ -183,12 +183,22 @@ impl HelperCommandPlan {
     }
 
     pub(crate) fn allows_upload_fallback(&self) -> bool {
+        self.policy.allows_upload()
+    }
+}
+
+impl BootstrapPolicy {
+    pub(crate) fn allows_upload(self) -> bool {
         matches!(
-            self.policy,
-            BootstrapPolicy::BuiltInCommandWithUploadFallback
-                | BootstrapPolicy::ExplicitUploadAllowed
+            self,
+            Self::BuiltInCommandWithUploadFallback | Self::ExplicitUploadAllowed
         )
     }
+}
+
+pub(crate) struct BootstrappedHelper {
+    pub(crate) handle: Handle<Client>,
+    pub(crate) helper: UploadedHelperCommand,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -316,6 +326,21 @@ pub(crate) async fn stage_uploaded_helper_command(
         local_path,
         remote_path,
     ))
+}
+
+pub(crate) async fn bootstrap_helper(
+    prepared: &PreparedSshConnection,
+    plan: &HelperCommandPlan,
+) -> Result<BootstrappedHelper> {
+    if !plan.policy.allows_upload() {
+        bail!(
+            "{}: upload bootstrap is not allowed for this helper startup policy",
+            plan.kind.controller_log_prefix()
+        );
+    }
+    let handle = connect_prepared_ssh(prepared).await?;
+    let helper = stage_uploaded_helper_command(&handle, plan.kind).await?;
+    Ok(BootstrappedHelper { handle, helper })
 }
 
 fn helper_uses_sidecar(current_exe: &Path, local_path: &Path) -> bool {
@@ -940,6 +965,7 @@ mod tests {
         let built_in = HelperCommandPlan::from_command_options(HelperKind::StdioAgent, None, None)
             .expect("built-in command plan");
         assert!(built_in.allows_upload_fallback());
+        assert!(built_in.policy.allows_upload());
 
         let explicit_command = HelperCommandPlan::from_command_options(
             HelperKind::QuicAgent,
@@ -948,6 +974,7 @@ mod tests {
         )
         .expect("explicit command plan");
         assert!(!explicit_command.allows_upload_fallback());
+        assert!(!explicit_command.policy.allows_upload());
 
         let explicit_path = HelperCommandPlan::from_command_options(
             HelperKind::QuicBridgeNative,
@@ -956,6 +983,7 @@ mod tests {
         )
         .expect("explicit path plan");
         assert!(!explicit_path.allows_upload_fallback());
+        assert!(!explicit_path.policy.allows_upload());
 
         let explicit_upload = HelperCommandPlan {
             kind: HelperKind::StdioAgent,
@@ -963,6 +991,7 @@ mod tests {
             policy: BootstrapPolicy::ExplicitUploadAllowed,
         };
         assert!(explicit_upload.allows_upload_fallback());
+        assert!(explicit_upload.policy.allows_upload());
     }
 
     #[test]
