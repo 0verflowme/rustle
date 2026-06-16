@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use russh::client::Handle;
@@ -28,6 +29,7 @@ pub(crate) use agent_startup::{
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const QUIC_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone)]
 pub(crate) struct SshAgentBridgeConnector {
@@ -243,7 +245,12 @@ async fn connect_quic_agent_bridge_transport_on_handle(
     );
 
     let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
-    let client = quic_agent_runtime::connect_quic_agent(remote_addr, &bootstrap, mtu).await?;
+    let client = connect_quic_data_plane(
+        "quic-agent",
+        remote_addr,
+        quic_agent_runtime::connect_quic_agent(remote_addr, &bootstrap, mtu),
+    )
+    .await?;
     let (transport, session) = client.into_transport_and_session();
 
     Ok(AgentBridgeTransport::quic(
@@ -305,11 +312,68 @@ async fn connect_quic_native_bridge_on_handle(
     );
 
     let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
-    let client = quic_agent::connect_quic_bridge(remote_addr, &bootstrap).await?;
+    let client = connect_quic_data_plane(
+        "quic-native",
+        remote_addr,
+        quic_agent::connect_quic_bridge(remote_addr, &bootstrap),
+    )
+    .await?;
 
     Ok(QuicNativeBridge::with_ssh_carrier(
         client, handle, drain_task,
     ))
+}
+
+async fn connect_quic_data_plane<T, F>(
+    label: &'static str,
+    remote_addr: SocketAddr,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    connect_quic_data_plane_with_timeout(
+        label,
+        remote_addr,
+        QUIC_DATA_PLANE_CONNECT_TIMEOUT,
+        future,
+    )
+    .await
+}
+
+async fn connect_quic_data_plane_with_timeout<T, F>(
+    label: &'static str,
+    remote_addr: SocketAddr,
+    timeout: Duration,
+    future: F,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match tokio::time::timeout(timeout, future).await {
+        Ok(result) => result.with_context(|| quic_data_plane_error_context(label, remote_addr)),
+        Err(_) => bail!(
+            "{}",
+            quic_data_plane_timeout_context(label, remote_addr, timeout)
+        ),
+    }
+}
+
+fn quic_data_plane_error_context(label: &str, remote_addr: SocketAddr) -> String {
+    format!(
+        "{label}: failed to establish UDP data plane to {remote_addr} after SSH bootstrap; inbound UDP to the helper port may be blocked, or the advertised address may be unreachable"
+    )
+}
+
+fn quic_data_plane_timeout_context(
+    label: &str,
+    remote_addr: SocketAddr,
+    timeout: Duration,
+) -> String {
+    format!(
+        "{label}: timed out after {}ms establishing UDP data plane to {remote_addr} after SSH bootstrap; inbound UDP to the helper port may be blocked, or the advertised address may be unreachable",
+        timeout.as_millis()
+    )
 }
 
 async fn drain_quic_agent_ssh_output<R>(mut reader: BufReader<R>)
@@ -625,4 +689,54 @@ fn ensure_agent_dns_remote_supported(
         "agent DNS transport to hostname {} requires hostname TCP connect support",
         remote.host
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use anyhow::{anyhow, Result};
+
+    use super::connect_quic_data_plane_with_timeout;
+
+    #[tokio::test]
+    async fn quic_data_plane_error_context_explains_udp_reachability() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 4433);
+        let err = connect_quic_data_plane_with_timeout(
+            "quic-native",
+            remote,
+            Duration::from_secs(1),
+            async { Err::<(), _>(anyhow!("handshake failed")) },
+        )
+        .await
+        .expect_err("expected wrapped QUIC data-plane error");
+        let detail = format!("{err:#}");
+
+        assert!(detail.contains("quic-native: failed to establish UDP data plane"));
+        assert!(detail.contains("203.0.113.7:4433"));
+        assert!(detail.contains("after SSH bootstrap"));
+        assert!(detail.contains("inbound UDP to the helper port may be blocked"));
+        assert!(detail.contains("handshake failed"));
+    }
+
+    #[tokio::test]
+    async fn quic_data_plane_timeout_context_explains_udp_reachability() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 4444);
+        let err = connect_quic_data_plane_with_timeout(
+            "quic-agent",
+            remote,
+            Duration::from_millis(1),
+            future::pending::<Result<()>>(),
+        )
+        .await
+        .expect_err("expected QUIC data-plane timeout");
+        let detail = format!("{err:#}");
+
+        assert!(detail.contains("quic-agent: timed out after 1ms"));
+        assert!(detail.contains("198.51.100.9:4444"));
+        assert!(detail.contains("after SSH bootstrap"));
+        assert!(detail.contains("advertised address may be unreachable"));
+    }
 }

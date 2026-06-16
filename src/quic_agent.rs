@@ -982,6 +982,34 @@ mod tests {
     }
 
     #[test]
+    fn bridge_bootstrap_line_round_trips_with_bridge_magic() {
+        let bootstrap = QuicAgentBootstrap {
+            port: 4434,
+            cert_der: vec![0x10, 0x20, 0xfe, 0xff],
+            cert_sha256: sha256_hex(&[0x10, 0x20, 0xfe, 0xff]),
+        };
+        let line = bootstrap.encode_bridge_line();
+
+        assert!(line.starts_with(QUIC_BRIDGE_BOOTSTRAP_MAGIC));
+        assert_eq!(
+            QuicAgentBootstrap::decode_bridge_line(&line).unwrap(),
+            bootstrap
+        );
+    }
+
+    #[test]
+    fn bridge_bootstrap_line_rejects_agent_magic() {
+        let bootstrap = QuicAgentBootstrap {
+            port: 4434,
+            cert_der: vec![4, 5, 6],
+            cert_sha256: sha256_hex(&[4, 5, 6]),
+        };
+
+        assert!(QuicAgentBootstrap::decode_bridge_line(&bootstrap.encode_line()).is_err());
+        assert!(QuicAgentBootstrap::decode_line(&bootstrap.encode_bridge_line()).is_err());
+    }
+
+    #[test]
     fn bootstrap_line_rejects_tampered_cert() {
         let bootstrap = QuicAgentBootstrap {
             port: 4433,
