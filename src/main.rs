@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 #[cfg(test)]
 use std::time::Duration;
@@ -49,9 +47,13 @@ mod tunnel_lifecycle;
 #[cfg(test)]
 use agent_bridge::{
     agent_host_lane_index, agent_lane_backoff_duration, agent_lane_bit, agent_lane_index,
-    AgentBridgeCarrier, AgentBridgeConnectFuture, AgentBridgeConnectManyFuture,
-    AgentBridgeTransport, AgentReconnectSnapshot, ReconnectingAgentBridge, AGENT_LANE_BACKOFF_BASE,
-    AGENT_LANE_BACKOFF_MAX,
+    test_support::{
+        agent_transport_closes_after_first_open, agent_transport_closes_after_opened,
+        agent_transport_pair, detached_bridge_transport, wait_for_reconnect_snapshot,
+        wait_for_transport_failure, QueuedAgentConnector,
+    },
+    AgentBridgeCarrier, AgentBridgeTransport, AgentReconnectSnapshot, ReconnectingAgentBridge,
+    AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
 use agent_lab::{run_agent_dns_lab, run_agent_lab, run_agent_udp_lab};
 use bridge_lab::run_bridge_lab;
@@ -59,10 +61,7 @@ use cli::{Cli, CommandKind};
 pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 use command_runtime::{run_compact_tunnel, run_direct_tcpip};
 #[cfg(test)]
-use control_plane::{
-    connect_agent_bridge_transports_from_connector,
-    connect_auto_agent_bridge_transports_from_connector,
-};
+use control_plane::connect_auto_agent_bridge_transports_from_connector;
 #[cfg(test)]
 use data_plane::spawn_agent_tcp_bridge;
 use helper_runtime::{run_agent, run_quic_agent, run_quic_bridge_agent};
@@ -97,8 +96,6 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use crate::agent_bridge::AgentBridgeConnector;
-    use anyhow::anyhow;
-    use std::sync::Arc;
 
     #[test]
     fn agent_lane_index_spreads_many_flows_across_pool() {
@@ -150,318 +147,6 @@ mod tests {
         assert_eq!(later, AGENT_LANE_BACKOFF_MAX);
         assert!(shifted_lane > first);
         assert!(shifted_lane <= AGENT_LANE_BACKOFF_MAX);
-    }
-
-    async fn test_agent_transport() -> (
-        agent_transport::AgentTransport,
-        tokio::task::JoinHandle<Result<()>>,
-    ) {
-        let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
-        let (agent_reader, agent_writer) = tokio::io::split(agent_io);
-        let agent = tokio::spawn(agent_runtime::run(
-            agent_reader,
-            agent_writer,
-            agent_runtime::AgentRuntimeConfig::new(DEFAULT_MTU),
-        ));
-
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let transport =
-            agent_transport::AgentTransport::connect(client_reader, client_writer, DEFAULT_MTU)
-                .await
-                .expect("connect test agent transport");
-        (transport, agent)
-    }
-
-    async fn test_agent_transport_closes_after_first_open(
-    ) -> (agent_transport::AgentTransport, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-
-        async fn read_test_agent_frame<R: AsyncRead + Unpin>(
-            reader: &mut R,
-            inbound: &mut BytesMut,
-        ) -> agent_proto::AgentFrame {
-            loop {
-                if let Some(frame) =
-                    agent_proto::try_decode_frame(inbound).expect("decode test agent frame")
-                {
-                    return frame;
-                }
-
-                let mut buf = [0_u8; 8192];
-                let read = reader.read(&mut buf).await.expect("read test agent frame");
-                assert_ne!(read, 0, "test agent stream closed before next frame");
-                inbound.extend_from_slice(&buf[..read]);
-            }
-        }
-
-        let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
-        let agent = tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(agent_io);
-            let mut inbound = BytesMut::new();
-
-            let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
-            assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
-            let hello = agent_proto::AgentFrame::new(
-                agent_proto::AgentFrameKind::Hello,
-                0,
-                agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
-            )
-            .expect("test hello frame");
-            let encoded = agent_proto::encode_frame(&hello).expect("encode test hello");
-            writer.write_all(&encoded).await.expect("write test hello");
-            writer.flush().await.expect("flush test hello");
-
-            let open = read_test_agent_frame(&mut reader, &mut inbound).await;
-            assert!(
-                matches!(
-                    open.kind,
-                    agent_proto::AgentFrameKind::OpenTcp
-                        | agent_proto::AgentFrameKind::OpenTcpHost
-                        | agent_proto::AgentFrameKind::OpenUdp
-                ),
-                "expected first stream open frame, got {:?}",
-                open.kind
-            );
-        });
-
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let transport =
-            agent_transport::AgentTransport::connect(client_reader, client_writer, DEFAULT_MTU)
-                .await
-                .expect("connect closing test agent transport");
-        (transport, agent)
-    }
-
-    async fn test_agent_transport_closes_after_opened() -> (
-        agent_transport::AgentTransport,
-        tokio::task::JoinHandle<()>,
-        tokio::sync::oneshot::Sender<()>,
-    ) {
-        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-
-        async fn read_test_agent_frame<R: AsyncRead + Unpin>(
-            reader: &mut R,
-            inbound: &mut BytesMut,
-        ) -> agent_proto::AgentFrame {
-            loop {
-                if let Some(frame) =
-                    agent_proto::try_decode_frame(inbound).expect("decode test agent frame")
-                {
-                    return frame;
-                }
-
-                let mut buf = [0_u8; 8192];
-                let read = reader.read(&mut buf).await.expect("read test agent frame");
-                assert_ne!(read, 0, "test agent stream closed before next frame");
-                inbound.extend_from_slice(&buf[..read]);
-            }
-        }
-
-        let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
-        let (close_tx, close_rx) = tokio::sync::oneshot::channel();
-        let agent = tokio::spawn(async move {
-            let (mut reader, mut writer) = tokio::io::split(agent_io);
-            let mut inbound = BytesMut::new();
-
-            let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
-            assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
-            let hello = agent_proto::AgentFrame::new(
-                agent_proto::AgentFrameKind::Hello,
-                0,
-                agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
-            )
-            .expect("test hello frame");
-            let encoded = agent_proto::encode_frame(&hello).expect("encode test hello");
-            writer.write_all(&encoded).await.expect("write test hello");
-            writer.flush().await.expect("flush test hello");
-
-            let open = read_test_agent_frame(&mut reader, &mut inbound).await;
-            assert!(
-                matches!(
-                    open.kind,
-                    agent_proto::AgentFrameKind::OpenTcp
-                        | agent_proto::AgentFrameKind::OpenTcpHost
-                        | agent_proto::AgentFrameKind::OpenUdp
-                ),
-                "expected first stream open frame, got {:?}",
-                open.kind
-            );
-            let opened = agent_proto::AgentFrame::new(
-                agent_proto::AgentFrameKind::Opened,
-                open.stream_id,
-                Bytes::new(),
-            )
-            .expect("test opened frame")
-            .with_credit(1024);
-            let encoded = agent_proto::encode_frame(&opened).expect("encode test opened");
-            writer.write_all(&encoded).await.expect("write test opened");
-            writer.flush().await.expect("flush test opened");
-            let _ = close_rx.await;
-        });
-
-        let (client_reader, client_writer) = tokio::io::split(client_io);
-        let transport =
-            agent_transport::AgentTransport::connect(client_reader, client_writer, DEFAULT_MTU)
-                .await
-                .expect("connect closing test agent transport");
-        (transport, agent, close_tx)
-    }
-
-    struct QueuedAgentConnector {
-        primary_command: String,
-        forced_primary_failures: std::sync::Mutex<usize>,
-        forced_command_failures: std::sync::Mutex<usize>,
-        primary_transports: std::sync::Mutex<VecDeque<AgentBridgeTransport>>,
-        command_transports: std::sync::Mutex<VecDeque<AgentBridgeTransport>>,
-        command_requests: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl QueuedAgentConnector {
-        fn new(
-            primary_command: &str,
-            primary_transports: Vec<AgentBridgeTransport>,
-            command_transports: Vec<AgentBridgeTransport>,
-        ) -> Arc<Self> {
-            Self::new_with_failures(
-                primary_command,
-                primary_transports,
-                command_transports,
-                0,
-                0,
-            )
-        }
-
-        fn new_with_primary_failures(
-            primary_command: &str,
-            primary_transports: Vec<AgentBridgeTransport>,
-            command_transports: Vec<AgentBridgeTransport>,
-            forced_primary_failures: usize,
-        ) -> Arc<Self> {
-            Self::new_with_failures(
-                primary_command,
-                primary_transports,
-                command_transports,
-                forced_primary_failures,
-                0,
-            )
-        }
-
-        fn new_with_failures(
-            primary_command: &str,
-            primary_transports: Vec<AgentBridgeTransport>,
-            command_transports: Vec<AgentBridgeTransport>,
-            forced_primary_failures: usize,
-            forced_command_failures: usize,
-        ) -> Arc<Self> {
-            Arc::new(Self {
-                primary_command: primary_command.to_owned(),
-                forced_primary_failures: std::sync::Mutex::new(forced_primary_failures),
-                forced_command_failures: std::sync::Mutex::new(forced_command_failures),
-                primary_transports: std::sync::Mutex::new(VecDeque::from(primary_transports)),
-                command_transports: std::sync::Mutex::new(VecDeque::from(command_transports)),
-                command_requests: std::sync::Mutex::new(Vec::new()),
-            })
-        }
-
-        fn command_requests(&self) -> Vec<String> {
-            self.command_requests
-                .lock()
-                .expect("command request lock")
-                .clone()
-        }
-    }
-
-    impl AgentBridgeConnector for QueuedAgentConnector {
-        fn primary_command(&self) -> &str {
-            &self.primary_command
-        }
-
-        fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_> {
-            Box::pin(async move {
-                connect_agent_bridge_transports_from_connector(self, desired_sessions).await
-            })
-        }
-
-        fn connect_primary(&self) -> AgentBridgeConnectFuture<'_> {
-            Box::pin(async move {
-                {
-                    let mut forced_failures = self
-                        .forced_primary_failures
-                        .lock()
-                        .expect("primary failure counter lock");
-                    if *forced_failures > 0 {
-                        *forced_failures -= 1;
-                        return Err(anyhow!("test connector forced primary reconnect failure"));
-                    }
-                }
-                self.primary_transports
-                    .lock()
-                    .expect("primary transport queue lock")
-                    .pop_front()
-                    .ok_or_else(|| anyhow!("test connector has no primary transport"))
-            })
-        }
-
-        fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a> {
-            Box::pin(async move {
-                self.command_requests
-                    .lock()
-                    .expect("command request lock")
-                    .push(agent_command.to_owned());
-                {
-                    let mut forced_failures = self
-                        .forced_command_failures
-                        .lock()
-                        .expect("command failure counter lock");
-                    if *forced_failures > 0 {
-                        *forced_failures -= 1;
-                        return Err(anyhow!("test connector forced command lane failure"));
-                    }
-                }
-                self.command_transports
-                    .lock()
-                    .expect("command transport queue lock")
-                    .pop_front()
-                    .ok_or_else(|| {
-                        anyhow!("test connector has no command transport for {agent_command}")
-                    })
-            })
-        }
-    }
-
-    async fn wait_for_transport_failure(transport: &agent_transport::AgentTransport) {
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if transport.failure_message().await.is_some() {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("test agent transport reports failure");
-    }
-
-    async fn wait_for_reconnect_snapshot(
-        bridge: &ReconnectingAgentBridge,
-        expected: AgentReconnectSnapshot,
-    ) {
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if bridge.reconnect_snapshot() == expected {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("test agent bridge reaches reconnect snapshot");
-    }
-
-    fn detached_bridge_transport(
-        transport: agent_transport::AgentTransport,
-    ) -> AgentBridgeTransport {
-        AgentBridgeTransport::detached_for_test(transport, "rustle agent")
     }
 
     #[tokio::test]
@@ -606,9 +291,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_lane_selection_prefers_less_loaded_secondary_but_repairs_failed_primary() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let bridge = ReconnectingAgentBridge::new(
             QueuedAgentConnector::new(
                 "rustle agent",
@@ -657,14 +342,14 @@ mod tests {
 
     #[tokio::test]
     async fn agent_lane_selection_uses_least_loaded_healthy_lane_when_candidates_unhealthy() {
-        let (failed_primary_transport, failed_primary_agent) = test_agent_transport().await;
-        let (failed_secondary_transport, failed_secondary_agent) = test_agent_transport().await;
-        let (busy_transport, busy_agent) = test_agent_transport().await;
-        let (idle_transport, idle_agent) = test_agent_transport().await;
+        let (failed_primary_transport, failed_primary_agent) = agent_transport_pair().await;
+        let (failed_secondary_transport, failed_secondary_agent) = agent_transport_pair().await;
+        let (busy_transport, busy_agent) = agent_transport_pair().await;
+        let (idle_transport, idle_agent) = agent_transport_pair().await;
         let (primary_replacement_transport, primary_replacement_agent) =
-            test_agent_transport().await;
+            agent_transport_pair().await;
         let (secondary_replacement_transport, secondary_replacement_agent) =
-            test_agent_transport().await;
+            agent_transport_pair().await;
 
         failed_primary_agent.abort();
         let _ = failed_primary_agent.await;
@@ -726,10 +411,10 @@ mod tests {
 
     #[tokio::test]
     async fn alternate_lane_selection_scans_by_load_without_snapshot_vector() {
-        let (skipped_transport, skipped_agent) = test_agent_transport().await;
-        let (busy_transport, busy_agent) = test_agent_transport().await;
-        let (idle_transport, idle_agent) = test_agent_transport().await;
-        let (middle_transport, middle_agent) = test_agent_transport().await;
+        let (skipped_transport, skipped_agent) = agent_transport_pair().await;
+        let (busy_transport, busy_agent) = agent_transport_pair().await;
+        let (idle_transport, idle_agent) = agent_transport_pair().await;
+        let (middle_transport, middle_agent) = agent_transport_pair().await;
         let bridge = ReconnectingAgentBridge::new(
             QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
             vec![
@@ -777,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_lane_repair_requests_are_coalesced() {
-        let (transport, agent) = test_agent_transport().await;
+        let (transport, agent) = agent_transport_pair().await;
         let bridge = ReconnectingAgentBridge::new(
             QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
             vec![detached_bridge_transport(transport)],
@@ -823,7 +508,7 @@ mod tests {
             assert!(request.is_empty());
         });
 
-        let (transport, agent) = test_agent_transport().await;
+        let (transport, agent) = agent_transport_pair().await;
         let bridge = ReconnectingAgentBridge::new(
             QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
             vec![detached_bridge_transport(transport)],
@@ -862,8 +547,8 @@ mod tests {
     #[tokio::test]
     async fn agent_bridge_repairs_lane_after_active_stream_transport_failure() {
         let (dying_transport, dying_agent, close_dying_transport) =
-            test_agent_transport_closes_after_opened().await;
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+            agent_transport_closes_after_opened().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let bridge = ReconnectingAgentBridge::new(
             QueuedAgentConnector::new(
                 "rustle agent",
@@ -928,9 +613,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_initial_startup_reuses_first_effective_command_for_extra_lanes() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (third_transport, third_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -985,9 +670,9 @@ mod tests {
 
     #[tokio::test]
     async fn auto_agent_startup_returns_after_primary_and_warms_extra_lanes() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (third_transport, third_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1052,8 +737,8 @@ mod tests {
 
     #[tokio::test]
     async fn fast_start_missing_lane_warmup_can_be_deferred() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1113,9 +798,9 @@ mod tests {
 
     #[tokio::test]
     async fn agent_initial_startup_keeps_successful_extra_lanes_after_extra_failure() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (third_transport, third_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new_with_failures(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1164,10 +849,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_bridge_repairs_missing_startup_lane_in_background() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (third_transport, third_agent) = test_agent_transport().await;
-        let (fourth_transport, fourth_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let (fourth_transport, fourth_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
             vec![detached_bridge_transport(fourth_transport)],
@@ -1221,8 +906,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_repair_retries_missing_lane_after_quarantine() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new_with_primary_failures(
             "rustle agent",
             vec![detached_bridge_transport(replacement_transport)],
@@ -1273,10 +958,10 @@ mod tests {
 
     #[tokio::test]
     async fn agent_initial_startup_retries_missing_extra_lanes_after_transient_failure() {
-        let (first_transport, first_agent) = test_agent_transport().await;
-        let (second_transport, second_agent) = test_agent_transport().await;
-        let (third_transport, third_agent) = test_agent_transport().await;
-        let (fourth_transport, fourth_agent) = test_agent_transport().await;
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let (fourth_transport, fourth_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new_with_failures(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1345,12 +1030,12 @@ mod tests {
             socket.shutdown().await.expect("shutdown TCP stream");
         });
 
-        let (failed_transport, failed_agent) = test_agent_transport().await;
+        let (failed_transport, failed_agent) = agent_transport_pair().await;
         failed_agent.abort();
         let _ = failed_agent.await;
         wait_for_transport_failure(&failed_transport).await;
 
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1449,12 +1134,12 @@ mod tests {
             socket.shutdown().await.expect("shutdown TCP stream");
         });
 
-        let (failed_transport, failed_agent) = test_agent_transport().await;
+        let (failed_transport, failed_agent) = agent_transport_pair().await;
         failed_agent.abort();
         let _ = failed_agent.await;
         wait_for_transport_failure(&failed_transport).await;
 
-        let (healthy_transport, healthy_agent) = test_agent_transport().await;
+        let (healthy_transport, healthy_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new());
         let bridge = ReconnectingAgentBridge::new(
             connector,
@@ -1558,17 +1243,17 @@ mod tests {
             socket.shutdown().await.expect("shutdown TCP stream");
         });
 
-        let (failed_primary_transport, failed_primary_agent) = test_agent_transport().await;
+        let (failed_primary_transport, failed_primary_agent) = agent_transport_pair().await;
         failed_primary_agent.abort();
         let _ = failed_primary_agent.await;
         wait_for_transport_failure(&failed_primary_transport).await;
 
-        let (failed_alternate_transport, failed_alternate_agent) = test_agent_transport().await;
+        let (failed_alternate_transport, failed_alternate_agent) = agent_transport_pair().await;
         failed_alternate_agent.abort();
         let _ = failed_alternate_agent.await;
         wait_for_transport_failure(&failed_alternate_transport).await;
 
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new_with_primary_failures(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1686,15 +1371,15 @@ mod tests {
             socket.shutdown().await.expect("shutdown TCP stream");
         });
 
-        let (failed_primary_transport, failed_primary_agent) = test_agent_transport().await;
+        let (failed_primary_transport, failed_primary_agent) = agent_transport_pair().await;
         failed_primary_agent.abort();
         let _ = failed_primary_agent.await;
         wait_for_transport_failure(&failed_primary_transport).await;
 
         let (dying_alternate_transport, dying_alternate_agent) =
-            test_agent_transport_closes_after_first_open().await;
+            agent_transport_closes_after_first_open().await;
 
-        let (replacement_transport, replacement_agent) = test_agent_transport().await;
+        let (replacement_transport, replacement_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new_with_primary_failures(
             "rustle agent",
             vec![AgentBridgeTransport::detached_for_test(
@@ -1811,12 +1496,12 @@ mod tests {
             }
         });
 
-        let (failed_transport, failed_agent) = test_agent_transport().await;
+        let (failed_transport, failed_agent) = agent_transport_pair().await;
         failed_agent.abort();
         let _ = failed_agent.await;
         wait_for_transport_failure(&failed_transport).await;
 
-        let (healthy_transport, healthy_agent) = test_agent_transport().await;
+        let (healthy_transport, healthy_agent) = agent_transport_pair().await;
         let connector = QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new());
         let bridge = ReconnectingAgentBridge::new(
             connector,

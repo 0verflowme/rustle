@@ -12,6 +12,8 @@ use crate::{agent_proto, agent_transport};
 
 mod affinity;
 mod carrier;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use affinity::{
     agent_host_lane_hash, agent_ipv4_lane_hash, agent_lane_candidates, TCP_PROTOCOL_NUMBER,
