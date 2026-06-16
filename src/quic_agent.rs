@@ -471,6 +471,7 @@ impl QuicBridgeStream {
             .context("failed to finish native QUIC bridge send stream")
     }
 
+    #[cfg(test)]
     pub async fn recv_data(&mut self, buf: &mut [u8]) -> Result<Option<Bytes>> {
         self.wait_opened().await?;
         let Some(len) = self

@@ -32,6 +32,17 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python3 scripts/verify-release-matrix.py
 
+      - name: Generate code health report
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/code-health.py --top 25
+
+      - name: Upload code health report
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-health-report
+          path: target/code-health
+
       - name: Verify Windows TUN smoke assertions
         if: matrix.os == 'ubuntu-latest'
         run: python3 scripts/verify-windows-tun-smoke.py

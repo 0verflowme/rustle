@@ -27,7 +27,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tun_rs::DeviceBuilder;
 
-#[allow(dead_code)]
+#[cfg(test)]
 mod agent_client;
 #[allow(dead_code)]
 mod agent_proto;
@@ -73,11 +73,11 @@ const MAX_AGENT_OPENING_STREAMS: usize = 128;
 const DEFAULT_SSH_SESSIONS: usize = 4;
 const MAX_SSH_SESSIONS: usize = 16;
 const AUTO_AGENT_SESSIONS: usize = 0;
-const DEFAULT_AGENT_SESSIONS: usize = AUTO_AGENT_SESSIONS;
+const DEFAULT_AGENT_SESSIONS: usize = 1;
 const MAX_AUTO_AGENT_SESSIONS: usize = 4;
 const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
-const AGENT_FAST_START_WARMUP_DELAY: Duration = Duration::from_millis(100);
+const AGENT_FAST_START_WARMUP_DELAY: Duration = Duration::from_secs(1);
 const DEFAULT_SSH_CONNECT_TIMEOUT_SECS: u64 = 15;
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
@@ -1082,12 +1082,36 @@ impl SshQuicAgentBridgeConnector {
     }
 
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
+        match connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
             &self.prepared,
             &self.agent_command,
             self.mtu,
         )
         .await
+        {
+            Ok(agent) => Ok(agent),
+            Err(initial_err) => {
+                eprintln!(
+                    "quic-agent: remote command failed ({initial_err:#}); trying upload bootstrap"
+                );
+                match connect_uploaded_quic_agent_bridge_transport_prepared(
+                    &self.prepared,
+                    self.mtu,
+                )
+                .await
+                {
+                    Ok(agent) => {
+                        eprintln!("quic-agent: bootstrapped remote helper from local binary");
+                        Ok(agent)
+                    }
+                    Err(bootstrap_err) => Err(bootstrap_err).with_context(|| {
+                        format!(
+                            "failed to start Rustle QUIC agent via command ({initial_err:#}) or upload bootstrap"
+                        )
+                    }),
+                }
+            }
+        }
     }
 }
 
@@ -1364,7 +1388,21 @@ async fn connect_quic_native_bridge_fresh_ssh_command(
 ) -> Result<QuicNativeBridge> {
     let target = resolve_ssh_target(ssh)?;
     let handle = connect_ssh(ssh).await?;
-    connect_quic_native_bridge_on_handle(handle, &target.host, agent_command).await
+    match connect_quic_native_bridge_on_handle(handle, &target.host, agent_command).await {
+        Ok(bridge) => Ok(bridge),
+        Err(initial_err) => {
+            eprintln!(
+                "quic-native: remote command failed ({initial_err:#}); trying upload bootstrap"
+            );
+            connect_uploaded_quic_native_bridge(ssh)
+                .await
+                .map_err(|bootstrap_err| {
+                    bootstrap_err.context(format!(
+                        "failed to start native QUIC bridge via command ({initial_err:#}) or upload bootstrap"
+                    ))
+                })
+        }
+    }
 }
 
 async fn connect_quic_native_bridge_on_handle(
@@ -1447,7 +1485,7 @@ async fn connect_uploaded_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    connect_uploaded_agent_bridge_transport_with_command_prepared(prepared, mtu)
+    connect_uploaded_agent_bridge_transport_with_command_prepared(prepared, mtu, "agent")
         .await
         .map(|(transport, _)| transport)
 }
@@ -1455,6 +1493,7 @@ async fn connect_uploaded_agent_bridge_transport_prepared(
 async fn connect_uploaded_agent_bridge_transport_with_command_prepared(
     prepared: &PreparedSshConnection,
     mtu: u16,
+    helper_subcommand: &str,
 ) -> Result<(AgentBridgeTransport, String)> {
     let handle = connect_prepared_ssh(prepared).await?;
     let platform = probe_remote_platform(&handle)
@@ -1470,11 +1509,68 @@ async fn connect_uploaded_agent_bridge_transport_with_command_prepared(
         );
     }
     let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
-    let agent_command = uploaded_agent_command(&remote_path, platform);
+    let agent_command = if helper_subcommand == "agent" {
+        uploaded_agent_command(&remote_path, platform)
+    } else {
+        uploaded_helper_command(&remote_path, platform, helper_subcommand)
+    };
     let transport = connect_agent_bridge_transport_on_handle(handle, &agent_command, mtu)
         .await
         .with_context(|| format!("uploaded Rustle agent failed to start from {remote_path}"))?;
     Ok((transport, agent_command))
+}
+
+async fn connect_uploaded_quic_agent_bridge_transport_prepared(
+    prepared: &PreparedSshConnection,
+    mtu: u16,
+) -> Result<AgentBridgeTransport> {
+    let handle = connect_prepared_ssh(prepared).await?;
+    let platform = probe_remote_platform(&handle)
+        .await
+        .context("failed to determine remote platform for Rustle QUIC agent bootstrap")?;
+    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
+    let local_agent = local_agent_binary_for_platform(&current_exe, platform)?;
+    if local_agent != current_exe {
+        eprintln!(
+            "quic-agent: using local {} helper sidecar {}",
+            platform.label(),
+            local_agent.display()
+        );
+    }
+    let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
+    let agent_command = uploaded_helper_command(&remote_path, platform, "quic-agent");
+    connect_quic_agent_bridge_transport_on_handle(
+        handle,
+        &prepared.target.host,
+        &agent_command,
+        mtu,
+    )
+    .await
+    .with_context(|| format!("uploaded Rustle QUIC agent failed to start from {remote_path}"))
+}
+
+async fn connect_uploaded_quic_native_bridge(ssh: &SshArgs) -> Result<QuicNativeBridge> {
+    let prepared = prepare_ssh_connection(ssh)?;
+    let handle = connect_prepared_ssh(&prepared).await?;
+    let platform = probe_remote_platform(&handle)
+        .await
+        .context("failed to determine remote platform for native QUIC bridge bootstrap")?;
+    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
+    let local_agent = local_agent_binary_for_platform(&current_exe, platform)?;
+    if local_agent != current_exe {
+        eprintln!(
+            "quic-native: using local {} helper sidecar {}",
+            platform.label(),
+            local_agent.display()
+        );
+    }
+    let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
+    let agent_command = uploaded_helper_command(&remote_path, platform, "quic-bridge-agent");
+    connect_quic_native_bridge_on_handle(handle, &prepared.target.host, &agent_command)
+        .await
+        .with_context(|| {
+            format!("uploaded native QUIC bridge helper failed to start from {remote_path}")
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1506,24 +1602,32 @@ impl RemotePlatform {
 }
 
 fn uploaded_agent_command(remote_path: &str, platform: RemotePlatform) -> String {
+    uploaded_helper_command(remote_path, platform, "agent")
+}
+
+fn uploaded_helper_command(
+    remote_path: &str,
+    platform: RemotePlatform,
+    helper_subcommand: &str,
+) -> String {
     if platform.is_windows() {
-        uploaded_windows_agent_command(remote_path)
+        uploaded_windows_helper_command(remote_path, helper_subcommand)
     } else {
-        uploaded_posix_agent_command(remote_path)
+        uploaded_posix_helper_command(remote_path, helper_subcommand)
     }
 }
 
-fn uploaded_posix_agent_command(remote_path: &str) -> String {
+fn uploaded_posix_helper_command(remote_path: &str, helper_subcommand: &str) -> String {
     let quoted_path = shell_quote(remote_path);
     format!(
-        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup_parent() {{ parent=${{tmp%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac; }}; cleanup() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi; }}; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" agent; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
+        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup_parent() {{ parent=${{tmp%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac; }}; cleanup() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi; }}; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" {helper_subcommand}; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
     )
 }
 
-fn uploaded_windows_agent_command(remote_path: &str) -> String {
+fn uploaded_windows_helper_command(remote_path: &str, helper_subcommand: &str) -> String {
     let quoted_path = powershell_quote(remote_path);
     format!(
-        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $tmp={quoted_path}; $refdir=$tmp+'.refs'; $marker=Join-Path -Path $refdir -ChildPath $PID; New-Item -ItemType Directory -Force -LiteralPath $refdir | Out-Null; New-Item -ItemType File -Force -LiteralPath $marker | Out-Null; function CleanupParent {{ $parent=[IO.Path]::GetDirectoryName($tmp); if ($parent -and ([IO.Path]::GetFileName($parent) -like 'rustle-agent-*')) {{ Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue }} }}; function Cleanup {{ Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $refdir) {{ Get-ChildItem -LiteralPath $refdir -ErrorAction SilentlyContinue | ForEach-Object {{ $id=0; if ([int]::TryParse($_.Name,[ref]$id)) {{ if (-not (Get-Process -Id $id -ErrorAction SilentlyContinue)) {{ Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }} }} }}; try {{ Remove-Item -LiteralPath $refdir -Force -ErrorAction Stop; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; CleanupParent }} catch {{}} }} }}; try {{ & $tmp agent; $status=$LASTEXITCODE }} finally {{ Cleanup }}; exit $status\""
+        "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $tmp={quoted_path}; $refdir=$tmp+'.refs'; $marker=Join-Path -Path $refdir -ChildPath $PID; New-Item -ItemType Directory -Force -LiteralPath $refdir | Out-Null; New-Item -ItemType File -Force -LiteralPath $marker | Out-Null; function CleanupParent {{ $parent=[IO.Path]::GetDirectoryName($tmp); if ($parent -and ([IO.Path]::GetFileName($parent) -like 'rustle-agent-*')) {{ Remove-Item -LiteralPath $parent -Recurse -Force -ErrorAction SilentlyContinue }} }}; function Cleanup {{ Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue; if (Test-Path -LiteralPath $refdir) {{ Get-ChildItem -LiteralPath $refdir -ErrorAction SilentlyContinue | ForEach-Object {{ $id=0; if ([int]::TryParse($_.Name,[ref]$id)) {{ if (-not (Get-Process -Id $id -ErrorAction SilentlyContinue)) {{ Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }} }} }}; try {{ Remove-Item -LiteralPath $refdir -Force -ErrorAction Stop; Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue; CleanupParent }} catch {{}} }} }}; try {{ & $tmp {helper_subcommand}; $status=$LASTEXITCODE }} finally {{ Cleanup }}; exit $status\""
     )
 }
 
@@ -1730,9 +1834,11 @@ fn local_agent_search_dirs(current_exe: &Path) -> Vec<PathBuf> {
         dirs.push(parent.to_path_buf());
         if let Some(package_parent) = parent.parent() {
             dirs.push(package_parent.to_path_buf());
+            dirs.push(package_parent.join("rustle-agent-dir"));
         }
     }
     if let Ok(cwd) = env::current_dir() {
+        dirs.push(cwd.join("target").join("rustle-agent-dir"));
         dirs.push(cwd);
     }
     dedupe_paths(dirs)
@@ -4178,20 +4284,19 @@ impl AgentIoStream {
     async fn recv(&mut self) -> Option<agent_proto::AgentFrame> {
         match self {
             Self::Bridge(stream) => stream.recv().await,
-            Self::QuicNativeTcp(stream) => {
-                let mut buf = vec![0_u8; agent_proto::AGENT_MAX_FRAME_PAYLOAD];
-                match stream.recv_data(&mut buf).await {
-                    Ok(Some(payload)) => {
-                        agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
-                            .ok()
-                    }
-                    Ok(None) => None,
-                    Err(err) => {
-                        eprintln!("quic-native: failed to read TCP data: {err:#}");
-                        None
-                    }
+            Self::QuicNativeTcp(stream) => match stream
+                .recv_chunk(agent_proto::AGENT_MAX_FRAME_PAYLOAD)
+                .await
+            {
+                Ok(Some(payload)) => {
+                    agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload).ok()
                 }
-            }
+                Ok(None) => None,
+                Err(err) => {
+                    eprintln!("quic-native: failed to read TCP data: {err:#}");
+                    None
+                }
+            },
             Self::QuicNativeUdp(stream) => match stream.recv_datagram().await {
                 Ok(Some(payload)) => {
                     agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload).ok()
@@ -10862,6 +10967,22 @@ mod tests {
     }
 
     #[test]
+    fn uploaded_helper_command_selects_requested_subcommand() {
+        let platform = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+
+        let quic_agent = uploaded_helper_command("/tmp/rustle-agent", platform, "quic-agent");
+        let quic_bridge =
+            uploaded_helper_command("/tmp/rustle-agent", platform, "quic-bridge-agent");
+
+        assert!(quic_agent.contains("\"$tmp\" quic-agent"));
+        assert!(!quic_agent.contains("\"$tmp\" agent"));
+        assert!(quic_bridge.contains("\"$tmp\" quic-bridge-agent"));
+    }
+
+    #[test]
     fn windows_uploaded_agent_command_uses_powershell_and_cleans_up() {
         let platform = RemotePlatform {
             os: "windows",
@@ -10887,6 +11008,18 @@ mod tests {
             remote_agent_upload_command(platform),
             WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND
         );
+    }
+
+    #[test]
+    fn windows_uploaded_helper_command_selects_requested_subcommand() {
+        let platform = RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        };
+
+        let command = uploaded_helper_command("C:\\Temp\\rustle-agent.exe", platform, "quic-agent");
+
+        assert!(command.contains("& $tmp quic-agent"));
     }
 
     #[test]
@@ -11299,6 +11432,15 @@ mod tests {
 
         assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-aarch64-apple-darwin")));
         assert!(dirs.contains(&PathBuf::from("/opt/rustle")));
+        assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-agent-dir")));
+    }
+
+    #[test]
+    fn local_agent_search_dirs_include_target_agent_dir_for_dev_builds() {
+        let current_exe = PathBuf::from("/work/rustle/target/debug/rustle");
+        let dirs = local_agent_search_dirs(&current_exe);
+
+        assert!(dirs.contains(&PathBuf::from("/work/rustle/target/rustle-agent-dir")));
     }
 
     #[test]
@@ -11556,7 +11698,7 @@ mod tests {
         );
         assert_eq!(cli.compact.dns_remote, "127.0.0.53:53");
         assert_eq!(cli.compact.ssh_sessions, DEFAULT_SSH_SESSIONS);
-        assert_eq!(cli.compact.agent_sessions, AUTO_AGENT_SESSIONS);
+        assert_eq!(cli.compact.agent_sessions, DEFAULT_AGENT_SESSIONS);
         assert_eq!(cli.compact.bridge_transport, BridgeTransportKind::Agent);
         assert!(!cli.compact.configure_dns);
     }

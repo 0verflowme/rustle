@@ -1,0 +1,97 @@
+[roots]
+production = [
+  "src/main.rs::main",
+  "agent-bootstrap/src/main.rs::main",
+]
+verification_scripts = [
+  "scripts/code-health.py",
+  "scripts/verify-local.sh",
+  "scripts/verify-release-candidate.sh",
+]
+documentation = [
+  "README.md",
+  "docs/architecture.md",
+  "docs/code-health.md",
+  "docs/performance.md",
+  "docs/release.md",
+  "docs/troubleshooting.md",
+]
+
+[thresholds]
+hot_file_loc = 1000
+hot_item_loc = 120
+large_file_loc = 2500
+large_item_loc = 300
+
+[domains.core]
+file_patterns = [
+  "src/agent_proto.rs",
+  "src/agent_runtime.rs",
+  "src/agent_transport.rs",
+  "src/agent_window.rs",
+  "src/dns.rs",
+  "src/tcp_core.rs",
+]
+name_patterns = [
+  "Agent*",
+  "Flow*",
+  "Tcp*",
+  "Udp*",
+]
+
+[domains.platform]
+file_patterns = [
+  "src/platform.rs",
+]
+name_patterns = [
+  "linux_*",
+  "macos_*",
+  "windows_*",
+  "*wintun*",
+  "*route*",
+]
+
+[domains.compatibility]
+file_patterns = [
+  "src/ssh_bridge.rs",
+]
+name_patterns = [
+  "*direct_tcpip*",
+  "*DirectTcpip*",
+  "*ssh_bridge*",
+]
+
+[domains.experimental]
+file_patterns = [
+  "src/quic_agent.rs",
+  "scripts/smoke-quic-*.sh",
+]
+name_patterns = [
+  "*quic*",
+  "*Quic*",
+]
+
+[domains.lab]
+file_patterns = [
+  "scripts/bench-*.sh",
+  "scripts/smoke-*.sh",
+  "scripts/stress-*.sh",
+]
+name_patterns = [
+  "*Lab*",
+  "*lab*",
+  "*bench*",
+  "*smoke*",
+]
+
+[domains.release]
+file_patterns = [
+  "scripts/verify-*.py",
+  "scripts/verify-*.sh",
+  "scripts/build-agent-sidecars.sh",
+  "scripts/prepare-agent-sidecars.sh",
+]
+name_patterns = [
+  "*release*",
+  "*verify*",
+]

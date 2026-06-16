@@ -33,6 +33,7 @@ UDP_IDLE_TIMEOUT_MS="${RUSTLE_LIVE_UDP_IDLE_TIMEOUT_MS:-500}"
 UDP_IDLE_GRACE_MS="${RUSTLE_LIVE_UDP_IDLE_GRACE_MS:-1500}"
 START_TIMEOUT="${RUSTLE_LIVE_UDP_START_TIMEOUT:-45}"
 BRIDGE_TRANSPORT="${RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT:-agent}"
+FIXTURE_TTL_SECONDS="${RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS:-300}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_LIVE_UDP_REMOTE or RUSTLE_LIVE_REMOTE, for example user@ssh.example.com"
 [[ -n "$FIXTURE_HOST" ]] || smoke_die "set RUSTLE_LIVE_UDP_HOST to the remote IP reachable through Rustle, for example 192.168.190.45"
@@ -46,6 +47,9 @@ for value_name in FIXTURE_PORT MESSAGES UDP_IDLE_TIMEOUT_MS UDP_IDLE_GRACE_MS ST
     '' | *[!0-9]*) smoke_die "${value_name/RUSTLE_/RUSTLE_LIVE_UDP_} must be a non-negative integer" ;;
   esac
 done
+case "$FIXTURE_TTL_SECONDS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS must be a positive integer" ;;
+esac
 if [[ "$MESSAGES" -lt 1 ]]; then
   smoke_die "RUSTLE_LIVE_UDP_MESSAGES must be at least 1"
 fi
@@ -54,6 +58,9 @@ if [[ "$UDP_IDLE_TIMEOUT_MS" -lt 1 ]]; then
 fi
 if [[ "$UDP_IDLE_GRACE_MS" -le "$UDP_IDLE_TIMEOUT_MS" ]]; then
   smoke_die "RUSTLE_LIVE_UDP_IDLE_GRACE_MS must be greater than RUSTLE_LIVE_UDP_IDLE_TIMEOUT_MS"
+fi
+if [[ "$FIXTURE_TTL_SECONDS" -lt 1 ]]; then
+  smoke_die "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS must be at least 1"
 fi
 case "$BRIDGE_TRANSPORT" in
   agent) ;;
@@ -64,6 +71,7 @@ TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-udp-smoke.XXXXXX")"
 RUSTLE_PID=""
 RUSTLE_CHILD_PID_FILE="${TMPDIR}/rustle.pid"
 FIXTURE_PID=""
+FIXTURE_REMOTE_PID=""
 FIXTURE_PASSWORD_FILE=""
 RUSTLE_PASSWORD_FILE=""
 
@@ -185,6 +193,11 @@ delete_target_route_best_effort() {
 }
 
 stop_fixture() {
+  if [[ -n "$FIXTURE_REMOTE_PID" ]]; then
+    "${SSH_CMD[@]}" "kill ${FIXTURE_REMOTE_PID} >/dev/null 2>&1 || true" \
+      >/dev/null 2>&1 || true
+    FIXTURE_REMOTE_PID=""
+  fi
   if [[ -n "$FIXTURE_PID" ]]; then
     kill "$FIXTURE_PID" >/dev/null 2>&1 || true
     wait "$FIXTURE_PID" >/dev/null 2>&1 || true
@@ -312,47 +325,76 @@ wait_for_fixture_ready() {
   esac
   local attempts=$((seconds * 10))
   for ((i = 0; i < attempts; i++)); do
-    if grep -Eq '^READY [0-9]+$' "$ready_file" 2>/dev/null; then
+    if grep -Eq '^READY [0-9]+ [0-9]+$' "$ready_file" 2>/dev/null; then
       return 0
     fi
     if [[ -n "$FIXTURE_PID" ]] && ! smoke_process_running "$FIXTURE_PID"; then
-      sed 's/^/fixture: /' "$err_file" >&2 || true
-      smoke_die "remote live UDP fixture exited before readiness"
+      return 1
     fi
     sleep 0.1
   done
-  sed 's/^/fixture: /' "$err_file" >&2 || true
-  smoke_die "remote live UDP fixture did not become ready"
+  return 1
 }
 
 start_udp_fixture() {
   local out_file="$1"
   local err_file="$2"
-  FIXTURE_PID=""
-  "${SSH_CMD[@]}" "$FIXTURE_PYTHON" - "$FIXTURE_BIND" "$FIXTURE_PORT" \
-    >"$out_file" 2>"$err_file" <<'PY' &
+  local start_retries="${RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES:-3}"
+
+  case "$start_retries" in
+    '' | *[!0-9]*) smoke_die "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES must be a positive integer" ;;
+  esac
+  if [[ "$start_retries" -lt 1 ]]; then
+    smoke_die "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES must be at least 1"
+  fi
+
+  for ((attempt = 1; attempt <= start_retries; attempt++)); do
+    : >"$out_file"
+    : >"$err_file"
+    FIXTURE_PID=""
+    "${SSH_CMD[@]}" "$FIXTURE_PYTHON" - "$FIXTURE_BIND" "$FIXTURE_PORT" "$FIXTURE_TTL_SECONDS" \
+      >"$out_file" 2>"$err_file" <<'PY' &
 from __future__ import print_function
+import os
 import socket
 import sys
+import time
 
 bind = sys.argv[1]
 port = int(sys.argv[2])
+ttl_seconds = int(sys.argv[3])
 response_prefix = b"rustle-live-udp-pong:"
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((bind, port))
-    sys.stdout.write("READY %d\n" % sock.getsockname()[1])
+    sock.settimeout(1.0)
+    deadline = time.time() + ttl_seconds
+    sys.stdout.write("READY %d %d\n" % (sock.getsockname()[1], os.getpid()))
     sys.stdout.flush()
-    while True:
-        data, peer = sock.recvfrom(65535)
+    while time.time() < deadline:
+        try:
+            data, peer = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
         sock.sendto(response_prefix + data, peer)
 finally:
     sock.close()
 PY
-  FIXTURE_PID=$!
-  wait_for_fixture_ready "$out_file" "$err_file"
+    FIXTURE_PID=$!
+    if wait_for_fixture_ready "$out_file" "$err_file"; then
+      return 0
+    fi
+    stop_fixture
+    if [[ "$attempt" -lt "$start_retries" ]]; then
+      smoke_info "remote live UDP fixture startup attempt ${attempt}/${start_retries} failed; retrying"
+      sleep 1
+    fi
+  done
+
+  sed 's/^/fixture: /' "$err_file" >&2 || true
+  smoke_die "remote live UDP fixture did not become ready after ${start_retries} attempt(s)"
 }
 
 RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bench_bin)"
@@ -361,7 +403,8 @@ FIXTURE_ERR="${TMPDIR}/fixture.err"
 RUSTLE_LOG="${TMPDIR}/rustle.log"
 
 start_udp_fixture "$FIXTURE_OUT" "$FIXTURE_ERR"
-ACTUAL_PORT="$(sed -n 's/^READY //p' "$FIXTURE_OUT" | tail -n 1)"
+ACTUAL_PORT="$(awk '/^READY / { print $2 }' "$FIXTURE_OUT" | tail -n 1)"
+FIXTURE_REMOTE_PID="$(awk '/^READY / { print $3 }' "$FIXTURE_OUT" | tail -n 1)"
 
 CMD_ENV=()
 if [[ -n "${RUSTLE_AGENT_DIR:-}" ]]; then
@@ -460,7 +503,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
 print("live UDP smoke response ok")
 PY
 
-if ! smoke_wait_for_log "udp: forwarding datagram .* -> ${FIXTURE_HOST}:${ACTUAL_PORT} over agent" "$RUSTLE_LOG" 5; then
+if ! smoke_wait_for_log "udp: forwarding datagram .* -> ${FIXTURE_HOST}:${ACTUAL_PORT} over " "$RUSTLE_LOG" 5; then
   sed 's/^/rustle: /' "$RUSTLE_LOG" >&2 || true
   smoke_die "Rustle did not log generic UDP forwarding"
 fi

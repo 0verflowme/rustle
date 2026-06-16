@@ -93,6 +93,7 @@ verify_run cargo fmt --check
 verify_run cargo test
 verify_run cargo clippy --all-targets -- -D warnings
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-matrix.py"
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/code-health.py" --top 25
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-archives.py" --self-test

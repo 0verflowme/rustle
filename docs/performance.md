@@ -121,11 +121,11 @@ This benchmark is useful for bridge regressions because it exercises:
 - one-lane versus multi-lane framed agent behavior with
   `RUSTLE_BENCH_AGENT_SESSIONS`
 
-`bridge-lab` disables the compact tunnel's auto-lane fast-start optimization and
-waits for the requested or recommended agent lane pool before starting synthetic
-clients. That keeps this benchmark focused on steady-state bridge throughput;
-the real tunnel path still starts after the primary auto-selected agent lane and
-warms remaining lanes in background to reduce first-request latency.
+`bridge-lab` waits for the requested or recommended agent lane pool before
+starting synthetic clients. That keeps this benchmark focused on steady-state
+bridge throughput; the real compact tunnel defaults to one agent lane for
+first-response latency, while hidden auto-lane mode starts after the primary lane
+and warms remaining lanes in the background.
 
 It does not exercise host route injection, TUN driver behavior, DNS takeover, or
 generic UDP datagram behavior.
@@ -402,6 +402,16 @@ during cleanup. Bare `--password` still supports the legacy
 `RUSTLE_SSH_PASSWORD_FILE` environment path for compatibility with older local
 scripts.
 
+For SSH config aliases such as `contabo`, the benchmark passes the user's
+`~/.ssh/config` and `~/.ssh/known_hosts` into sshuttle's SSH command when the
+benchmark itself has to launch sshuttle through `sudo`. It also resolves
+`IdentityFile ~/.ssh/...` entries with `ssh -G` before sudo starts sshuttle, so
+the comparator uses the same user key material as a normal `ssh contabo` run.
+Set `RUSTLE_BENCH_SSH_CONFIG` to pin the config used by both Rustle and
+sshuttle, or `RUSTLE_BENCH_SSHUTTLE_SSH_CONFIG` when only the sshuttle
+comparator needs a different config. `RUSTLE_BENCH_SSHUTTLE_SSH_CMD` still
+overrides the complete sshuttle SSH command when a lab needs total control.
+
 For throwaway lab hosts, `RUSTLE_BENCH_INSECURE_HOST_KEY=1` or
 `RUSTLE_LIVE_INSECURE_HOST_KEY=1` also applies to sshuttle identity mode. When
 the harness constructs sshuttle's `-e ssh` command, both password and identity
@@ -434,6 +444,10 @@ The harness treats sshuttle as an opt-in comparator because sshuttle depends on
 local firewall hooks and a remote Python helper. If sshuttle cannot make the URL
 reachable before the readiness deadline, the benchmark exits with diagnostics
 instead of reporting a misleading comparison row.
+For large-response comparator runs where Rustle completes but sshuttle times out
+or resets mid-transfer, set `RUSTLE_BENCH_ALLOW_FAILED_TOOLS=sshuttle` to keep a
+failed sshuttle row in the TSV. That mode is intentionally opt-in: failed Rustle
+rows and all failed comparator rows remain fatal unless the tool name is listed.
 
 ## Controlled Live Large-Response Fixture
 
@@ -469,7 +483,9 @@ code is compatible with Python 2.7 and Python 3; set
 `RUSTLE_FIXTURE_PYTHON=python` for older SSH hosts that do not provide
 `python3`. Fixture runs set `RUSTLE_BENCH_READY_METHOD=HEAD` so sshuttle
 readiness probes verify reachability without downloading the full large
-response before the measured GET request.
+response before the measured GET request. The fixture server has a bounded TTL
+(`RUSTLE_FIXTURE_TTL_SECONDS`, default 3600) and the wrapper also records the
+remote PID so cleanup can kill it explicitly after each body-size run.
 
 For agent-mode live benchmarks from a different local platform than the remote,
 prepare a sidecar store with `scripts/prepare-agent-sidecars.sh` and export
@@ -488,12 +504,40 @@ are not set, fixture-only auth and host-key settings are forwarded into the
 nested live benchmark run, including `RUSTLE_FIXTURE_PASSWORD_VALUE`, prompted
 `RUSTLE_FIXTURE_PASSWORD`, `RUSTLE_FIXTURE_IDENTITY`,
 `RUSTLE_FIXTURE_INSECURE_HOST_KEY`, and `RUSTLE_FIXTURE_KNOWN_HOSTS`.
+Set `RUSTLE_FIXTURE_ALLOW_FAILED_TOOLS=sshuttle` when a large fixture should
+preserve Rustle rows and record a partial failed sshuttle comparator row instead
+of aborting the whole fixture run. The fixture row verifier still requires every
+non-allowed tool row to have zero failures and exact transferred bytes.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is
 that it can lean on OS-specific firewall and kernel TCP behavior. That means the
 comparison is only meaningful when both tools are run on the exact same traffic
 shape and target.
+
+### Current Live Fixture Evidence
+
+The following rows were collected on 2026-06-16 from a macOS client against the
+`contabo` SSH config alias, routing only the remote-side fixture address
+`172.17.0.1/32`. They are lab evidence for this client, network, and host, not a
+portable release claim.
+
+| Fixture | Tool | Runs | Result |
+| --- | --- | ---: | --- |
+| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 218.1 ms |
+| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 174.1 ms |
+| 10 MiB, 1 request | `rustle-agent` | 2 | avg throughput 3.90 MiB/s |
+| 10 MiB, 1 request | `rustle-quic-native` | 2 | avg throughput 2.71 MiB/s, with one slow outlier |
+| 10 MiB, 1 request | `sshuttle` | 2 | avg throughput 0.19 MiB/s |
+| 100 MiB, 1 request | `rustle-agent` | 1 | 5.65 MiB/s |
+| 100 MiB, 1 request | `rustle-quic-native` | 1 | 14.84 MiB/s |
+| 100 MiB, 1 request | `sshuttle` | 1 | timed out after 75 s with 14.36 MiB received |
+
+This proves the current bulk-transfer path is already much faster than sshuttle
+on that lab route, and that `quic-native` can provide the intended high-throughput
+optional data plane. It also shows the default SSH-agent path does not yet beat
+sshuttle on tiny-response latency on this host, so tiny p50 remains an open
+performance gate rather than a completed claim.
 
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:
@@ -652,12 +696,13 @@ Performance work must preserve these invariants:
   across flushes instead of allocating them once per burst
 - agent peers that advertise heartbeat support must answer periodic zero-stream
   pings; missed pongs must trip sticky transport failure and reconnect handling
-- agent streams can be hashed across multiple SSH exec lanes; lane count is
-  auto-selected as capped `ceil(sqrt(local CPU parallelism))` by default and
-  remains a hidden/internal tuning knob so the public command stays compact
+- agent streams can be hashed across multiple SSH exec lanes; the public compact
+  command defaults to one lane for first-response latency, while hidden
+  `--agent-sessions 0` selects capped `ceil(sqrt(local CPU parallelism))` auto
+  lanes for lab or unusual high-bandwidth links
 - the compact auto-lane path starts after the primary agent lane and warms the
-  remaining recommended lanes in background after a short first-flow defer,
-  while explicit `--agent-sessions` requests keep the full initial startup gate
+  remaining recommended lanes in background, while explicit `--agent-sessions`
+  requests keep the full initial startup gate
 - rootless `bridge-lab` keeps full lane warmup for steady-state throughput and
   stress evidence instead of timing the compact tunnel fast-start path
 - each agent exec lane must be a fresh SSH connection with one exec channel, not

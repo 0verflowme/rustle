@@ -18,6 +18,7 @@ FIXTURE_PORT="${RUSTLE_FIXTURE_PORT:-0}"
 FIXTURE_BODY_BYTES="${RUSTLE_FIXTURE_BODY_BYTES:-1048576 10485760 104857600}"
 FIXTURE_PYTHON="${RUSTLE_FIXTURE_PYTHON:-python3}"
 FIXTURE_LISTEN_BACKLOG="${RUSTLE_FIXTURE_LISTEN_BACKLOG:-256}"
+FIXTURE_TTL_SECONDS="${RUSTLE_FIXTURE_TTL_SECONDS:-3600}"
 TARGET_CIDR="${RUSTLE_FIXTURE_TARGET_CIDR:-${RUSTLE_BENCH_TARGET_CIDR:-}}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_FIXTURE_REMOTE or RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
@@ -31,19 +32,23 @@ esac
 case "$FIXTURE_LISTEN_BACKLOG" in
   '' | *[!0-9]*) smoke_die "RUSTLE_FIXTURE_LISTEN_BACKLOG must be a positive integer" ;;
 esac
+case "$FIXTURE_TTL_SECONDS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_FIXTURE_TTL_SECONDS must be a positive integer" ;;
+esac
 if [[ "$FIXTURE_LISTEN_BACKLOG" -lt 1 ]]; then
   smoke_die "RUSTLE_FIXTURE_LISTEN_BACKLOG must be at least 1"
+fi
+if [[ "$FIXTURE_TTL_SECONDS" -lt 1 ]]; then
+  smoke_die "RUSTLE_FIXTURE_TTL_SECONDS must be at least 1"
 fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-fixture.XXXXXX")"
 FIXTURE_PID=""
+FIXTURE_REMOTE_PID=""
 FIXTURE_PASSWORD_FILE=""
 
 cleanup() {
-  if [[ -n "$FIXTURE_PID" ]]; then
-    kill "$FIXTURE_PID" >/dev/null 2>&1 || true
-    wait "$FIXTURE_PID" >/dev/null 2>&1 || true
-  fi
+  stop_fixture
   if [[ -n "$FIXTURE_PASSWORD_FILE" ]]; then
     rm -f "$FIXTURE_PASSWORD_FILE"
   fi
@@ -124,6 +129,9 @@ fi
 if [[ -n "${RUSTLE_FIXTURE_KNOWN_HOSTS:-}" && -z "${RUSTLE_BENCH_KNOWN_HOSTS:-}" && -z "${RUSTLE_LIVE_KNOWN_HOSTS:-}" ]]; then
   BENCH_ENV+=(RUSTLE_BENCH_KNOWN_HOSTS="$RUSTLE_FIXTURE_KNOWN_HOSTS")
 fi
+if [[ -n "${RUSTLE_FIXTURE_ALLOW_FAILED_TOOLS:-}" && -z "${RUSTLE_BENCH_ALLOW_FAILED_TOOLS:-}" ]]; then
+  BENCH_ENV+=(RUSTLE_BENCH_ALLOW_FAILED_TOOLS="$RUSTLE_FIXTURE_ALLOW_FAILED_TOOLS")
+fi
 
 wait_for_fixture_ready() {
   local ready_file="$1"
@@ -134,7 +142,7 @@ wait_for_fixture_ready() {
   esac
   local attempts=$((seconds * 10))
   for ((i = 0; i < attempts; i++)); do
-    if grep -Eq '^READY [0-9]+$' "$ready_file" 2>/dev/null; then
+    if grep -Eq '^READY [0-9]+ [0-9]+$' "$ready_file" 2>/dev/null; then
       return 0
     fi
     if [[ -n "$FIXTURE_PID" ]] && ! smoke_process_running "$FIXTURE_PID"; then
@@ -152,16 +160,19 @@ start_fixture() {
   local out_file="$2"
   local err_file="$3"
   FIXTURE_PID=""
-  "${SSH_CMD[@]}" "$FIXTURE_PYTHON" - "$FIXTURE_BIND" "$FIXTURE_PORT" "$body_bytes" "$FIXTURE_LISTEN_BACKLOG" \
+  "${SSH_CMD[@]}" "$FIXTURE_PYTHON" - "$FIXTURE_BIND" "$FIXTURE_PORT" "$body_bytes" "$FIXTURE_LISTEN_BACKLOG" "$FIXTURE_TTL_SECONDS" \
     >"$out_file" 2>"$err_file" <<'PY' &
 import socket
 import sys
 import threading
+import time
+import os
 
 bind = sys.argv[1]
 port = int(sys.argv[2])
 body_size = int(sys.argv[3])
 listen_backlog = int(sys.argv[4])
+ttl_seconds = int(sys.argv[5])
 marker = b"rustle-live-fixture\n"
 if body_size < len(marker):
     body_prefix = marker[:body_size]
@@ -209,10 +220,15 @@ try:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((bind, port))
     sock.listen(listen_backlog)
-    sys.stdout.write("READY %d\n" % sock.getsockname()[1])
+    sock.settimeout(1.0)
+    deadline = time.time() + ttl_seconds
+    sys.stdout.write("READY %d %d\n" % (sock.getsockname()[1], os.getpid()))
     sys.stdout.flush()
-    while True:
-        conn, _peer = sock.accept()
+    while time.time() < deadline:
+        try:
+            conn, _peer = sock.accept()
+        except socket.timeout:
+            continue
         thread = threading.Thread(target=serve, args=(conn,))
         thread.daemon = True
         thread.start()
@@ -224,6 +240,11 @@ PY
 }
 
 stop_fixture() {
+  if [[ -n "$FIXTURE_REMOTE_PID" ]]; then
+    "${SSH_CMD[@]}" "kill ${FIXTURE_REMOTE_PID} >/dev/null 2>&1 || true" \
+      >/dev/null 2>&1 || true
+    FIXTURE_REMOTE_PID=""
+  fi
   if [[ -n "$FIXTURE_PID" ]]; then
     kill "$FIXTURE_PID" >/dev/null 2>&1 || true
     wait "$FIXTURE_PID" >/dev/null 2>&1 || true
@@ -234,7 +255,19 @@ stop_fixture() {
 verify_fixture_benchmark_rows() {
   local results_file="$1"
   local body_bytes="$2"
-  "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" "$results_file" "$body_bytes"
+  local allow_failed_tools="${RUSTLE_FIXTURE_ALLOW_FAILED_TOOLS:-${RUSTLE_BENCH_ALLOW_FAILED_TOOLS:-}}"
+  local args=()
+  local tool
+  for tool in $allow_failed_tools; do
+    args+=(--allow-failed-tool "$tool")
+  done
+  if [[ "${#args[@]}" -gt 0 ]]; then
+    "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" \
+      "${args[@]}" "$results_file" "$body_bytes"
+  else
+    "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" \
+      "$results_file" "$body_bytes"
+  fi
 }
 
 for body_bytes in $FIXTURE_BODY_BYTES; do
@@ -248,7 +281,8 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
   fixture_out="${TMPDIR}/fixture-${body_bytes}.out"
   fixture_err="${TMPDIR}/fixture-${body_bytes}.err"
   start_fixture "$body_bytes" "$fixture_out" "$fixture_err"
-  actual_port="$(sed -n 's/^READY //p' "$fixture_out" | tail -n 1)"
+  actual_port="$(awk '/^READY / { print $2 }' "$fixture_out" | tail -n 1)"
+  FIXTURE_REMOTE_PID="$(awk '/^READY / { print $3 }' "$fixture_out" | tail -n 1)"
   fixture_url="http://${FIXTURE_HOST}:${actual_port}/"
   fixture_results="${TMPDIR}/fixture-${body_bytes}-bench.tsv"
   smoke_info "benchmarking live fixture body_bytes=${body_bytes} url=${fixture_url}"

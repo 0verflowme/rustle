@@ -88,15 +88,12 @@ Rustle keeps three transport choices, but only one is the normal path:
   blocking on one SSH channel. Each lane is established through a fresh SSH connection with one exec channel.
   It is not another exec channel on an existing SSH carrier, so multi-lane mode
   can also reduce SSH TCP head-of-line blocking.
-  When the hidden lane count is left at its default,
-  Rustle chooses `ceil(sqrt(local CPU parallelism))`, capped to four exec
-  transports. That default keeps the compact path restrained on small hosts
-  while giving larger machines more parallel SSH exec capacity without exposing
-  a public tuning knob. The compact auto-lane path starts after the primary
-  agent lane is established, then warms the remaining recommended lanes in
-  background after a short defer so first-request latency does not wait for, or
-  immediately compete with, every extra SSH exec transport. Larger lane counts
-  remain available through the hidden
+  The compact tunnel default uses one agent exec lane so the daily-use path does
+  not start background SSH authentications during the first page load. The hidden
+  auto setting, `--agent-sessions 0`, chooses `ceil(sqrt(local CPU parallelism))`,
+  capped to four exec transports, then starts after the primary agent lane is
+  established and warms the remaining recommended lanes in the background.
+  Larger fixed lane counts remain available through the hidden
   `--agent-sessions` override for unusual high-latency or high-bandwidth links;
   explicit lane counts keep the full initial startup gate.
   Stream assignment uses a deterministic two-candidate choice: the primary hash
@@ -404,10 +401,9 @@ failure, timeout, or route/device shutdown.
   extra lane must not prevent other successful extra lanes from entering the
   pool. Missing lanes get one bounded retry before Rustle accepts a degraded
   startup pool, and those missing desired slots remain repairable in the
-  background. For the compact default auto-lane path, only the primary lane is
-  required before the tunnel can start; remaining recommended lanes use the same
-  background repair path as missing startup lanes after a short first-flow
-  defer.
+  background. For hidden auto-lane mode, only the primary lane is required before
+  the tunnel can start; remaining recommended lanes use the same background
+  repair path as missing startup lanes.
   Uploaded helpers are staged in private Rustle-owned temporary directories
   before execution. POSIX remotes create the directory with `mktemp -d` under
   `umask 077` and `chmod 700`; Windows remotes create a GUID-suffixed

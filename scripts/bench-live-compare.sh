@@ -41,6 +41,7 @@ LIVE_GATE_TOOL_PATTERN="${RUSTLE_BENCH_LIVE_TOOL_PATTERN:-}"
 LIVE_MAX_P50_MS="${RUSTLE_BENCH_LIVE_MAX_P50_MS:-}"
 LIVE_MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S:-}"
 EXPECT_BYTES="${RUSTLE_BENCH_EXPECT_BYTES:-${RUSTLE_LIVE_EXPECT_BYTES:-}}"
+ALLOW_FAILED_TOOLS="${RUSTLE_BENCH_ALLOW_FAILED_TOOLS:-}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$TARGET_CIDR" ]] || smoke_die "set RUSTLE_BENCH_TARGET_CIDR, for example 192.168.0.0/16"
@@ -396,6 +397,89 @@ write_password_file() {
   (umask 077 && printf '%s' "$password_value" >"$path")
 }
 
+benchmark_failure_allowed_for_tool() {
+  local tool_label="$1"
+  case " ${ALLOW_FAILED_TOOLS} " in
+    *" ${tool_label} "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+quote_arg() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+ssh_config_path_for_tool() {
+  local explicit="${RUSTLE_BENCH_SSH_CONFIG:-${RUSTLE_LIVE_SSH_CONFIG:-}}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" && -f "${HOME}/.ssh/config" ]]; then
+    printf '%s\n' "${HOME}/.ssh/config"
+  fi
+}
+
+sshuttle_ssh_config_path() {
+  local explicit="${RUSTLE_BENCH_SSHUTTLE_SSH_CONFIG:-}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  ssh_config_path_for_tool
+}
+
+sshuttle_ssh_config_options() {
+  local config_path
+  config_path="$(sshuttle_ssh_config_path)"
+  if [[ -n "$config_path" ]]; then
+    printf ' -F %s' "$(quote_arg "$config_path")"
+  fi
+}
+
+expand_user_ssh_path() {
+  local path="$1"
+  case "$path" in
+    '~')
+      printf '%s\n' "${HOME:-$path}"
+      ;;
+    '~/'*)
+      if [[ -n "${HOME:-}" ]]; then
+        printf '%s/%s\n' "$HOME" "${path#\~/}"
+      else
+        printf '%s\n' "$path"
+      fi
+      ;;
+    *)
+      printf '%s\n' "$path"
+      ;;
+  esac
+}
+
+sshuttle_config_identity_options() {
+  local remote="$1"
+  local config_path
+  local ssh_g_args=(ssh -G)
+
+  config_path="$(sshuttle_ssh_config_path)"
+  if [[ -n "$config_path" ]]; then
+    ssh_g_args+=(-F "$config_path")
+  fi
+
+  "${ssh_g_args[@]}" "$remote" 2>/dev/null | while IFS= read -r line; do
+    case "$line" in
+      identityfile\ *)
+        local identity_path="${line#identityfile }"
+        local expanded_path
+        expanded_path="$(expand_user_ssh_path "$identity_path")"
+        if [[ "$expanded_path" != none && -f "$expanded_path" ]]; then
+          printf ' -i %s' "$(quote_arg "$expanded_path")"
+        fi
+        ;;
+    esac
+  done
+}
+
 RUSTLE_BIN_RESOLVED="$(smoke_resolve_rustle_bench_bin)"
 RUSTLE_PASSWORD_VALUE="${RUSTLE_BENCH_PASSWORD_VALUE:-${RUSTLE_LIVE_PASSWORD_VALUE:-}}"
 if [[ -z "$RUSTLE_PASSWORD_VALUE" && "${RUSTLE_BENCH_PASSWORD:-${RUSTLE_LIVE_PASSWORD:-0}}" == "1" ]]; then
@@ -425,6 +509,9 @@ start_rustle() {
   fi
   if [[ -n "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}" ]]; then
     cmd+=(-i "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}")
+  fi
+  if [[ -n "${RUSTLE_BENCH_SSH_CONFIG:-${RUSTLE_LIVE_SSH_CONFIG:-}}" ]]; then
+    cmd+=(--ssh-config "${RUSTLE_BENCH_SSH_CONFIG:-${RUSTLE_LIVE_SSH_CONFIG:-}}")
   fi
   if [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
     cmd+=(--known-hosts "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}")
@@ -532,10 +619,20 @@ sshuttle_insecure_host_key_enabled() {
 
 sshuttle_ssh_host_key_options() {
   if sshuttle_insecure_host_key_enabled; then
-    printf ' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
-  elif [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
-    printf ' -o UserKnownHostsFile=%s -o StrictHostKeyChecking=yes' \
-      "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}"
+    printf ' -o %s -o %s' \
+      "$(quote_arg StrictHostKeyChecking=no)" \
+      "$(quote_arg UserKnownHostsFile=/dev/null)"
+    return 0
+  fi
+
+  local known_hosts="${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}"
+  if [[ -z "$known_hosts" && -n "${HOME:-}" && -f "${HOME}/.ssh/known_hosts" ]]; then
+    known_hosts="${HOME}/.ssh/known_hosts"
+  fi
+  if [[ -n "$known_hosts" ]]; then
+    printf ' -o %s -o %s' \
+      "$(quote_arg "UserKnownHostsFile=${known_hosts}")" \
+      "$(quote_arg StrictHostKeyChecking=yes)"
   fi
 }
 
@@ -557,13 +654,29 @@ start_sshuttle() {
     password_file="${run_dir}/sshuttle-password"
     (umask 077 && printf '%s\n' "$SSHUTTLE_PASSWORD_VALUE" >"$password_file")
     CURRENT_PASSWORD_FILE="$password_file"
-    local ssh_cmd="sshpass -f ${password_file} ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o KbdInteractiveAuthentication=yes -o NumberOfPasswordPrompts=1"
+    local ssh_cmd="sshpass -f $(quote_arg "$password_file") ssh"
+    ssh_cmd+="$(sshuttle_ssh_config_options)"
+    ssh_cmd+=" -o $(quote_arg PubkeyAuthentication=no)"
+    ssh_cmd+=" -o $(quote_arg PreferredAuthentications=password,keyboard-interactive)"
+    ssh_cmd+=" -o $(quote_arg KbdInteractiveAuthentication=yes)"
+    ssh_cmd+=" -o $(quote_arg NumberOfPasswordPrompts=1)"
     ssh_cmd+="$(sshuttle_ssh_host_key_options)"
     cmd+=(-e "$ssh_cmd")
   elif [[ -n "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}" ]]; then
-    local ssh_cmd="ssh -i ${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}} -o IdentitiesOnly=yes"
+    local ssh_cmd="ssh"
+    ssh_cmd+="$(sshuttle_ssh_config_options)"
+    ssh_cmd+=" -i $(quote_arg "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}")"
+    ssh_cmd+=" -o $(quote_arg IdentitiesOnly=yes)"
     ssh_cmd+="$(sshuttle_ssh_host_key_options)"
     cmd+=(-e "$ssh_cmd")
+  else
+    local ssh_cmd="ssh"
+    ssh_cmd+="$(sshuttle_ssh_config_options)"
+    ssh_cmd+="$(sshuttle_config_identity_options "$remote")"
+    ssh_cmd+="$(sshuttle_ssh_host_key_options)"
+    if [[ "$ssh_cmd" != "ssh" ]]; then
+      cmd+=(-e "$ssh_cmd")
+    fi
   fi
 
   "${SUDO_CMD[@]}" "${cmd[@]}" >"$log" 2>&1 &
@@ -659,7 +772,11 @@ run_curl_batch() {
     for response_path in "$metrics_dir"/*.body; do
       if ! grep -q "${RUSTLE_BENCH_EXPECT:-${RUSTLE_LIVE_EXPECT:-}}" "$response_path"; then
         sed 's/^/curl: /' "$response_path" >&2 || true
-        smoke_die "${tool} response did not contain expected text"
+        if benchmark_failure_allowed_for_tool "$tool"; then
+          failed="$REQUESTS"
+        else
+          smoke_die "${tool} response did not contain expected text"
+        fi
       fi
     done
   fi
@@ -669,7 +786,11 @@ run_curl_batch() {
       size_download="$(awk 'NF >= 2 { printf "%.0f", $2; exit }' "$metric_path")"
       if [[ "$size_download" != "$EXPECT_BYTES" ]]; then
         sed 's/^/curl: /' "${metric_path%.metric}.err" >&2 || true
-        smoke_die "${tool} response downloaded ${size_download:-0} bytes, expected ${EXPECT_BYTES}"
+        if benchmark_failure_allowed_for_tool "$tool"; then
+          failed="$REQUESTS"
+        else
+          smoke_die "${tool} response downloaded ${size_download:-0} bytes, expected ${EXPECT_BYTES}"
+        fi
       fi
     done
   fi
@@ -682,7 +803,7 @@ import sys
 tool, run, requests, concurrency, failed, started_ms, ended_ms, metrics_dir = sys.argv[1:]
 requests = int(requests)
 concurrency = int(concurrency)
-failed = int(failed)
+failed = min(int(failed), requests)
 started_ms = int(started_ms)
 ended_ms = int(ended_ms)
 metrics = pathlib.Path(metrics_dir)
@@ -699,7 +820,7 @@ for path in sorted(metrics.glob("*.metric")):
     latencies.append(float(parts[0]) * 1000)
     bytes_total += int(float(parts[1]))
 
-success = len(latencies)
+success = max(len(latencies) - failed, 0)
 wall_ms = max(ended_ms - started_ms, 1)
 latencies.sort()
 
@@ -840,7 +961,10 @@ for tool in $TOOLS; do
       cpu_samples="${run_dir}/cpu.samples"
       sampler_pid="$(start_cpu_sampler "$sample_pid" "$cpu_samples")"
       metrics_file="${run_dir}/batch.tsv"
-      if ! run_curl_batch_with_timeout "$metrics_file" "$tool_label" "$run" "$run_dir"; then
+      batch_status=0
+      run_curl_batch_with_timeout "$metrics_file" "$tool_label" "$run" "$run_dir" \
+        || batch_status=$?
+      if [[ "$batch_status" -ne 0 ]] && ! benchmark_failure_allowed_for_tool "$tool_label"; then
         stop_sampler "$sampler_pid"
         if [[ "$tool" == "rustle" ]]; then
           tail -n 120 "$RUSTLE_LOG" 2>/dev/null | sed 's/^/rustle: /' >&2 || true
@@ -849,8 +973,20 @@ for tool in $TOOLS; do
         fi
         smoke_die "${tool_label} benchmark request batch failed or timed out"
       fi
-      metrics_line="$(cat "$metrics_file")"
+      metrics_line="$(cat "$metrics_file" 2>/dev/null || true)"
       stop_sampler "$sampler_pid"
+
+      if [[ "$batch_status" -ne 0 && -z "$metrics_line" ]]; then
+        if [[ "$tool" == "rustle" ]]; then
+          tail -n 120 "$RUSTLE_LOG" 2>/dev/null | sed 's/^/rustle: /' >&2 || true
+        elif [[ -n "${SSHUTTLE_LOG:-}" ]]; then
+          tail -n 120 "$SSHUTTLE_LOG" 2>/dev/null | sed 's/^/sshuttle: /' >&2 || true
+        fi
+        smoke_die "${tool_label} benchmark failed before producing a metrics row"
+      fi
+      if [[ "$batch_status" -ne 0 ]]; then
+        smoke_info "recording allowed failed benchmark row for ${tool_label} run ${run}/${RUNS}"
+      fi
 
       if [[ "$tool" == "rustle" ]]; then
         stop_rustle
