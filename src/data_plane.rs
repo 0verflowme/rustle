@@ -29,8 +29,10 @@ mod udp;
 pub(crate) use dns::spawn_dns_query_on_data_plane;
 pub(crate) use tcp::spawn_agent_tcp_bridge;
 use tcp::{spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge};
-use udp::spawn_udp_association_with_idle_timeout;
-use udp::UdpAssociationTransport;
+use udp::{
+    spawn_agent_udp_association_with_idle_timeout,
+    spawn_quic_native_udp_association_with_idle_timeout,
+};
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
@@ -63,33 +65,12 @@ pub(crate) trait DataPlane: Send + Sync {
 }
 
 #[derive(Clone)]
-pub(crate) enum RuntimeDataPlane {
-    DirectTcpip(DirectTcpipDataPlane),
-    FramedAgent(FramedAgentDataPlane),
-    QuicNative(QuicNativeDataPlane),
-}
-
-impl RuntimeDataPlane {
-    pub(crate) fn direct_tcpip(ssh: SshSessionPool) -> Self {
-        Self::DirectTcpip(DirectTcpipDataPlane::new(ssh))
-    }
-
-    pub(crate) fn framed_agent(agent: ReconnectingAgentBridge) -> Self {
-        Self::FramedAgent(FramedAgentDataPlane::new(agent))
-    }
-
-    pub(crate) fn quic_native(bridge: QuicNativeBridge) -> Self {
-        Self::QuicNative(QuicNativeDataPlane::new(bridge))
-    }
-}
-
-#[derive(Clone)]
 pub(crate) struct DirectTcpipDataPlane {
     ssh: SshSessionPool,
 }
 
 impl DirectTcpipDataPlane {
-    fn new(ssh: SshSessionPool) -> Self {
+    pub(crate) fn new(ssh: SshSessionPool) -> Self {
         Self { ssh }
     }
 }
@@ -100,7 +81,7 @@ pub(crate) struct FramedAgentDataPlane {
 }
 
 impl FramedAgentDataPlane {
-    fn new(agent: ReconnectingAgentBridge) -> Self {
+    pub(crate) fn new(agent: ReconnectingAgentBridge) -> Self {
         Self { agent }
     }
 }
@@ -111,7 +92,7 @@ pub(crate) struct QuicNativeDataPlane {
 }
 
 impl QuicNativeDataPlane {
-    fn new(bridge: QuicNativeBridge) -> Self {
+    pub(crate) fn new(bridge: QuicNativeBridge) -> Self {
         Self { bridge }
     }
 }
@@ -245,8 +226,8 @@ impl DataPlane for FramedAgentDataPlane {
         events: UdpAssociationEvents,
         idle_timeout: Duration,
     ) {
-        spawn_udp_association_with_idle_timeout(
-            UdpAssociationTransport::Agent(self.agent.clone()),
+        spawn_agent_udp_association_with_idle_timeout(
+            self.agent.clone(),
             key,
             from_local,
             events,
@@ -307,100 +288,13 @@ impl DataPlane for QuicNativeDataPlane {
         events: UdpAssociationEvents,
         idle_timeout: Duration,
     ) {
-        spawn_udp_association_with_idle_timeout(
-            UdpAssociationTransport::QuicNative(self.bridge.clone()),
+        spawn_quic_native_udp_association_with_idle_timeout(
+            self.bridge.clone(),
             key,
             from_local,
             events,
             idle_timeout,
         );
-    }
-}
-
-impl DataPlane for RuntimeDataPlane {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.label(),
-            Self::FramedAgent(data_plane) => data_plane.label(),
-            Self::QuicNative(data_plane) => data_plane.label(),
-        }
-    }
-
-    fn udp_label(&self) -> Option<&'static str> {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.udp_label(),
-            Self::FramedAgent(data_plane) => data_plane.udp_label(),
-            Self::QuicNative(data_plane) => data_plane.udp_label(),
-        }
-    }
-
-    fn caps(&self) -> DataPlaneCaps {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.caps(),
-            Self::FramedAgent(data_plane) => data_plane.caps(),
-            Self::QuicNative(data_plane) => data_plane.caps(),
-        }
-    }
-
-    fn admission_limits(&self) -> BridgeAdmissionLimits {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.admission_limits(),
-            Self::FramedAgent(data_plane) => data_plane.admission_limits(),
-            Self::QuicNative(data_plane) => data_plane.admission_limits(),
-        }
-    }
-
-    fn snapshot(&self) -> DataPlaneSnapshotFuture<'_> {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.snapshot(),
-            Self::FramedAgent(data_plane) => data_plane.snapshot(),
-            Self::QuicNative(data_plane) => data_plane.snapshot(),
-        }
-    }
-
-    fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.spawn_tcp_bridge(id, event_tx),
-            Self::FramedAgent(data_plane) => data_plane.spawn_tcp_bridge(id, event_tx),
-            Self::QuicNative(data_plane) => data_plane.spawn_tcp_bridge(id, event_tx),
-        }
-    }
-
-    fn query_dns(
-        &self,
-        remote: Destination,
-        query: Bytes,
-        originator_ip: Ipv4Addr,
-    ) -> DataPlaneDnsFuture<'_> {
-        match self {
-            Self::DirectTcpip(data_plane) => data_plane.query_dns(remote, query, originator_ip),
-            Self::FramedAgent(data_plane) => data_plane.query_dns(remote, query, originator_ip),
-            Self::QuicNative(data_plane) => data_plane.query_dns(remote, query, originator_ip),
-        }
-    }
-
-    fn spawn_udp_association(
-        &self,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    ) {
-        match self {
-            Self::DirectTcpip(data_plane) => {
-                data_plane.spawn_udp_association(key, from_local, events, idle_timeout);
-            }
-            Self::FramedAgent(data_plane) => {
-                data_plane.spawn_udp_association(key, from_local, events, idle_timeout);
-            }
-            Self::QuicNative(data_plane) => {
-                data_plane.spawn_udp_association(key, from_local, events, idle_timeout);
-            }
-        }
     }
 }
 
@@ -437,8 +331,8 @@ mod tests {
         }
     }
 
-    async fn test_agent_runtime_data_plane() -> (
-        RuntimeDataPlane,
+    async fn test_agent_data_plane() -> (
+        FramedAgentDataPlane,
         ReconnectingAgentBridge,
         tokio::task::JoinHandle<Result<()>>,
     ) {
@@ -467,13 +361,13 @@ mod tests {
                 ),
             ],
         );
-        let runtime = RuntimeDataPlane::framed_agent(bridge.clone());
+        let data_plane = FramedAgentDataPlane::new(bridge.clone());
 
-        (runtime, bridge, agent_task)
+        (data_plane, bridge, agent_task)
     }
 
     async fn test_quic_native_runtime() -> (
-        RuntimeDataPlane,
+        QuicNativeDataPlane,
         QuicNativeBridge,
         tokio::task::JoinHandle<()>,
     ) {
@@ -490,25 +384,28 @@ mod tests {
             .await
             .expect("connect native QUIC bridge");
         let bridge = QuicNativeBridge::detached(client);
-        let runtime = RuntimeDataPlane::quic_native(bridge.clone());
+        let data_plane = QuicNativeDataPlane::new(bridge.clone());
 
-        (runtime, bridge, bridge_task)
+        (data_plane, bridge, bridge_task)
     }
 
     #[tokio::test]
-    async fn runtime_data_plane_wraps_framed_agent_adapter_contract() {
-        let (runtime, bridge, agent_task) = test_agent_runtime_data_plane().await;
+    async fn framed_agent_data_plane_contract_matches_agent_adapter() {
+        let (data_plane, bridge, agent_task) = test_agent_data_plane().await;
 
-        assert_eq!(runtime.label(), "agent");
-        assert_eq!(runtime.udp_label(), Some("agent"));
-        assert!(runtime.caps().udp_associations);
-        assert_eq!(runtime.admission_limits(), BridgeAdmissionLimits::agent());
-        let snapshot = runtime.snapshot().await;
+        assert_eq!(data_plane.label(), "agent");
+        assert_eq!(data_plane.udp_label(), Some("agent"));
+        assert!(data_plane.caps().udp_associations);
+        assert_eq!(
+            data_plane.admission_limits(),
+            BridgeAdmissionLimits::agent()
+        );
+        let snapshot = data_plane.snapshot().await;
         assert_eq!(snapshot.lanes_total, 1);
         assert_eq!(snapshot.lanes_desired, 1);
         assert_eq!(snapshot.lanes_available, 1);
 
-        drop(runtime);
+        drop(data_plane);
         drop(bridge);
         tokio::time::timeout(std::time::Duration::from_secs(1), agent_task)
             .await
@@ -518,7 +415,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_data_plane_spawns_framed_agent_udp_association() {
+    async fn framed_agent_data_plane_spawns_udp_association() {
         let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
             .await
             .expect("bind UDP target");
@@ -545,7 +442,7 @@ mod tests {
             dst_ip: *destination.ip(),
             dst_port: destination.port(),
         };
-        let (runtime, bridge, agent_task) = test_agent_runtime_data_plane().await;
+        let (data_plane, bridge, agent_task) = test_agent_data_plane().await;
         let (to_remote, from_local) =
             mpsc::channel(crate::transport_model::UDP_DATAGRAMS_PER_ASSOCIATION);
         let (response_tx, mut response_rx) = mpsc::channel(8);
@@ -555,7 +452,12 @@ mod tests {
             close_tx,
         };
 
-        runtime.spawn_udp_association(key, from_local, events, std::time::Duration::from_secs(30));
+        data_plane.spawn_udp_association(
+            key,
+            from_local,
+            events,
+            std::time::Duration::from_secs(30),
+        );
         to_remote
             .send(Bytes::from_static(b"one"))
             .await
@@ -598,7 +500,7 @@ mod tests {
         assert_eq!(closed.key, key);
         assert!(closed.error.is_none());
 
-        drop(runtime);
+        drop(data_plane);
         drop(bridge);
         tokio::time::timeout(std::time::Duration::from_secs(1), agent_task)
             .await
@@ -609,15 +511,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_data_plane_wraps_quic_native_adapter_contract() {
-        let (runtime, bridge, bridge_task) = test_quic_native_runtime().await;
+    async fn quic_native_data_plane_contract_matches_native_adapter() {
+        let (data_plane, bridge, bridge_task) = test_quic_native_runtime().await;
 
-        assert_eq!(runtime.label(), "native QUIC");
-        assert_eq!(runtime.udp_label(), Some("quic-native"));
-        assert!(runtime.caps().udp_associations);
-        assert_eq!(runtime.admission_limits(), BridgeAdmissionLimits::agent());
+        assert_eq!(data_plane.label(), "native QUIC");
+        assert_eq!(data_plane.udp_label(), Some("quic-native"));
+        assert!(data_plane.caps().udp_associations);
         assert_eq!(
-            runtime.snapshot().await,
+            data_plane.admission_limits(),
+            BridgeAdmissionLimits::agent()
+        );
+        assert_eq!(
+            data_plane.snapshot().await,
             DataPlaneRuntimeSnapshot::default()
         );
 
@@ -626,7 +531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_data_plane_spawns_quic_native_udp_association() {
+    async fn quic_native_data_plane_spawns_udp_association() {
         let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
             .await
             .expect("bind UDP target");
@@ -653,7 +558,7 @@ mod tests {
             dst_ip: *destination.ip(),
             dst_port: destination.port(),
         };
-        let (runtime, bridge, bridge_task) = test_quic_native_runtime().await;
+        let (data_plane, bridge, bridge_task) = test_quic_native_runtime().await;
         let (to_remote, from_local) =
             mpsc::channel(crate::transport_model::UDP_DATAGRAMS_PER_ASSOCIATION);
         let (response_tx, mut response_rx) = mpsc::channel(8);
@@ -663,7 +568,12 @@ mod tests {
             close_tx,
         };
 
-        runtime.spawn_udp_association(key, from_local, events, std::time::Duration::from_secs(30));
+        data_plane.spawn_udp_association(
+            key,
+            from_local,
+            events,
+            std::time::Duration::from_secs(30),
+        );
         to_remote
             .send(Bytes::from_static(b"one"))
             .await

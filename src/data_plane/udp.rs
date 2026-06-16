@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -17,21 +18,49 @@ use super::stream::AgentIoStream;
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Clone)]
-pub(super) enum UdpAssociationTransport {
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
-}
-
-pub(super) fn spawn_udp_association_with_idle_timeout(
-    transport: UdpAssociationTransport,
+pub(super) fn spawn_agent_udp_association_with_idle_timeout(
+    agent: ReconnectingAgentBridge,
     key: UdpFlowKey,
     from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
 ) {
+    spawn_udp_association_with_idle_timeout(
+        open_agent_udp_association(agent, key),
+        key,
+        from_local,
+        events,
+        idle_timeout,
+    );
+}
+
+pub(super) fn spawn_quic_native_udp_association_with_idle_timeout(
+    bridge: QuicNativeBridge,
+    key: UdpFlowKey,
+    from_local: mpsc::Receiver<Bytes>,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+) {
+    spawn_udp_association_with_idle_timeout(
+        open_quic_native_udp_association(bridge, key),
+        key,
+        from_local,
+        events,
+        idle_timeout,
+    );
+}
+
+fn spawn_udp_association_with_idle_timeout<Fut>(
+    open_stream: Fut,
+    key: UdpFlowKey,
+    from_local: mpsc::Receiver<Bytes>,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+) where
+    Fut: Future<Output = Result<AgentIoStream>> + Send + 'static,
+{
     tokio::spawn(async move {
-        let error = run_udp_association(transport, key, from_local, events.clone(), idle_timeout)
+        let error = run_udp_association(open_stream, key, from_local, events.clone(), idle_timeout)
             .await
             .err()
             .map(|err| err.to_string());
@@ -44,43 +73,77 @@ pub(super) fn spawn_udp_association_with_idle_timeout(
     });
 }
 
-pub(crate) async fn run_udp_association(
-    transport: UdpAssociationTransport,
+async fn run_udp_association<Fut>(
+    open_stream: Fut,
     key: UdpFlowKey,
     mut from_local: mpsc::Receiver<Bytes>,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
-) -> Result<()> {
-    let open = agent_proto::AgentOpenIpv4 {
+) -> Result<()>
+where
+    Fut: Future<Output = Result<AgentIoStream>>,
+{
+    let stream = open_stream.await?;
+    run_udp_association_stream(stream, key, &mut from_local, events, idle_timeout).await
+}
+
+fn udp_open_request(key: UdpFlowKey) -> agent_proto::AgentOpenIpv4 {
+    agent_proto::AgentOpenIpv4 {
         destination_ip: key.dst_ip,
         destination_port: key.dst_port,
         originator_ip: key.src_ip,
         originator_port: key.src_port,
-    };
-    let stream = match transport {
-        UdpAssociationTransport::Agent(agent) => agent
-            .open_udp_ipv4(open)
-            .await
-            .map(AgentIoStream::Bridge)
-            .with_context(|| {
-                format!(
-                    "failed to open agent UDP association to {}:{}",
-                    key.dst_ip, key.dst_port
-                )
-            })?,
-        UdpAssociationTransport::QuicNative(bridge) => bridge
-            .open_udp_ipv4(open)
-            .await
-            .map(AgentIoStream::QuicNativeUdp)
-            .with_context(|| {
-                format!(
-                    "failed to open native QUIC UDP association to {}:{}",
-                    key.dst_ip, key.dst_port
-                )
-            })?,
-    };
+    }
+}
 
-    run_udp_association_stream(stream, key, &mut from_local, events, idle_timeout).await
+async fn open_agent_udp_association(
+    agent: ReconnectingAgentBridge,
+    key: UdpFlowKey,
+) -> Result<AgentIoStream> {
+    agent
+        .open_udp_ipv4(udp_open_request(key))
+        .await
+        .map(AgentIoStream::Bridge)
+        .with_context(|| {
+            format!(
+                "failed to open agent UDP association to {}:{}",
+                key.dst_ip, key.dst_port
+            )
+        })
+}
+
+async fn open_quic_native_udp_association(
+    bridge: QuicNativeBridge,
+    key: UdpFlowKey,
+) -> Result<AgentIoStream> {
+    bridge
+        .open_udp_ipv4(udp_open_request(key))
+        .await
+        .map(AgentIoStream::QuicNativeUdp)
+        .with_context(|| {
+            format!(
+                "failed to open native QUIC UDP association to {}:{}",
+                key.dst_ip, key.dst_port
+            )
+        })
+}
+
+#[cfg(test)]
+async fn run_quic_native_udp_association(
+    bridge: QuicNativeBridge,
+    key: UdpFlowKey,
+    from_local: mpsc::Receiver<Bytes>,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+) -> Result<()> {
+    run_udp_association(
+        open_quic_native_udp_association(bridge, key),
+        key,
+        from_local,
+        events,
+        idle_timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -425,8 +488,8 @@ mod tests {
             response_tx,
             close_tx,
         };
-        let association = tokio::spawn(run_udp_association(
-            UdpAssociationTransport::QuicNative(bridge.clone()),
+        let association = tokio::spawn(run_quic_native_udp_association(
+            bridge.clone(),
             key,
             from_local,
             events,
@@ -500,8 +563,8 @@ mod tests {
         let mut association_limit = DnsInflight::new(1);
         assert!(association_limit.try_admit());
 
-        spawn_udp_association_with_idle_timeout(
-            UdpAssociationTransport::Agent(bridge.clone()),
+        spawn_agent_udp_association_with_idle_timeout(
+            bridge.clone(),
             key,
             from_local,
             events,
@@ -528,5 +591,52 @@ mod tests {
             .expect("agent exits")
             .expect("agent join")
             .expect("agent run");
+    }
+
+    #[tokio::test]
+    async fn quic_native_udp_association_idle_timeout_emits_close_for_accounting() {
+        let (bridge, bridge_task) = test_quic_native_bridge().await;
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::LOCALHOST,
+            dst_port: 5353,
+        };
+        let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (close_tx, mut close_rx) = mpsc::channel(1);
+        let events = UdpAssociationEvents {
+            response_tx,
+            close_tx,
+        };
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let mut association_limit = DnsInflight::new(1);
+        assert!(association_limit.try_admit());
+
+        spawn_quic_native_udp_association_with_idle_timeout(
+            bridge.clone(),
+            key,
+            from_local,
+            events,
+            std::time::Duration::from_millis(10),
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(1), close_rx.recv())
+            .await
+            .expect("idle association closes")
+            .expect("close event");
+        assert_eq!(closed.key, key);
+        assert!(closed.error.is_none());
+        assert!(response_rx.try_recv().is_err());
+
+        associations.remove(&closed.key);
+        association_limit.complete();
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(association_limit.completed(), 1);
+        assert!(associations.is_empty());
+
+        drop(bridge);
+        bridge_task.await.expect("native bridge task");
     }
 }
