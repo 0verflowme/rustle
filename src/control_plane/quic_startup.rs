@@ -11,7 +11,7 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport, QuicNativeBridge,
 };
-use crate::remote_helper::{bootstrap_helper, HelperCommandPlan, HelperKind};
+use crate::remote_helper::{HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
     connect_prepared_ssh, prepare_ssh_connection, Client, PreparedSshConnection,
 };
@@ -19,7 +19,7 @@ use crate::{quic_agent, quic_agent_runtime, SshArgs};
 
 use super::{
     connect_agent_bridge_transports_from_connector, connect_helper_with_upload_fallback,
-    ensure_helper_plan_kind,
+    connect_uploaded_helper,
 };
 
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -221,33 +221,34 @@ async fn connect_uploaded_quic_agent_bridge_transport_prepared(
     helper_plan: &HelperCommandPlan,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    let kind = HelperKind::QuicAgent;
-    ensure_helper_plan_kind(helper_plan, kind)?;
-    let started = bootstrap_helper(prepared, helper_plan).await?;
-    connect_quic_agent_bridge_transport_on_handle(
-        started.handle,
-        prepared.remote_host(),
-        &started.helper.command,
-        mtu,
+    let remote_host = prepared.remote_host().to_owned();
+    let (transport, _) = connect_uploaded_helper(
+        prepared,
+        helper_plan,
+        HelperKind::QuicAgent,
+        |handle, command| async move {
+            connect_quic_agent_bridge_transport_on_handle(handle, &remote_host, &command, mtu).await
+        },
     )
-    .await
-    .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))
+    .await?;
+    Ok(transport)
 }
 
 async fn connect_uploaded_quic_native_bridge_prepared(
     prepared: &PreparedSshConnection,
     helper_plan: &HelperCommandPlan,
 ) -> Result<QuicNativeBridge> {
-    let kind = HelperKind::QuicBridgeNative;
-    ensure_helper_plan_kind(helper_plan, kind)?;
-    let started = bootstrap_helper(prepared, helper_plan).await?;
-    connect_quic_native_bridge_on_handle(
-        started.handle,
-        prepared.remote_host(),
-        &started.helper.command,
+    let remote_host = prepared.remote_host().to_owned();
+    let (bridge, _) = connect_uploaded_helper(
+        prepared,
+        helper_plan,
+        HelperKind::QuicBridgeNative,
+        |handle, command| async move {
+            connect_quic_native_bridge_on_handle(handle, &remote_host, &command).await
+        },
     )
-    .await
-    .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))
+    .await?;
+    Ok(bridge)
 }
 
 async fn connect_quic_data_plane<T, F>(

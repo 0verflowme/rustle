@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
@@ -10,7 +9,7 @@ use crate::agent_bridge::{
     AgentBridgeTransport, ReconnectingAgentBridge,
 };
 use crate::bridge_runtime::{BridgeRuntime, DnsTransport};
-use crate::remote_helper::{bootstrap_helper, HelperCommandPlan, HelperKind};
+use crate::remote_helper::{HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, resolve_agent_session_count,
     Client, PreparedSshConnection,
@@ -19,12 +18,14 @@ use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destinat
 use crate::{agent_proto, agent_transport, SshArgs};
 
 mod agent_startup;
+mod helper_startup;
 mod quic_startup;
 
 pub(crate) use agent_startup::{
     connect_agent_bridge_transports_from_connector,
     connect_auto_agent_bridge_transports_from_connector, should_fast_start_agent_lanes,
 };
+use helper_startup::{connect_helper_with_upload_fallback, connect_uploaded_helper};
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
@@ -131,86 +132,21 @@ async fn connect_agent_bridge_transport_on_handle(
     Ok(AgentBridgeTransport::ssh(handle, transport, agent_command))
 }
 
-async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
-    helper_plan: &HelperCommandPlan,
-    primary: PrimaryFut,
-    upload: UploadFn,
-    helper_name: &str,
-    upload_success_log: Option<&str>,
-) -> Result<T>
-where
-    PrimaryFut: Future<Output = Result<T>>,
-    UploadFn: FnOnce() -> UploadFut,
-    UploadFut: Future<Output = Result<T>>,
-{
-    match primary.await {
-        Ok(started) => Ok(started),
-        Err(initial_err) => {
-            if !helper_plan.allows_upload_fallback() {
-                return Err(initial_err).with_context(|| {
-                    format!(
-                        "failed to start {helper_name} via explicit command: {}",
-                        helper_plan.command
-                    )
-                });
-            }
-
-            let initial_err_detail = format!("{initial_err:#}");
-            eprintln!(
-                "{}: remote command failed ({initial_err_detail}); trying upload bootstrap",
-                helper_plan.kind.controller_log_prefix()
-            );
-            match upload().await {
-                Ok(started) => {
-                    if let Some(message) = upload_success_log {
-                        eprintln!("{message}");
-                    }
-                    Ok(started)
-                }
-                Err(bootstrap_err) => Err(bootstrap_err).with_context(|| {
-                    format!(
-                        "failed to start {helper_name} via command ({initial_err_detail}) or upload bootstrap"
-                    )
-                }),
-            }
-        }
-    }
-}
-
 async fn connect_uploaded_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
     helper_plan: &HelperCommandPlan,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    connect_uploaded_stdio_agent_bridge_transport_prepared(prepared, helper_plan, mtu)
-        .await
-        .map(|(transport, _)| transport)
-}
-
-async fn connect_uploaded_stdio_agent_bridge_transport_prepared(
-    prepared: &PreparedSshConnection,
-    helper_plan: &HelperCommandPlan,
-    mtu: u16,
-) -> Result<(AgentBridgeTransport, String)> {
-    let kind = HelperKind::StdioAgent;
-    ensure_helper_plan_kind(helper_plan, kind)?;
-    let started = bootstrap_helper(prepared, helper_plan).await?;
-    let transport =
-        connect_agent_bridge_transport_on_handle(started.handle, &started.helper.command, mtu)
-            .await
-            .with_context(|| kind.uploaded_start_context(&started.helper.remote_path))?;
-    Ok((transport, started.helper.command))
-}
-
-fn ensure_helper_plan_kind(plan: &HelperCommandPlan, expected: HelperKind) -> Result<()> {
-    if plan.kind != expected {
-        bail!(
-            "helper startup plan kind mismatch: expected {:?}, got {:?}",
-            expected,
-            plan.kind
-        );
-    }
-    Ok(())
+    let (transport, _) = connect_uploaded_helper(
+        prepared,
+        helper_plan,
+        HelperKind::StdioAgent,
+        |handle, command| async move {
+            connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
+        },
+    )
+    .await?;
+    Ok(transport)
 }
 
 pub(crate) async fn connect_bridge_runtime(
