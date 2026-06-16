@@ -13,10 +13,10 @@ use crate::agent_bridge::{
 };
 use crate::data_plane::{
     bridge_admission_decision, spawn_dns_query, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, BridgeRuntime, Destination, DnsResponseEvent, DnsTransport,
-    UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
-    UDP_DATAGRAMS_PER_ASSOCIATION,
+    BridgeAdmissionDecision, BridgeRuntime, DnsResponseEvent, DnsTransport, UdpAssociation,
+    UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey, UDP_DATAGRAMS_PER_ASSOCIATION,
 };
+use crate::transport_model::Destination;
 use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core, DEFAULT_TUN_IP};
 
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;

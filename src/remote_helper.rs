@@ -6,8 +6,8 @@ use ring::digest;
 use russh::client::Handle;
 use tokio::io::AsyncReadExt;
 
-use crate::data_plane::BridgeTransportKind;
 use crate::ssh_control::Client;
+use crate::transport_model::BridgeTransportKind;
 
 pub(crate) const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
 pub(crate) const DEFAULT_QUIC_AGENT_COMMAND: &str = "rustle quic-agent";

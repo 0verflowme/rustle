@@ -10,9 +10,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tun_rs::DeviceBuilder;
 
-use crate::data_plane::{
-    query_dns_over_transport, BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsTransport,
-};
+use crate::connect_bridge_runtime;
+use crate::data_plane::{query_dns_over_transport, DnsTransport};
 use crate::packet_engine::{
     run_tunnel_loop, smol_now, tun_ipv4_packet, write_packets_to_tun, MAX_IN_FLIGHT_DNS_QUERIES,
     PACKET_BUF_SIZE,
@@ -21,7 +20,9 @@ use crate::remote_helper::effective_bridge_agent_command;
 use crate::ssh_control::{
     resolve_ssh_target, validate_agent_session_request_count, validate_ssh_session_count,
 };
-use crate::{connect_bridge_runtime, parse_destination};
+use crate::transport_model::{
+    parse_destination, BridgeRuntimeOptions, BridgeTransportKind, Destination,
+};
 use crate::{dns, platform, tcp_core, SshArgs, TunCaptureArgs, TunnelArgs, DEFAULT_TUN_IP};
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {

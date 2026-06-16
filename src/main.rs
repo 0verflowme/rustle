@@ -37,6 +37,7 @@ mod ssh_control;
 mod supervisor;
 #[allow(dead_code)]
 mod tcp_core;
+mod transport_model;
 
 use agent_bridge::AgentBridgeConnector;
 #[cfg(test)]
@@ -69,10 +70,7 @@ use data_plane::{
     send_dns_response_event, spawn_udp_association_with_idle_timeout, BridgeAdmissionDecision,
     DnsResponseEvent, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
 };
-use data_plane::{
-    query_dns_over_transport, BridgeRuntimeOptions, BridgeTransportKind, Destination,
-    UDP_DATAGRAMS_PER_ASSOCIATION,
-};
+use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
 use packet_engine::{
     admit_udp_datagram, drain_local_bytes_to_bridges, drop_unsupported_direct_udp, format_bytes,
@@ -105,6 +103,9 @@ use supervisor::{
     RouteCommandExecutor,
 };
 use supervisor::{parse_target_cidr, run_tun_capture, run_tunnel};
+#[cfg(test)]
+use transport_model::Destination;
+use transport_model::{parse_destination, BridgeRuntimeOptions, BridgeTransportKind};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;
@@ -1018,23 +1019,6 @@ pub(crate) struct Ipv4Destination {
     pub(crate) host: String,
     pub(crate) ip: Ipv4Addr,
     pub(crate) port: u16,
-}
-
-fn parse_destination(input: &str) -> Result<Destination> {
-    let (host, port) = input
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("destination must be in host:port form"))?;
-    if host.is_empty() {
-        bail!("destination host must not be empty");
-    }
-
-    let port = port
-        .parse::<u16>()
-        .with_context(|| format!("invalid destination port in {input}"))?;
-    Ok(Destination {
-        host: host.to_owned(),
-        port,
-    })
 }
 
 pub(crate) fn parse_ipv4_destination(input: &str) -> Result<Ipv4Destination> {

@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use clap::ValueEnum;
 use tokio::sync::mpsc;
 
 use crate::agent_bridge::{
@@ -12,6 +11,7 @@ use crate::agent_bridge::{
 #[cfg(test)]
 use crate::agent_transport;
 use crate::ssh_control::SshSessionPool;
+use crate::transport_model::Destination;
 use crate::{agent_proto, dns, quic_agent, ssh_bridge};
 
 pub(crate) const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
@@ -22,28 +22,6 @@ pub(crate) const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum BridgeTransportKind {
-    Auto,
-    DirectTcpip,
-    Agent,
-    QuicAgent,
-    QuicNative,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct BridgeRuntimeOptions {
-    pub(crate) ssh_sessions: usize,
-    pub(crate) agent_sessions: usize,
-    pub(crate) fast_start_auto_agent_lanes: bool,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct Destination {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-}
 
 pub(crate) enum BridgeRuntime {
     DirectTcpip(SshSessionPool),
