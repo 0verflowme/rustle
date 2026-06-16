@@ -11,7 +11,8 @@ use crate::agent_bridge::{
 };
 #[cfg(test)]
 use crate::agent_transport;
-use crate::{agent_proto, dns, quic_agent, ssh_bridge, SshSessionPool};
+use crate::ssh_control::SshSessionPool;
+use crate::{agent_proto, dns, quic_agent, ssh_bridge};
 
 pub(crate) const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
 pub(crate) const MAX_DIRECT_OPENING_CHANNELS: usize = 32;

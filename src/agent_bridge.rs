@@ -9,7 +9,8 @@ use bytes::Bytes;
 use russh::client::Handle;
 use tokio::sync::Mutex;
 
-use crate::{agent_proto, agent_transport, finalize_flow_hash, fnv1a_mix, quic_agent, Client};
+use crate::ssh_control::{finalize_flow_hash, fnv1a_mix, Client};
+use crate::{agent_proto, agent_transport, quic_agent};
 
 pub(crate) const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 pub(crate) const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);

@@ -17,13 +17,17 @@ use crate::remote_helper::{
     local_agent_binary_for_platform, probe_remote_platform, upload_agent_binary,
     uploaded_agent_command, uploaded_helper_command,
 };
-use crate::{
-    agent_proto, agent_transport, connect_prepared_ssh, connect_ssh, connect_ssh_pool,
-    prepare_ssh_connection, quic_agent, resolve_agent_session_count, resolve_ssh_target,
-    validate_agent_session_count, Client, PreparedSshConnection, SshArgs,
-    AGENT_FAST_START_WARMUP_DELAY, AGENT_INITIAL_CONNECT_BATCH, AGENT_INITIAL_CONNECT_RETRY_ROUNDS,
-    AUTO_AGENT_SESSIONS, QUIC_AGENT_BOOTSTRAP_TIMEOUT,
+use crate::ssh_control::{
+    connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,
+    resolve_agent_session_count, resolve_ssh_target, validate_agent_session_count, Client,
+    PreparedSshConnection, AUTO_AGENT_SESSIONS,
 };
+use crate::{agent_proto, agent_transport, quic_agent, SshArgs};
+
+const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const AGENT_INITIAL_CONNECT_BATCH: usize = 4;
+const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
+const QUIC_AGENT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone)]
 pub(crate) struct SshAgentBridgeConnector {

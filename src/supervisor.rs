@@ -18,10 +18,10 @@ use crate::packet_engine::{
     PACKET_BUF_SIZE,
 };
 use crate::remote_helper::effective_bridge_agent_command;
-use crate::{
-    connect_bridge_runtime, parse_destination, resolve_ssh_target,
-    validate_agent_session_request_count, validate_ssh_session_count,
+use crate::ssh_control::{
+    resolve_ssh_target, validate_agent_session_request_count, validate_ssh_session_count,
 };
+use crate::{connect_bridge_runtime, parse_destination};
 use crate::{dns, platform, tcp_core, SshArgs, TunCaptureArgs, TunnelArgs, DEFAULT_TUN_IP};
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {

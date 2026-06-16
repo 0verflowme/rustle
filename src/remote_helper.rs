@@ -7,7 +7,7 @@ use russh::client::Handle;
 use tokio::io::AsyncReadExt;
 
 use crate::data_plane::BridgeTransportKind;
-use crate::Client;
+use crate::ssh_control::Client;
 
 pub(crate) const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
 pub(crate) const DEFAULT_QUIC_AGENT_COMMAND: &str = "rustle quic-agent";
@@ -75,7 +75,7 @@ impl HelperCommandPlan {
         agent_command: Option<&str>,
         agent_path: Option<&str>,
     ) -> Result<Self> {
-        match (agent_command, agent_path) {
+        let (command, policy) = match (agent_command, agent_path) {
             (Some(_), Some(_)) => {
                 bail!("--agent-command cannot be combined with --agent-path");
             }
@@ -83,28 +83,31 @@ impl HelperCommandPlan {
                 if command.trim().is_empty() {
                     bail!("--agent-command must not be empty");
                 }
-                Ok(Self {
-                    kind,
-                    command: command.to_owned(),
-                    policy: BootstrapPolicy::ExplicitCommandNoFallback,
-                })
+                (
+                    command.to_owned(),
+                    BootstrapPolicy::ExplicitCommandNoFallback,
+                )
             }
             (None, Some(path)) => {
                 if path.trim().is_empty() {
                     bail!("--agent-path must not be empty");
                 }
-                Ok(Self {
-                    kind,
-                    command: format!("{} {}", shell_quote(path), kind.subcommand()),
-                    policy: BootstrapPolicy::ExplicitCommandNoFallback,
-                })
+                (
+                    format!("{} {}", shell_quote(path), kind.subcommand()),
+                    BootstrapPolicy::ExplicitCommandNoFallback,
+                )
             }
-            (None, None) => Ok(Self {
-                kind,
-                command: kind.default_command().to_owned(),
-                policy: BootstrapPolicy::BuiltInCommandWithUploadFallback,
-            }),
-        }
+            (None, None) => (
+                kind.default_command().to_owned(),
+                BootstrapPolicy::BuiltInCommandWithUploadFallback,
+            ),
+        };
+
+        Ok(Self {
+            kind,
+            command,
+            policy,
+        })
     }
 }
 
