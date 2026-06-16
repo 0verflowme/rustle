@@ -10,6 +10,7 @@ use ring::digest;
 use russh::client::Handle;
 use tokio::io::AsyncReadExt;
 
+use crate::sidecar_store::local_helper_binary_for_platform;
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 use crate::transport_model::BridgeTransportKind;
 
@@ -21,7 +22,6 @@ pub(crate) const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str =
 pub(crate) const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
 pub(crate) const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
 pub(crate) const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $d=$env:TEMP; if ([string]::IsNullOrWhiteSpace($d)) { $d=$env:TMP }; if ([string]::IsNullOrWhiteSpace($d)) { $d=[IO.Path]::GetTempPath() }; $dir=Join-Path -Path $d -ChildPath ('rustle-agent-{0}-{1}' -f $PID,[Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dir -Force | Out-Null; $p=Join-Path -Path $dir -ChildPath 'rustle-agent.exe'; $stdin=[Console]::OpenStandardInput(); try { $out=[IO.File]::Open($p,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); try { $stdin.CopyTo($out) } finally { $out.Dispose(); $stdin.Dispose() } } catch { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; throw }; [Console]::Out.WriteLine($p)\"";
-pub(crate) const RUSTLE_AGENT_DIR_ENV: &str = "RUSTLE_AGENT_DIR";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HelperKind {
@@ -309,21 +309,21 @@ pub(crate) async fn stage_uploaded_helper_command(
         .await
         .context(kind.platform_probe_context())?;
     let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
-    let local_path = local_agent_binary_for_platform(&current_exe, platform)?;
-    if helper_uses_sidecar(&current_exe, &local_path) {
+    let local_helper = local_helper_binary_for_platform(&current_exe, platform)?;
+    if local_helper.is_sidecar() {
         eprintln!(
             "{}: using local {} {} sidecar {}",
             kind.controller_log_prefix(),
             platform.label(),
             kind.sidecar_noun(),
-            local_path.display()
+            local_helper.path.display()
         );
     }
-    let remote_path = upload_agent_binary(handle, &local_path, platform).await?;
+    let remote_path = upload_agent_binary(handle, &local_helper.path, platform).await?;
     Ok(UploadedHelperCommand::new(
         kind,
         platform,
-        local_path,
+        local_helper.path,
         remote_path,
     ))
 }
@@ -341,10 +341,6 @@ pub(crate) async fn bootstrap_helper(
     let handle = connect_prepared_ssh(prepared).await?;
     let helper = stage_uploaded_helper_command(&handle, plan.kind).await?;
     Ok(BootstrappedHelper { handle, helper })
-}
-
-fn helper_uses_sidecar(current_exe: &Path, local_path: &Path) -> bool {
-    local_path != current_exe
 }
 
 pub(crate) fn remote_agent_upload_command(platform: RemotePlatform) -> &'static str {
@@ -469,174 +465,6 @@ fn lower_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
-}
-
-pub(crate) fn local_agent_binary_for_platform(
-    current_exe: &Path,
-    platform: RemotePlatform,
-) -> Result<PathBuf> {
-    local_agent_binary_for_platform_with_explicit_dirs(
-        current_exe,
-        platform,
-        &explicit_agent_search_dirs(),
-    )
-}
-
-fn local_agent_binary_for_platform_with_explicit_dirs(
-    current_exe: &Path,
-    platform: RemotePlatform,
-    explicit_dirs: &[PathBuf],
-) -> Result<PathBuf> {
-    let local = RemotePlatform::local()?;
-    if platform == local {
-        if let Some(candidate) =
-            explicit_portable_linux_agent_binary_for_platform(platform, explicit_dirs)
-        {
-            return Ok(candidate.clone());
-        }
-        return Ok(current_exe.to_path_buf());
-    }
-
-    let candidates =
-        local_agent_binary_candidates_with_explicit_dirs(current_exe, platform, explicit_dirs);
-    if let Some(candidate) = candidates.iter().find(|path| path.is_file()) {
-        return Ok(candidate.clone());
-    }
-
-    let candidate_list = candidates
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    bail!(
-        "no local Rustle agent binary found for remote {}; install `rustle agent` on the remote host or place a matching sidecar beside the local binary. Checked: {candidate_list}",
-        platform.label()
-    )
-}
-
-fn explicit_portable_linux_agent_binary_for_platform(
-    platform: RemotePlatform,
-    explicit_dirs: &[PathBuf],
-) -> Option<PathBuf> {
-    if platform.os != "linux" {
-        return None;
-    }
-    portable_linux_agent_binary_candidates_in_dirs(platform, explicit_dirs)
-        .into_iter()
-        .find(|path| path.is_file())
-}
-
-fn local_agent_binary_candidates_with_explicit_dirs(
-    current_exe: &Path,
-    platform: RemotePlatform,
-    explicit_dirs: &[PathBuf],
-) -> Vec<PathBuf> {
-    dedupe_paths(agent_binary_candidates_in_dirs(
-        platform,
-        &local_agent_search_dirs_with_explicit_dirs(current_exe, explicit_dirs),
-    ))
-}
-
-#[cfg(test)]
-pub(crate) fn local_agent_search_dirs(current_exe: &Path) -> Vec<PathBuf> {
-    local_agent_search_dirs_with_explicit_dirs(current_exe, &explicit_agent_search_dirs())
-}
-
-fn explicit_agent_search_dirs() -> Vec<PathBuf> {
-    env::var_os(RUSTLE_AGENT_DIR_ENV)
-        .map(|paths| env::split_paths(&paths).collect())
-        .unwrap_or_default()
-}
-
-fn local_agent_search_dirs_with_explicit_dirs(
-    current_exe: &Path,
-    explicit_dirs: &[PathBuf],
-) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    dirs.extend(explicit_dirs.iter().cloned());
-    if let Some(parent) = current_exe.parent() {
-        dirs.push(parent.to_path_buf());
-        if let Some(package_parent) = parent.parent() {
-            dirs.push(package_parent.to_path_buf());
-            dirs.push(package_parent.join("rustle-agent-dir"));
-        }
-    }
-    if let Ok(cwd) = env::current_dir() {
-        dirs.push(cwd.join("target").join("rustle-agent-dir"));
-        dirs.push(cwd);
-    }
-    dedupe_paths(dirs)
-}
-
-pub(crate) fn agent_binary_candidates_in_dirs(
-    platform: RemotePlatform,
-    dirs: &[PathBuf],
-) -> Vec<PathBuf> {
-    let suffix = if platform.is_windows() { ".exe" } else { "" };
-    let binary = format!("rustle{suffix}");
-    let platform_key = format!("{}-{}", platform.os, platform.arch);
-    let mut candidates = Vec::new();
-
-    for dir in dirs {
-        candidates.push(dir.join(format!("rustle-agent-{platform_key}{suffix}")));
-        candidates.push(dir.join(format!("rustle-{platform_key}{suffix}")));
-
-        for triple in remote_platform_target_triples(platform) {
-            candidates.push(dir.join(format!("rustle-agent-{triple}{suffix}")));
-            candidates.push(dir.join(format!("rustle-{triple}{suffix}")));
-            candidates.push(dir.join(format!("rustle-{triple}")).join(&binary));
-            candidates.push(
-                dir.join(format!("rustle-{triple}"))
-                    .join(format!("rustle-agent{suffix}")),
-            );
-        }
-    }
-
-    dedupe_paths(candidates)
-}
-
-fn portable_linux_agent_binary_candidates_in_dirs(
-    platform: RemotePlatform,
-    dirs: &[PathBuf],
-) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-
-    for dir in dirs {
-        for triple in remote_platform_target_triples(platform)
-            .iter()
-            .copied()
-            .filter(|triple| triple.ends_with("-unknown-linux-musl"))
-        {
-            candidates.push(dir.join(format!("rustle-agent-{triple}")));
-            candidates.push(dir.join(format!("rustle-{triple}")));
-            candidates.push(dir.join(format!("rustle-{triple}")).join("rustle"));
-            candidates.push(dir.join(format!("rustle-{triple}")).join("rustle-agent"));
-        }
-    }
-
-    dedupe_paths(candidates)
-}
-
-fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut deduped = Vec::new();
-    for path in paths {
-        if !deduped.iter().any(|existing| existing == &path) {
-            deduped.push(path);
-        }
-    }
-    deduped
-}
-
-pub(crate) fn remote_platform_target_triples(platform: RemotePlatform) -> &'static [&'static str] {
-    match (platform.os, platform.arch) {
-        ("linux", "x86_64") => &["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"],
-        ("linux", "aarch64") => &["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"],
-        ("macos", "x86_64") => &["x86_64-apple-darwin"],
-        ("macos", "aarch64") => &["aarch64-apple-darwin"],
-        ("windows", "x86_64") => &["x86_64-pc-windows-msvc"],
-        ("windows", "aarch64") => &["aarch64-pc-windows-msvc"],
-        _ => &[],
-    }
 }
 
 pub(crate) async fn probe_remote_platform(handle: &Handle<Client>) -> Result<RemotePlatform> {
@@ -1205,17 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn helper_uses_sidecar_only_when_selected_path_differs_from_current_exe() {
-        let current = PathBuf::from("/opt/rustle/rustle");
-
-        assert!(!helper_uses_sidecar(&current, &current));
-        assert!(helper_uses_sidecar(
-            &current,
-            &PathBuf::from("/opt/rustle/rustle-agent-linux-x86_64")
-        ));
-    }
-
-    #[test]
     fn posix_uploaded_helper_command_constructs_command_for_each_helper_kind() {
         let platform = RemotePlatform {
             os: "linux",
@@ -1548,254 +1365,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn local_agent_selection_uses_current_binary_for_matching_platform() {
-        let current_exe = PathBuf::from(if cfg!(windows) {
-            "C:\\rustle\\rustle.exe"
-        } else {
-            "/tmp/rustle"
-        });
-        let local = RemotePlatform::local().expect("local platform is supported");
-
-        assert_eq!(
-            local_agent_binary_for_platform(&current_exe, local)
-                .expect("current binary works for matching platform"),
-            current_exe
-        );
-    }
-
-    #[test]
-    fn linux_local_agent_selection_prefers_explicit_packaged_sidecar_when_present() {
-        struct TempTree {
-            path: PathBuf,
-        }
-
-        impl Drop for TempTree {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.path);
-            }
-        }
-
-        let local = RemotePlatform::local().expect("local platform is supported");
-        if local.os != "linux" {
-            return;
-        }
-
-        let root = env::temp_dir().join(format!(
-            "rustle-linux-local-sidecar-test-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
-        let temp = TempTree { path: root };
-        let bin_dir = temp.path.join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
-
-        let current_exe = bin_dir.join("rustle");
-        std::fs::write(&current_exe, "current gnu controller").expect("write fake current binary");
-
-        let triple = remote_platform_target_triples(local)
-            .first()
-            .expect("local Linux platform has a release target");
-        let package_dir = bin_dir.join(format!("rustle-{triple}"));
-        std::fs::create_dir(&package_dir).expect("create sidecar package dir");
-        let sidecar = package_dir.join("rustle");
-        std::fs::write(&sidecar, "portable sidecar").expect("write fake sidecar");
-
-        assert_eq!(
-            local_agent_binary_for_platform_with_explicit_dirs(
-                &current_exe,
-                local,
-                std::slice::from_ref(&bin_dir),
-            )
-            .expect("select local Linux helper"),
-            sidecar
-        );
-    }
-
-    #[test]
-    fn explicit_portable_sidecar_selection_is_limited_to_linux_musl() {
-        let dir = PathBuf::from("/opt/rustle");
-        let linux_x64 = RemotePlatform {
-            os: "linux",
-            arch: "x86_64",
-        };
-        let macos_x64 = RemotePlatform {
-            os: "macos",
-            arch: "x86_64",
-        };
-        let linux_candidates =
-            portable_linux_agent_binary_candidates_in_dirs(linux_x64, std::slice::from_ref(&dir));
-
-        assert!(
-            linux_candidates.contains(&dir.join("rustle-x86_64-unknown-linux-musl").join("rustle"))
-        );
-        assert!(!linux_candidates
-            .iter()
-            .any(|candidate| candidate.display().to_string().contains("linux-gnu")));
-        assert!(portable_linux_agent_binary_candidates_in_dirs(
-            macos_x64,
-            std::slice::from_ref(&dir),
-        )
-        .is_empty());
-    }
-
-    #[test]
-    fn cross_platform_agent_candidates_include_release_package_shapes() {
-        let dir = PathBuf::from("/opt/rustle");
-        let linux = RemotePlatform {
-            os: "linux",
-            arch: "x86_64",
-        };
-        let linux_candidates = agent_binary_candidates_in_dirs(linux, std::slice::from_ref(&dir));
-
-        assert_eq!(
-            linux_candidates.first(),
-            Some(&dir.join("rustle-agent-linux-x86_64"))
-        );
-        let musl = dir.join("rustle-x86_64-unknown-linux-musl").join("rustle");
-        let gnu = dir.join("rustle-x86_64-unknown-linux-gnu").join("rustle");
-        let musl_index = linux_candidates
-            .iter()
-            .position(|candidate| candidate == &musl)
-            .expect("Linux musl release package shape is a candidate");
-        let gnu_index = linux_candidates
-            .iter()
-            .position(|candidate| candidate == &gnu)
-            .expect("Linux gnu release package shape is a candidate");
-        assert!(musl_index < gnu_index, "static Linux sidecar is preferred");
-
-        let windows = RemotePlatform {
-            os: "windows",
-            arch: "aarch64",
-        };
-        let windows_candidates =
-            agent_binary_candidates_in_dirs(windows, std::slice::from_ref(&dir));
-        assert!(windows_candidates.contains(
-            &dir.join("rustle-aarch64-pc-windows-msvc")
-                .join("rustle.exe")
-        ));
-    }
-
-    #[test]
-    fn cross_platform_release_package_shape_is_a_sidecar_candidate() {
-        struct TempTree {
-            path: PathBuf,
-        }
-
-        impl Drop for TempTree {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.path);
-            }
-        }
-
-        fn nonlocal_platform() -> RemotePlatform {
-            let local = RemotePlatform::local().expect("local platform is supported");
-            [
-                RemotePlatform {
-                    os: "linux",
-                    arch: "x86_64",
-                },
-                RemotePlatform {
-                    os: "linux",
-                    arch: "aarch64",
-                },
-                RemotePlatform {
-                    os: "macos",
-                    arch: "x86_64",
-                },
-                RemotePlatform {
-                    os: "macos",
-                    arch: "aarch64",
-                },
-                RemotePlatform {
-                    os: "windows",
-                    arch: "x86_64",
-                },
-                RemotePlatform {
-                    os: "windows",
-                    arch: "aarch64",
-                },
-            ]
-            .into_iter()
-            .find(|platform| *platform != local)
-            .expect("at least one nonlocal supported platform")
-        }
-
-        let root = env::temp_dir().join(format!(
-            "rustle-agent-sidecar-test-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
-        let temp = TempTree { path: root };
-        let bin_dir = temp.path.join("bin");
-        std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
-
-        let current_exe = bin_dir.join(if cfg!(windows) {
-            "rustle-current.exe"
-        } else {
-            "rustle-current"
-        });
-        std::fs::write(&current_exe, "local").expect("write fake current binary");
-
-        let remote = nonlocal_platform();
-        let triple = remote_platform_target_triples(remote)
-            .first()
-            .expect("remote platform has a release target");
-        let package_dir = bin_dir.join(format!("rustle-{triple}"));
-        std::fs::create_dir(&package_dir).expect("create sidecar package dir");
-        let sidecar = package_dir.join(if remote.is_windows() {
-            "rustle.exe"
-        } else {
-            "rustle"
-        });
-        std::fs::write(&sidecar, "agent").expect("write fake sidecar");
-
-        let candidates = agent_binary_candidates_in_dirs(remote, std::slice::from_ref(&bin_dir));
-        let selected = candidates
-            .iter()
-            .find(|path| path.is_file())
-            .expect("matching sidecar should be a selectable candidate");
-        assert_eq!(selected, &sidecar);
-    }
-
-    #[test]
-    fn local_agent_search_dirs_include_release_package_parent() {
-        let current_exe = PathBuf::from("/opt/rustle/rustle-aarch64-apple-darwin/rustle");
-        let dirs = local_agent_search_dirs(&current_exe);
-
-        assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-aarch64-apple-darwin")));
-        assert!(dirs.contains(&PathBuf::from("/opt/rustle")));
-        assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-agent-dir")));
-    }
-
-    #[test]
-    fn local_agent_search_dirs_include_target_agent_dir_for_dev_builds() {
-        let current_exe = PathBuf::from("/work/rustle/target/debug/rustle");
-        let dirs = local_agent_search_dirs(&current_exe);
-
-        assert!(dirs.contains(&PathBuf::from("/work/rustle/target/rustle-agent-dir")));
-    }
-
-    #[test]
-    fn cross_platform_agent_candidates_support_env_style_agent_dirs() {
-        let agent_dir = PathBuf::from("/var/lib/rustle-agents");
-        let linux = RemotePlatform {
-            os: "linux",
-            arch: "aarch64",
-        };
-        let candidates = agent_binary_candidates_in_dirs(linux, std::slice::from_ref(&agent_dir));
-
-        assert!(candidates.contains(
-            &agent_dir
-                .join("rustle-aarch64-unknown-linux-musl")
-                .join("rustle")
-        ));
-        assert!(candidates.contains(&agent_dir.join("rustle-agent-linux-aarch64")));
-    }
-
     #[cfg(unix)]
     #[test]
-    fn uploaded_agent_command_keeps_staged_binary_until_last_lane_exits() {
+    fn uploaded_helper_command_keeps_staged_binary_until_last_lane_exits_for_each_kind() {
         use std::os::unix::fs::PermissionsExt;
 
         struct TempTree {
@@ -1896,80 +1468,93 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        let root = env::temp_dir().join(format!(
-            "rustle-uploaded-agent-test-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
-        let temp = TempTree { path: root };
-        std::fs::create_dir_all(&temp.path).expect("create temp tree");
-        let ready_dir = temp.path.join("ready");
-        let release_dir = temp.path.join("release");
-        std::fs::create_dir(&ready_dir).expect("create ready dir");
-        std::fs::create_dir(&release_dir).expect("create release dir");
+        fn assert_refcounted_cleanup_for_kind(kind: HelperKind) {
+            let root = env::temp_dir().join(format!(
+                "rustle-uploaded-{}-test-{}-{:?}",
+                kind.subcommand(),
+                std::process::id(),
+                StdInstant::now()
+            ));
+            let temp = TempTree { path: root };
+            std::fs::create_dir_all(&temp.path).expect("create temp tree");
+            let ready_dir = temp.path.join("ready");
+            let release_dir = temp.path.join("release");
+            std::fs::create_dir(&ready_dir).expect("create ready dir");
+            std::fs::create_dir(&release_dir).expect("create release dir");
 
-        let agent_path = temp.path.join("rustle-agent");
-        std::fs::write(
-            &agent_path,
-            "#!/bin/sh\n\
-             set -eu\n\
-             if [ \"${1:-}\" != \"agent\" ]; then exit 64; fi\n\
-             : > \"$RUSTLE_FAKE_AGENT_READY_DIR/$$\"\n\
-             while [ ! -f \"$RUSTLE_FAKE_AGENT_RELEASE_DIR/$$\" ]; do sleep 0.05; done\n",
-        )
-        .expect("write fake uploaded agent");
-        let mut perms = std::fs::metadata(&agent_path)
-            .expect("fake agent metadata")
-            .permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&agent_path, perms).expect("chmod fake agent");
-
-        let command = uploaded_agent_command(
-            agent_path.to_str().expect("utf-8 temp path"),
-            RemotePlatform {
-                os: "linux",
-                arch: "x86_64",
-            },
-        );
-        let mut children = ChildGuard {
-            children: (0..2)
-                .map(|_| {
-                    Command::new("sh")
-                        .arg("-c")
-                        .arg(&command)
-                        .env("RUSTLE_FAKE_AGENT_READY_DIR", &ready_dir)
-                        .env("RUSTLE_FAKE_AGENT_RELEASE_DIR", &release_dir)
-                        .spawn()
-                        .expect("spawn uploaded-agent wrapper")
-                })
-                .collect(),
-        };
-        let refdir = PathBuf::from(format!("{}.refs", agent_path.display()));
-
-        let ready = wait_for_files(&ready_dir, 2);
-        assert!(agent_path.exists(), "staged helper disappeared early");
-        assert!(refdir.exists(), "refdir should exist while lanes run");
-        assert_eq!(dir_entry_count(&refdir), 2);
-
-        let first_release = release_dir.join(ready[0].file_name().expect("ready file name"));
-        std::fs::write(first_release, b"").expect("release one fake agent");
-        wait_for_any_child_exit(&mut children.children);
-        assert!(
-            agent_path.exists(),
-            "staged helper should remain while another lane is active"
-        );
-        assert_eq!(dir_entry_count(&refdir), 1);
-
-        for ready_file in &ready[1..] {
+            let agent_path = temp.path.join("rustle-agent");
             std::fs::write(
-                release_dir.join(ready_file.file_name().expect("ready file name")),
-                b"",
+                &agent_path,
+                "#!/bin/sh\n\
+                 set -eu\n\
+                 if [ \"${1:-}\" != \"$RUSTLE_FAKE_HELPER_SUBCOMMAND\" ]; then exit 64; fi\n\
+                 : > \"$RUSTLE_FAKE_AGENT_READY_DIR/$$\"\n\
+                 while [ ! -f \"$RUSTLE_FAKE_AGENT_RELEASE_DIR/$$\" ]; do sleep 0.05; done\n",
             )
-            .expect("release remaining fake agent");
+            .expect("write fake uploaded helper");
+            let mut perms = std::fs::metadata(&agent_path)
+                .expect("fake helper metadata")
+                .permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&agent_path, perms).expect("chmod fake helper");
+
+            let command = uploaded_helper_command(
+                agent_path.to_str().expect("utf-8 temp path"),
+                RemotePlatform {
+                    os: "linux",
+                    arch: "x86_64",
+                },
+                kind.subcommand(),
+            );
+            let mut children = ChildGuard {
+                children: (0..2)
+                    .map(|_| {
+                        Command::new("sh")
+                            .arg("-c")
+                            .arg(&command)
+                            .env("RUSTLE_FAKE_HELPER_SUBCOMMAND", kind.subcommand())
+                            .env("RUSTLE_FAKE_AGENT_READY_DIR", &ready_dir)
+                            .env("RUSTLE_FAKE_AGENT_RELEASE_DIR", &release_dir)
+                            .spawn()
+                            .expect("spawn uploaded-helper wrapper")
+                    })
+                    .collect(),
+            };
+            let refdir = PathBuf::from(format!("{}.refs", agent_path.display()));
+
+            let ready = wait_for_files(&ready_dir, 2);
+            assert!(agent_path.exists(), "staged helper disappeared early");
+            assert!(refdir.exists(), "refdir should exist while lanes run");
+            assert_eq!(dir_entry_count(&refdir), 2);
+
+            let first_release = release_dir.join(ready[0].file_name().expect("ready file name"));
+            std::fs::write(first_release, b"").expect("release one fake helper");
+            wait_for_any_child_exit(&mut children.children);
+            assert!(
+                agent_path.exists(),
+                "staged helper should remain while another lane is active"
+            );
+            assert_eq!(dir_entry_count(&refdir), 1);
+
+            for ready_file in &ready[1..] {
+                std::fs::write(
+                    release_dir.join(ready_file.file_name().expect("ready file name")),
+                    b"",
+                )
+                .expect("release remaining fake helper");
+            }
+            wait_for_all_children_exit(&mut children.children);
+            wait_for_absent(&agent_path);
+            wait_for_absent(&refdir);
         }
-        wait_for_all_children_exit(&mut children.children);
-        wait_for_absent(&agent_path);
-        wait_for_absent(&refdir);
+
+        for kind in [
+            HelperKind::StdioAgent,
+            HelperKind::QuicAgent,
+            HelperKind::QuicBridgeNative,
+        ] {
+            assert_refcounted_cleanup_for_kind(kind);
+        }
     }
 
     #[test]

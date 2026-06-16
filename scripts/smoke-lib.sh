@@ -56,7 +56,8 @@ smoke_uploaded_agent_artifacts() {
   [[ -d "$root" ]] || return 0
 
   find "$root" -maxdepth 1 \( \
-    -name 'rustle-agent-[0-9]*' \
+    -name 'rustle-agent.*' \
+    -o -name 'rustle-agent-[0-9]*' \
     -o -name 'rustle-agent-[0-9]*.refs' \
   \) -print 2>/dev/null | sort
 }

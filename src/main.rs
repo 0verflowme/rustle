@@ -26,6 +26,7 @@ mod quic_agent;
 mod quic_agent_runtime;
 mod remote_helper;
 mod routing;
+mod sidecar_store;
 mod ssh_bridge;
 mod ssh_control;
 mod supervisor;
