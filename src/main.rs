@@ -62,13 +62,10 @@ use control_plane::{
 };
 use control_plane::{connect_bridge_runtime, SshAgentBridgeConnector};
 #[cfg(test)]
-use data_plane::BridgeAdmissionLimits;
-#[cfg(test)]
 use data_plane::{
-    bridge_admission_decision, query_dns_over_agent, query_dns_over_agent_udp,
-    query_udp_over_agent, run_udp_association, run_udp_association_transport,
-    send_dns_response_event, spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, UdpAssociationTransport,
+    query_dns_over_agent, query_dns_over_agent_udp, query_udp_over_agent, run_udp_association,
+    run_udp_association_transport, send_dns_response_event, spawn_agent_tcp_bridge,
+    spawn_udp_association_with_idle_timeout, UdpAssociationTransport,
 };
 use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
@@ -77,9 +74,9 @@ use packet_engine::{
     execute_udp_ingress_action, format_bytes, format_duration, handle_bridge_event,
     handle_bridge_event_into, plan_udp_datagram_actions, should_log_stale_bridge_event,
     BridgeAdmissionStats, BridgeEventStats, DnsInflight, LocalDrainStats, RemoteBacklogPush,
-    RemoteBacklogs, TunWriteStats, TunnelStats, UdpDropReason, UdpIngressAction,
-    MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
-    REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
+    RemoteBacklogs, TunWriteStats, TunnelStats, UdpAssociationTransportPlan, UdpDropReason,
+    UdpIngressAction, MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW,
+    REMOTE_BACKLOG_BYTES_TOTAL, REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
 use remote_helper::{agent_command_plan, bridge_agent_command_plan};
 #[cfg(test)]
@@ -106,12 +103,14 @@ use supervisor::{
     RouteCommandExecutor,
 };
 use supervisor::{parse_target_cidr, run_tun_capture, run_tunnel};
-use transport_model::{parse_destination, BridgeRuntimeOptions, BridgeTransportKind};
 #[cfg(test)]
 use transport_model::{
+    bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
     DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent,
-    UdpAssociation, UdpAssociationEvents, UdpFlowKey,
+    UdpAssociation, UdpAssociationEvents, UdpFlowKey, MAX_AGENT_ACTIVE_STREAMS,
+    MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
 };
+use transport_model::{parse_destination, BridgeRuntimeOptions, BridgeTransportKind};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;
@@ -1273,7 +1272,7 @@ mod tests {
         let (close_tx, _close_rx) = mpsc::channel(1);
         let mut associations = HashMap::new();
         let mut association_limit = DnsInflight::new(1);
-        let mut actions = Vec::new();
+        let mut actions: Vec<UdpIngressAction<()>> = Vec::new();
 
         plan_udp_datagram_actions(
             None,
@@ -1331,7 +1330,10 @@ mod tests {
         let mut actions = Vec::new();
 
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransport::Agent(bridge.clone())),
+            Some(UdpAssociationTransportPlan::new(
+                "agent",
+                UdpAssociationTransport::Agent(bridge.clone()),
+            )),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -1407,7 +1409,10 @@ mod tests {
         let mut actions = Vec::new();
 
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransport::Agent(bridge.clone())),
+            Some(UdpAssociationTransportPlan::new(
+                "agent",
+                UdpAssociationTransport::Agent(bridge.clone()),
+            )),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -1469,6 +1474,7 @@ mod tests {
         let mut association_limit = DnsInflight::new(1);
         assert!(association_limit.try_admit());
         let mut stats = TunnelStats::new();
+        let mut spawn_association = |(), _, _, _, _| {};
 
         execute_udp_ingress_action(
             UdpIngressAction::SendDatagram {
@@ -1480,6 +1486,7 @@ mod tests {
             &mut associations,
             &mut association_limit,
             &mut stats,
+            &mut spawn_association,
         );
 
         assert!(associations.is_empty());
@@ -4756,8 +4763,6 @@ mod tests {
 
     #[test]
     fn agent_bridge_admission_budget_exceeds_direct_tcpip_channel_budget() {
-        use data_plane::{MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS};
-
         let direct = BridgeAdmissionLimits::direct_tcpip();
         let agent = BridgeAdmissionLimits::agent();
 
@@ -4770,10 +4775,6 @@ mod tests {
 
     #[test]
     fn bridge_admission_decision_uses_transport_specific_opening_budget() {
-        use data_plane::{
-            MAX_AGENT_ACTIVE_STREAMS, MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_OPENING_CHANNELS,
-        };
-
         let direct = BridgeAdmissionLimits::direct_tcpip();
         let agent = BridgeAdmissionLimits::agent();
 

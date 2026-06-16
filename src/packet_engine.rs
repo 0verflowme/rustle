@@ -8,12 +8,9 @@ use bytes::Bytes;
 use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc;
 
-use crate::data_plane::{
-    bridge_admission_decision, spawn_dns_query, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, BridgeRuntime, DnsTransport, UdpAssociationTransport,
-    UDP_DATAGRAMS_PER_ASSOCIATION,
-};
+use crate::data_plane::{spawn_dns_query, DnsTransport, UDP_DATAGRAMS_PER_ASSOCIATION};
 use crate::transport_model::{
+    bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
     DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent, UdpAssociation, UdpAssociationEvents,
     UdpFlowKey,
 };
@@ -175,7 +172,7 @@ impl DnsInflight {
 pub(crate) async fn run_tunnel_loop(
     dev: tun_rs::AsyncDevice,
     mut flow_manager: tcp_core::FlowManager,
-    bridge_runtime: BridgeRuntime,
+    bridge_runtime: crate::data_plane::BridgeRuntime,
     dns_transport: DnsTransport,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
@@ -275,8 +272,11 @@ pub(crate) async fn run_tunnel_loop(
                     continue;
                 }
                 if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
+                    let udp_transport = dns_transport
+                        .udp_transport()
+                        .map(|transport| UdpAssociationTransportPlan::new(transport.label(), transport));
                     plan_udp_datagram_actions(
-                        dns_transport.udp_transport(),
+                        udp_transport,
                         request,
                         &mut udp_associations,
                         &mut udp_inflight,
@@ -289,6 +289,15 @@ pub(crate) async fn run_tunnel_loop(
                         &mut udp_associations,
                         &mut udp_inflight,
                         &mut stats,
+                        &mut |transport, key, from_local, events, idle_timeout| {
+                            crate::data_plane::spawn_udp_association_with_idle_timeout(
+                                transport,
+                                key,
+                                from_local,
+                                events,
+                                idle_timeout,
+                            );
+                        },
                     );
                     continue;
                 }
@@ -302,7 +311,8 @@ pub(crate) async fn run_tunnel_loop(
                 let admission_stats = ensure_bridges(
                     &mut flow_manager,
                     &mut bridges,
-                    &bridge_runtime,
+                    bridge_runtime.admission_limits(),
+                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
                     event_tx.clone(),
                     &mut ready_flow_ids,
                     now,
@@ -460,7 +470,8 @@ pub(crate) async fn run_tunnel_loop(
                 let admission_stats = ensure_bridges(
                     &mut flow_manager,
                     &mut bridges,
-                    &bridge_runtime,
+                    bridge_runtime.admission_limits(),
+                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
                     event_tx.clone(),
                     &mut ready_flow_ids,
                     now,
@@ -751,9 +762,20 @@ pub(crate) struct BridgeEventStats {
     pub(crate) stale_bridge_events: u64,
 }
 
-pub(crate) enum UdpIngressAction {
+pub(crate) struct UdpAssociationTransportPlan<T> {
+    pub(crate) label: &'static str,
+    pub(crate) transport: T,
+}
+
+impl<T> UdpAssociationTransportPlan<T> {
+    pub(crate) fn new(label: &'static str, transport: T) -> Self {
+        Self { label, transport }
+    }
+}
+
+pub(crate) enum UdpIngressAction<T> {
     StartAssociation {
-        transport: UdpAssociationTransport,
+        transport: T,
         key: UdpFlowKey,
         from_local: mpsc::Receiver<Bytes>,
         events: UdpAssociationEvents,
@@ -803,7 +825,7 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 pub(crate) fn admit_udp_datagram(
-    transport: UdpAssociationTransport,
+    transport: crate::data_plane::UdpAssociationTransport,
     request: dns::UdpPacket,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
@@ -812,6 +834,7 @@ pub(crate) fn admit_udp_datagram(
     stats: &mut TunnelStats,
 ) {
     let mut actions = Vec::new();
+    let transport = UdpAssociationTransportPlan::new(transport.label(), transport);
     plan_udp_datagram_actions(
         Some(transport),
         request,
@@ -821,17 +844,31 @@ pub(crate) fn admit_udp_datagram(
         idle_timeout,
         &mut actions,
     );
-    execute_udp_ingress_actions(&mut actions, associations, association_limit, stats);
+    execute_udp_ingress_actions(
+        &mut actions,
+        associations,
+        association_limit,
+        stats,
+        &mut |transport, key, from_local, events, idle_timeout| {
+            crate::data_plane::spawn_udp_association_with_idle_timeout(
+                transport,
+                key,
+                from_local,
+                events,
+                idle_timeout,
+            );
+        },
+    );
 }
 
-pub(crate) fn plan_udp_datagram_actions(
-    transport: Option<UdpAssociationTransport>,
+pub(crate) fn plan_udp_datagram_actions<T>(
+    transport: Option<UdpAssociationTransportPlan<T>>,
     request: dns::UdpPacket,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
-    actions: &mut Vec<UdpIngressAction>,
+    actions: &mut Vec<UdpIngressAction<T>>,
 ) {
     let key = UdpFlowKey::from_packet(&request);
     let Some(transport) = transport else {
@@ -841,7 +878,7 @@ pub(crate) fn plan_udp_datagram_actions(
         });
         return;
     };
-    let transport_label = transport.label();
+    let transport_label = transport.label;
     let association = match associations.entry(key) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
@@ -857,7 +894,7 @@ pub(crate) fn plan_udp_datagram_actions(
 
             let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
             actions.push(UdpIngressAction::StartAssociation {
-                transport,
+                transport: transport.transport,
                 key,
                 from_local,
                 events: events.clone(),
@@ -877,23 +914,35 @@ pub(crate) fn plan_udp_datagram_actions(
     });
 }
 
-pub(crate) fn execute_udp_ingress_actions(
-    actions: &mut Vec<UdpIngressAction>,
+pub(crate) fn execute_udp_ingress_actions<T, F>(
+    actions: &mut Vec<UdpIngressAction<T>>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     stats: &mut TunnelStats,
-) {
+    spawn_association: &mut F,
+) where
+    F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
+{
     for action in actions.drain(..) {
-        execute_udp_ingress_action(action, associations, association_limit, stats);
+        execute_udp_ingress_action(
+            action,
+            associations,
+            association_limit,
+            stats,
+            spawn_association,
+        );
     }
 }
 
-pub(crate) fn execute_udp_ingress_action(
-    action: UdpIngressAction,
+pub(crate) fn execute_udp_ingress_action<T, F>(
+    action: UdpIngressAction<T>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     stats: &mut TunnelStats,
-) {
+    spawn_association: &mut F,
+) where
+    F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
+{
     match action {
         UdpIngressAction::StartAssociation {
             transport,
@@ -902,13 +951,7 @@ pub(crate) fn execute_udp_ingress_action(
             events,
             idle_timeout,
         } => {
-            spawn_udp_association_with_idle_timeout(
-                transport,
-                key,
-                from_local,
-                events,
-                idle_timeout,
-            );
+            spawn_association(transport, key, from_local, events, idle_timeout);
         }
         UdpIngressAction::SendDatagram {
             key,
@@ -923,61 +966,23 @@ pub(crate) fn execute_udp_ingress_action(
                     key.src_ip, key.src_port, key.dst_ip, key.dst_port, transport_label,
                 );
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                execute_udp_ingress_action(
-                    UdpIngressAction::DropDatagram {
-                        key,
-                        reason: UdpDropReason::AssociationQueueFull,
-                    },
-                    associations,
-                    association_limit,
-                    stats,
-                );
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                execute_udp_ingress_action(
-                    UdpIngressAction::DropDatagram {
-                        key,
-                        reason: UdpDropReason::AssociationClosed,
-                    },
-                    associations,
-                    association_limit,
-                    stats,
-                );
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => drop_udp_datagram(
+                key,
+                UdpDropReason::AssociationQueueFull,
+                associations,
+                association_limit,
+                stats,
+            ),
+            Err(mpsc::error::TrySendError::Closed(_)) => drop_udp_datagram(
+                key,
+                UdpDropReason::AssociationClosed,
+                associations,
+                association_limit,
+                stats,
+            ),
         },
         UdpIngressAction::DropDatagram { key, reason } => {
-            if reason == UdpDropReason::AssociationClosed {
-                associations.remove(&key);
-                association_limit.complete();
-            }
-            match reason {
-                UdpDropReason::UnsupportedTransport => {
-                    eprintln!(
-                        "udp: dropping datagram {}:{} -> {}:{} because direct-tcpip transport does not support generic UDP",
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                    );
-                }
-                UdpDropReason::AssociationLimitReached { max } => {
-                    eprintln!(
-                        "udp: dropping datagram because {max} UDP associations are already active",
-                    );
-                }
-                UdpDropReason::AssociationQueueFull => {
-                    eprintln!(
-                        "udp: dropping datagram {}:{} -> {}:{} because the association queue is full",
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                    );
-                }
-                UdpDropReason::AssociationClosed => {
-                    eprintln!(
-                        "udp: dropping datagram {}:{} -> {}:{} because the association is closed",
-                        key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-                    );
-                }
-            }
-            stats.udp_dropped = stats.udp_dropped.saturating_add(1);
-            stats.record_udp_response(false);
+            drop_udp_datagram(key, reason, associations, association_limit, stats);
         }
     }
 }
@@ -986,6 +991,7 @@ pub(crate) fn execute_udp_ingress_action(
 pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
     let mut associations = HashMap::new();
     let mut association_limit = DnsInflight::new(1);
+    let mut spawn_association = |(), _, _, _, _| {};
     execute_udp_ingress_action(
         UdpIngressAction::DropDatagram {
             key: UdpFlowKey::from_packet(request),
@@ -994,7 +1000,46 @@ pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut 
         &mut associations,
         &mut association_limit,
         stats,
+        &mut spawn_association,
     );
+}
+
+fn drop_udp_datagram(
+    key: UdpFlowKey,
+    reason: UdpDropReason,
+    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
+    association_limit: &mut DnsInflight,
+    stats: &mut TunnelStats,
+) {
+    if reason == UdpDropReason::AssociationClosed {
+        associations.remove(&key);
+        association_limit.complete();
+    }
+    match reason {
+        UdpDropReason::UnsupportedTransport => {
+            eprintln!(
+                "udp: dropping datagram {}:{} -> {}:{} because direct-tcpip transport does not support generic UDP",
+                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+            );
+        }
+        UdpDropReason::AssociationLimitReached { max } => {
+            eprintln!("udp: dropping datagram because {max} UDP associations are already active",);
+        }
+        UdpDropReason::AssociationQueueFull => {
+            eprintln!(
+                "udp: dropping datagram {}:{} -> {}:{} because the association queue is full",
+                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+            );
+        }
+        UdpDropReason::AssociationClosed => {
+            eprintln!(
+                "udp: dropping datagram {}:{} -> {}:{} because the association is closed",
+                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+            );
+        }
+    }
+    stats.udp_dropped = stats.udp_dropped.saturating_add(1);
+    stats.record_udp_response(false);
 }
 
 pub(crate) async fn write_dns_event_to_tun(
@@ -1029,16 +1074,19 @@ pub(crate) async fn write_udp_response_to_tun(
     write_packet_to_tun(dev, &packet, "UDP response").await
 }
 
-pub(crate) fn ensure_bridges(
+pub(crate) fn ensure_bridges<F>(
     flow_manager: &mut tcp_core::FlowManager,
     bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
-    runtime: &BridgeRuntime,
+    limits: BridgeAdmissionLimits,
+    mut spawn_bridge: F,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ready_flow_ids: &mut Vec<tcp_core::FlowId>,
     now: SmolInstant,
-) -> Result<BridgeAdmissionStats> {
+) -> Result<BridgeAdmissionStats>
+where
+    F: FnMut(tcp_core::FlowId, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
+{
     let mut stats = BridgeAdmissionStats::default();
-    let limits = runtime.admission_limits();
     let mut active_channels = bridges.len();
     let mut opening_channels = flow_manager.opening_flow_count();
 
@@ -1061,7 +1109,7 @@ pub(crate) fn ensure_bridges(
         }
 
         flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::SshOpening, now)?;
-        let bridge = runtime.spawn_tcp_bridge(id, event_tx.clone());
+        let bridge = spawn_bridge(id, event_tx.clone());
         bridges.insert(bridge.id.key, bridge);
         active_channels += 1;
         opening_channels += 1;

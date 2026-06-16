@@ -324,7 +324,8 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         ensure_bridges(
             &mut flow_manager,
             &mut bridges,
-            &bridge_runtime,
+            bridge_runtime.admission_limits(),
+            |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
             event_tx.clone(),
             &mut ready_flow_ids,
             now,

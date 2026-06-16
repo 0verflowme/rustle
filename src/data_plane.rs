@@ -13,15 +13,11 @@ use crate::agent_bridge::{
 use crate::agent_transport;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
-    DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent,
-    UdpAssociationEvents, UdpFlowKey,
+    BridgeAdmissionLimits, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination,
+    DnsResponseEvent, UdpAssociationEvents, UdpFlowKey,
 };
 use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core};
 
-pub(crate) const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
-pub(crate) const MAX_DIRECT_OPENING_CHANNELS: usize = 32;
-pub(crate) const MAX_AGENT_ACTIVE_STREAMS: usize = crate::tcp_core::DEFAULT_MAX_ACTIVE_FLOWS;
-pub(crate) const MAX_AGENT_OPENING_STREAMS: usize = 128;
 pub(crate) const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1361,47 +1357,4 @@ pub(crate) async fn query_udp_over_agent(
             request.dst_ip, request.dst_port
         )
     })?
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BridgeAdmissionLimits {
-    pub(crate) active: usize,
-    pub(crate) opening: usize,
-}
-
-impl BridgeAdmissionLimits {
-    pub(crate) const fn direct_tcpip() -> Self {
-        Self {
-            active: MAX_DIRECT_ACTIVE_CHANNELS,
-            opening: MAX_DIRECT_OPENING_CHANNELS,
-        }
-    }
-
-    pub(crate) const fn agent() -> Self {
-        Self {
-            active: MAX_AGENT_ACTIVE_STREAMS,
-            opening: MAX_AGENT_OPENING_STREAMS,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BridgeAdmissionDecision {
-    Admit,
-    DeferActive,
-    DeferOpening,
-}
-
-pub(crate) fn bridge_admission_decision(
-    active: usize,
-    opening: usize,
-    limits: BridgeAdmissionLimits,
-) -> BridgeAdmissionDecision {
-    if active >= limits.active {
-        BridgeAdmissionDecision::DeferActive
-    } else if opening >= limits.opening {
-        BridgeAdmissionDecision::DeferOpening
-    } else {
-        BridgeAdmissionDecision::Admit
-    }
 }
