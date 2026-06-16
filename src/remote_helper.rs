@@ -109,6 +109,14 @@ impl HelperCommandPlan {
             policy,
         })
     }
+
+    pub(crate) fn allows_upload_fallback(&self) -> bool {
+        matches!(
+            self.policy,
+            BootstrapPolicy::BuiltInCommandWithUploadFallback
+                | BootstrapPolicy::ExplicitUploadAllowed
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -539,27 +547,33 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+#[cfg(test)]
 pub(crate) fn effective_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(agent_command, agent_path, HelperKind::StdioAgent)
+    agent_command_plan(agent_command, agent_path).map(|plan| plan.command)
 }
 
+#[cfg(test)]
 fn effective_quic_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(agent_command, agent_path, HelperKind::QuicAgent)
+    remote_helper_command_plan(agent_command, agent_path, HelperKind::QuicAgent)
+        .map(|plan| plan.command)
 }
 
+#[cfg(test)]
 fn effective_quic_bridge_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(agent_command, agent_path, HelperKind::QuicBridgeNative)
+    remote_helper_command_plan(agent_command, agent_path, HelperKind::QuicBridgeNative)
+        .map(|plan| plan.command)
 }
 
+#[cfg(test)]
 pub(crate) fn effective_bridge_agent_command(
     transport: BridgeTransportKind,
     agent_command: Option<&str>,
@@ -574,12 +588,31 @@ pub(crate) fn effective_bridge_agent_command(
     }
 }
 
-fn effective_remote_helper_command(
+pub(crate) fn agent_command_plan(
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<HelperCommandPlan> {
+    remote_helper_command_plan(agent_command, agent_path, HelperKind::StdioAgent)
+}
+
+pub(crate) fn bridge_agent_command_plan(
+    transport: BridgeTransportKind,
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<HelperCommandPlan> {
+    remote_helper_command_plan(
+        agent_command,
+        agent_path,
+        HelperKind::for_bridge_transport(transport),
+    )
+}
+
+fn remote_helper_command_plan(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
     helper: HelperKind,
-) -> Result<String> {
-    Ok(HelperCommandPlan::from_command_options(helper, agent_command, agent_path)?.command)
+) -> Result<HelperCommandPlan> {
+    HelperCommandPlan::from_command_options(helper, agent_command, agent_path)
 }
 
 pub(crate) fn powershell_quote(value: &str) -> String {
@@ -738,6 +771,36 @@ mod tests {
             .policy,
             BootstrapPolicy::ExplicitCommandNoFallback,
         );
+    }
+
+    #[test]
+    fn helper_command_plan_controls_upload_fallback() {
+        let built_in = HelperCommandPlan::from_command_options(HelperKind::StdioAgent, None, None)
+            .expect("built-in command plan");
+        assert!(built_in.allows_upload_fallback());
+
+        let explicit_command = HelperCommandPlan::from_command_options(
+            HelperKind::QuicAgent,
+            Some("custom quic-agent"),
+            None,
+        )
+        .expect("explicit command plan");
+        assert!(!explicit_command.allows_upload_fallback());
+
+        let explicit_path = HelperCommandPlan::from_command_options(
+            HelperKind::QuicBridgeNative,
+            None,
+            Some("/tmp/rustle"),
+        )
+        .expect("explicit path plan");
+        assert!(!explicit_path.allows_upload_fallback());
+
+        let explicit_upload = HelperCommandPlan {
+            kind: HelperKind::StdioAgent,
+            command: "custom rustle agent".to_owned(),
+            policy: BootstrapPolicy::ExplicitUploadAllowed,
+        };
+        assert!(explicit_upload.allows_upload_fallback());
     }
 
     #[test]

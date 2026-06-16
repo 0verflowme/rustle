@@ -82,6 +82,8 @@ use packet_engine::{
     MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
     REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
+use remote_helper::{agent_command_plan, bridge_agent_command_plan};
+#[cfg(test)]
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
 use ssh_control::{connect_ssh, DEFAULT_SSH_CONNECT_TIMEOUT_SECS};
 #[cfg(test)]
@@ -610,9 +612,9 @@ async fn run_agent_lab_inner(args: AgentLabArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(|| default_http_request(&destination.host));
 
-    let agent_command =
-        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu)?;
+    let helper_plan =
+        agent_command_plan(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), helper_plan, args.mtu)?;
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport()
@@ -699,9 +701,9 @@ async fn run_agent_udp_lab_inner(args: AgentUdpLabArgs) -> Result<()> {
     }
 
     let destination = parse_ipv4_destination(&args.destination)?;
-    let agent_command =
-        effective_agent_command(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), agent_command, args.mtu)?;
+    let helper_plan =
+        agent_command_plan(args.agent_command.as_deref(), args.agent_path.as_deref())?;
+    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), helper_plan, args.mtu)?;
     let agent_runtime = connector.connect_primary().await?;
     let mut stream = agent_runtime
         .transport()
@@ -806,7 +808,7 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
 
     let dns_remote = parse_destination(&args.dns_remote)
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
-    let agent_command = effective_bridge_agent_command(
+    let helper_plan = bridge_agent_command_plan(
         args.bridge_transport,
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),
@@ -814,7 +816,7 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
     let (bridge_runtime, dns_transport) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
-        &agent_command,
+        helper_plan,
         args.mtu,
         Some(&dns_remote),
         BridgeRuntimeOptions {

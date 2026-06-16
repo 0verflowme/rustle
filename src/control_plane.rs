@@ -13,7 +13,7 @@ use crate::agent_bridge::{
 use crate::data_plane::{BridgeRuntime, DnsTransport};
 use crate::remote_helper::{
     local_agent_binary_for_platform, probe_remote_platform, upload_agent_binary,
-    uploaded_agent_command, uploaded_helper_command,
+    uploaded_agent_command, uploaded_helper_command, HelperCommandPlan,
 };
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,
@@ -31,15 +31,15 @@ const QUIC_AGENT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::f
 #[derive(Clone)]
 pub(crate) struct SshAgentBridgeConnector {
     prepared: Arc<PreparedSshConnection>,
-    agent_command: String,
+    helper_plan: HelperCommandPlan,
     mtu: u16,
 }
 
 impl SshAgentBridgeConnector {
-    pub(crate) fn new(ssh: SshArgs, agent_command: String, mtu: u16) -> Result<Self> {
+    pub(crate) fn new(ssh: SshArgs, helper_plan: HelperCommandPlan, mtu: u16) -> Result<Self> {
         Ok(Self {
             prepared: Arc::new(prepare_ssh_connection(&ssh)?),
-            agent_command,
+            helper_plan,
             mtu,
         })
     }
@@ -47,13 +47,21 @@ impl SshAgentBridgeConnector {
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
         match connect_agent_bridge_transport_fresh_prepared_ssh_command(
             &self.prepared,
-            &self.agent_command,
+            &self.helper_plan.command,
             self.mtu,
         )
         .await
         {
             Ok(agent) => Ok(agent),
             Err(initial_err) => {
+                if !self.helper_plan.allows_upload_fallback() {
+                    return Err(initial_err).with_context(|| {
+                        format!(
+                            "failed to start Rustle agent via explicit command: {}",
+                            self.helper_plan.command
+                        )
+                    });
+                }
                 eprintln!(
                     "agent: remote command failed ({initial_err:#}); trying upload bootstrap"
                 );
@@ -77,7 +85,7 @@ impl SshAgentBridgeConnector {
 
 impl AgentBridgeConnector for SshAgentBridgeConnector {
     fn primary_command(&self) -> &str {
-        &self.agent_command
+        &self.helper_plan.command
     }
 
     fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_> {
@@ -104,15 +112,15 @@ impl AgentBridgeConnector for SshAgentBridgeConnector {
 
 pub(crate) struct SshQuicAgentBridgeConnector {
     prepared: Arc<PreparedSshConnection>,
-    agent_command: String,
+    helper_plan: HelperCommandPlan,
     mtu: u16,
 }
 
 impl SshQuicAgentBridgeConnector {
-    pub(crate) fn new(ssh: SshArgs, agent_command: String, mtu: u16) -> Result<Self> {
+    pub(crate) fn new(ssh: SshArgs, helper_plan: HelperCommandPlan, mtu: u16) -> Result<Self> {
         Ok(Self {
             prepared: Arc::new(prepare_ssh_connection(&ssh)?),
-            agent_command,
+            helper_plan,
             mtu,
         })
     }
@@ -120,13 +128,21 @@ impl SshQuicAgentBridgeConnector {
     async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
         match connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
             &self.prepared,
-            &self.agent_command,
+            &self.helper_plan.command,
             self.mtu,
         )
         .await
         {
             Ok(agent) => Ok(agent),
             Err(initial_err) => {
+                if !self.helper_plan.allows_upload_fallback() {
+                    return Err(initial_err).with_context(|| {
+                        format!(
+                            "failed to start Rustle QUIC agent via explicit command: {}",
+                            self.helper_plan.command
+                        )
+                    });
+                }
                 eprintln!(
                     "quic-agent: remote command failed ({initial_err:#}); trying upload bootstrap"
                 );
@@ -153,7 +169,7 @@ impl SshQuicAgentBridgeConnector {
 
 impl AgentBridgeConnector for SshQuicAgentBridgeConnector {
     fn primary_command(&self) -> &str {
-        &self.agent_command
+        &self.helper_plan.command
     }
 
     fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_> {
@@ -419,13 +435,21 @@ async fn connect_quic_agent_bridge_transport_on_handle(
 
 async fn connect_quic_native_bridge_fresh_ssh_command(
     ssh: &SshArgs,
-    agent_command: &str,
+    helper_plan: &HelperCommandPlan,
 ) -> Result<QuicNativeBridge> {
     let target = resolve_ssh_target(ssh)?;
     let handle = connect_ssh(ssh).await?;
-    match connect_quic_native_bridge_on_handle(handle, &target.host, agent_command).await {
+    match connect_quic_native_bridge_on_handle(handle, &target.host, &helper_plan.command).await {
         Ok(bridge) => Ok(bridge),
         Err(initial_err) => {
+            if !helper_plan.allows_upload_fallback() {
+                return Err(initial_err).with_context(|| {
+                    format!(
+                        "failed to start native QUIC bridge via explicit command: {}",
+                        helper_plan.command
+                    )
+                });
+            }
             eprintln!(
                 "quic-native: remote command failed ({initial_err:#}); trying upload bootstrap"
             );
@@ -607,7 +631,7 @@ async fn connect_uploaded_quic_native_bridge(ssh: &SshArgs) -> Result<QuicNative
 pub(crate) async fn connect_bridge_runtime(
     ssh: &SshArgs,
     requested: BridgeTransportKind,
-    agent_command: &str,
+    helper_plan: HelperCommandPlan,
     mtu: u16,
     dns_remote: Option<&Destination>,
     options: BridgeRuntimeOptions,
@@ -622,11 +646,8 @@ pub(crate) async fn connect_bridge_runtime(
         }
         BridgeTransportKind::Agent => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
-            let connector: Arc<dyn AgentBridgeConnector> = Arc::new(SshAgentBridgeConnector::new(
-                ssh.clone(),
-                agent_command.to_owned(),
-                mtu,
-            )?);
+            let connector: Arc<dyn AgentBridgeConnector> =
+                Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
             let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,
@@ -662,7 +683,7 @@ pub(crate) async fn connect_bridge_runtime(
         BridgeTransportKind::QuicAgent => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(
-                SshQuicAgentBridgeConnector::new(ssh.clone(), agent_command.to_owned(), mtu)?,
+                SshQuicAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?,
             );
             let agent = connector.connect_initial(desired_agent_sessions).await?;
             ensure_agent_dns_remote_supported(&agent, dns_remote)?;
@@ -675,7 +696,7 @@ pub(crate) async fn connect_bridge_runtime(
             Ok((BridgeRuntime::Agent(agent), dns_transport))
         }
         BridgeTransportKind::QuicNative => {
-            let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, agent_command).await?;
+            let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
             Ok((
                 BridgeRuntime::QuicNative(bridge.clone()),
                 DnsTransport::QuicNative(bridge),
@@ -683,11 +704,8 @@ pub(crate) async fn connect_bridge_runtime(
         }
         BridgeTransportKind::Auto => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
-            let connector: Arc<dyn AgentBridgeConnector> = Arc::new(SshAgentBridgeConnector::new(
-                ssh.clone(),
-                agent_command.to_owned(),
-                mtu,
-            )?);
+            let connector: Arc<dyn AgentBridgeConnector> =
+                Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
             let fast_start_agent_lanes = should_fast_start_agent_lanes(
                 options.fast_start_auto_agent_lanes,
                 options.agent_sessions,

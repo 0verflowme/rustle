@@ -17,7 +17,7 @@ use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
     prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
-use crate::remote_helper::effective_bridge_agent_command;
+use crate::remote_helper::bridge_agent_command_plan;
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind};
 use crate::{
     default_http_request, parse_ipv4_destination, percentile_nearest_rank, ssh_bridge, tcp_core,
@@ -227,7 +227,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         .request
         .clone()
         .unwrap_or_else(|| default_http_request(&destination.host));
-    let agent_command = effective_bridge_agent_command(
+    let helper_plan = bridge_agent_command_plan(
         args.bridge_transport,
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),
@@ -235,7 +235,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
     let (bridge_runtime, _) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
-        &agent_command,
+        helper_plan,
         DEFAULT_MTU,
         None,
         BridgeRuntimeOptions {

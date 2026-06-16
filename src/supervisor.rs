@@ -16,7 +16,7 @@ use crate::packet_engine::{
     run_tunnel_loop, smol_now, tun_ipv4_packet, write_packets_to_tun, MAX_IN_FLIGHT_DNS_QUERIES,
     PACKET_BUF_SIZE,
 };
-use crate::remote_helper::effective_bridge_agent_command;
+use crate::remote_helper::bridge_agent_command_plan;
 use crate::ssh_control::{
     resolve_ssh_target, validate_agent_session_request_count, validate_ssh_session_count,
 };
@@ -63,7 +63,7 @@ pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
 
 pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;
-    let agent_command = effective_bridge_agent_command(
+    let helper_plan = bridge_agent_command_plan(
         args.bridge_transport,
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),
@@ -97,7 +97,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     let (bridge_runtime, dns_transport) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
-        &agent_command,
+        helper_plan,
         args.mtu,
         Some(&dns_remote),
         BridgeRuntimeOptions {
