@@ -9,8 +9,8 @@ use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPla
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
-    TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
-    MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
+    TunnelEngine, UdpAssociationStart, UdpAssociationTransportPlan, UdpIngressAction,
+    MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
 };
 use crate::remote_helper::bridge_agent_command_plan;
 use crate::routing::{
@@ -270,16 +270,14 @@ impl TunnelSupervisor {
                                 .expect("UDP-capable data plane must provide a UDP label");
                             UdpAssociationTransportPlan::new(label, Arc::clone(&data_plane))
                         });
-                        engine.handle_udp_datagram(
+                        engine.plan_udp_datagram(
                             udp_transport,
                             request,
                             udp_events.clone(),
                             udp_association_idle_timeout,
                             &mut udp_actions,
-                            &mut |transport, key, from_local, events, idle_timeout| {
-                                transport.spawn_udp_association(key, from_local, events, idle_timeout);
-                            },
                         );
+                        execute_udp_ingress_actions(&mut engine, &mut udp_actions);
                         continue;
                     }
 
@@ -359,6 +357,26 @@ impl TunnelSupervisor {
             }
         }
     }
+}
+
+fn execute_udp_ingress_actions(
+    engine: &mut TunnelEngine,
+    actions: &mut Vec<UdpIngressAction<Arc<dyn DataPlane>>>,
+) {
+    for action in actions.drain(..) {
+        if let Some(start) = engine.apply_udp_ingress_action(action) {
+            execute_udp_association_start(start);
+        }
+    }
+}
+
+fn execute_udp_association_start(start: UdpAssociationStart<Arc<dyn DataPlane>>) {
+    start.transport.spawn_udp_association(
+        start.key,
+        start.from_local,
+        start.events,
+        start.idle_timeout,
+    );
 }
 
 pub(crate) async fn capture_packets(

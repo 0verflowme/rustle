@@ -600,17 +600,14 @@ impl TunnelEngine {
         Ok(outcome)
     }
 
-    pub(crate) fn handle_udp_datagram<T, F>(
+    pub(crate) fn plan_udp_datagram<T>(
         &mut self,
         transport: Option<UdpAssociationTransportPlan<T>>,
         request: dns::UdpPacket,
         events: UdpAssociationEvents,
         idle_timeout: Duration,
         actions: &mut Vec<UdpIngressAction<T>>,
-        spawn_association: &mut F,
-    ) where
-        F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
-    {
+    ) {
         plan_udp_datagram_actions(
             transport,
             request,
@@ -620,13 +617,18 @@ impl TunnelEngine {
             idle_timeout,
             actions,
         );
-        execute_udp_ingress_actions(
-            actions,
+    }
+
+    pub(crate) fn apply_udp_ingress_action<T>(
+        &mut self,
+        action: UdpIngressAction<T>,
+    ) -> Option<UdpAssociationStart<T>> {
+        apply_udp_ingress_action(
+            action,
             &mut self.udp_associations,
             &mut self.udp_inflight,
             &mut self.stats,
-            spawn_association,
-        );
+        )
     }
 
     fn now(&self) -> SmolInstant {
@@ -672,14 +674,16 @@ impl<T> UdpAssociationTransportPlan<T> {
     }
 }
 
+pub(crate) struct UdpAssociationStart<T> {
+    pub(crate) transport: T,
+    pub(crate) key: UdpFlowKey,
+    pub(crate) from_local: mpsc::Receiver<Bytes>,
+    pub(crate) events: UdpAssociationEvents,
+    pub(crate) idle_timeout: Duration,
+}
+
 pub(crate) enum UdpIngressAction<T> {
-    StartAssociation {
-        transport: T,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    },
+    StartAssociation(UdpAssociationStart<T>),
     SendDatagram {
         key: UdpFlowKey,
         to_remote: mpsc::Sender<Bytes>,
@@ -690,6 +694,24 @@ pub(crate) enum UdpIngressAction<T> {
         key: UdpFlowKey,
         reason: UdpDropReason,
     },
+}
+
+impl<T> UdpIngressAction<T> {
+    fn start_association(
+        transport: T,
+        key: UdpFlowKey,
+        from_local: mpsc::Receiver<Bytes>,
+        events: UdpAssociationEvents,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self::StartAssociation(UdpAssociationStart {
+            transport,
+            key,
+            from_local,
+            events,
+            idle_timeout,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -754,13 +776,13 @@ pub(crate) fn plan_udp_datagram_actions<T>(
             }
 
             let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
-            actions.push(UdpIngressAction::StartAssociation {
-                transport: transport.transport,
+            actions.push(UdpIngressAction::start_association(
+                transport.transport,
                 key,
                 from_local,
-                events: events.clone(),
+                events.clone(),
                 idle_timeout,
-            });
+            ));
             entry.insert(UdpAssociation {
                 to_remote: to_remote.clone(),
             })
@@ -775,44 +797,32 @@ pub(crate) fn plan_udp_datagram_actions<T>(
     });
 }
 
-pub(crate) fn execute_udp_ingress_actions<T, F>(
+#[cfg(test)]
+pub(crate) fn apply_udp_ingress_actions<T>(
     actions: &mut Vec<UdpIngressAction<T>>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     stats: &mut TunnelStats,
-    spawn_association: &mut F,
-) where
-    F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
-{
+    starts: &mut Vec<UdpAssociationStart<T>>,
+) {
     for action in actions.drain(..) {
-        execute_udp_ingress_action(
-            action,
-            associations,
-            association_limit,
-            stats,
-            spawn_association,
-        );
+        if let Some(start) =
+            apply_udp_ingress_action(action, associations, association_limit, stats)
+        {
+            starts.push(start);
+        }
     }
 }
 
-pub(crate) fn execute_udp_ingress_action<T, F>(
+pub(crate) fn apply_udp_ingress_action<T>(
     action: UdpIngressAction<T>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut DnsInflight,
     stats: &mut TunnelStats,
-    spawn_association: &mut F,
-) where
-    F: FnMut(T, UdpFlowKey, mpsc::Receiver<Bytes>, UdpAssociationEvents, Duration),
-{
+) -> Option<UdpAssociationStart<T>> {
     match action {
-        UdpIngressAction::StartAssociation {
-            transport,
-            key,
-            from_local,
-            events,
-            idle_timeout,
-        } => {
-            spawn_association(transport, key, from_local, events, idle_timeout);
+        UdpIngressAction::StartAssociation(start) => {
+            return Some(start);
         }
         UdpIngressAction::SendDatagram {
             key,
@@ -846,14 +856,14 @@ pub(crate) fn execute_udp_ingress_action<T, F>(
             drop_udp_datagram(key, reason, associations, association_limit, stats);
         }
     }
+    None
 }
 
 #[cfg(test)]
 pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
     let mut associations = HashMap::new();
     let mut association_limit = DnsInflight::new(1);
-    let mut spawn_association = |(), _, _, _, _| {};
-    execute_udp_ingress_action(
+    let start = apply_udp_ingress_action::<()>(
         UdpIngressAction::DropDatagram {
             key: UdpFlowKey::from_packet(request),
             reason: UdpDropReason::UnsupportedTransport,
@@ -861,8 +871,8 @@ pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut 
         &mut associations,
         &mut association_limit,
         stats,
-        &mut spawn_association,
     );
+    debug_assert!(start.is_none());
 }
 
 fn drop_udp_datagram(
@@ -1558,12 +1568,13 @@ mod tests {
             idle_timeout,
             &mut actions,
         );
-        execute_udp_ingress_actions(
+        let mut starts = Vec::new();
+        apply_udp_ingress_actions(
             &mut actions,
             associations,
             association_limit,
             stats,
-            &mut |(), _, _, _, _| {},
+            &mut starts,
         );
     }
 
@@ -1649,10 +1660,8 @@ mod tests {
         assert!(associations.contains_key(&key));
         assert_eq!(actions.len(), 2);
         match &actions[0] {
-            UdpIngressAction::StartAssociation {
-                key: action_key, ..
-            } => {
-                assert_eq!(*action_key, key);
+            UdpIngressAction::StartAssociation(start) => {
+                assert_eq!(start.key, key);
             }
             _ => panic!("expected association start action first"),
         }
@@ -1670,6 +1679,66 @@ mod tests {
             }
             _ => panic!("expected UDP send action second"),
         }
+    }
+
+    #[tokio::test]
+    async fn udp_executor_surfaces_start_effect_before_first_send() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let payload = Bytes::from_static(b"first-datagram");
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+        let mut stats = TunnelStats::new();
+
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransportPlan::new("agent", ())),
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload,
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        let mut start = None;
+        for action in actions.drain(..) {
+            let effect = apply_udp_ingress_action(
+                action,
+                &mut associations,
+                &mut association_limit,
+                &mut stats,
+            );
+            if let Some(effect) = effect {
+                assert!(start.is_none(), "only one association should start");
+                assert_eq!(effect.key, key);
+                start = Some(effect);
+            }
+        }
+
+        let mut start = start.expect("first action should surface a start effect");
+        let queued = start
+            .from_local
+            .try_recv()
+            .expect("first datagram should be queued after start effect is held");
+        assert_eq!(queued.as_ref(), b"first-datagram");
+        assert_eq!(stats.udp_forwarded, 1);
+        assert_eq!(stats.udp_dropped, 0);
     }
 
     #[tokio::test]
@@ -1742,9 +1811,7 @@ mod tests {
         let mut association_limit = DnsInflight::new(1);
         assert!(association_limit.try_admit());
         let mut stats = TunnelStats::new();
-        let mut spawn_association = |(), _, _, _, _| {};
-
-        execute_udp_ingress_action(
+        let start = apply_udp_ingress_action::<()>(
             UdpIngressAction::SendDatagram {
                 key,
                 to_remote,
@@ -1754,9 +1821,9 @@ mod tests {
             &mut associations,
             &mut association_limit,
             &mut stats,
-            &mut spawn_association,
         );
 
+        assert!(start.is_none());
         assert!(associations.is_empty());
         assert_eq!(association_limit.current(), 0);
         assert_eq!(association_limit.completed(), 1);
