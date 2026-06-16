@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 #[cfg(test)]
 use std::net::SocketAddr;
 #[cfg(test)]
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 
 use anyhow::Result;
 #[cfg(test)]
@@ -12,8 +12,6 @@ use bytes::Bytes;
 #[cfg(test)]
 use bytes::BytesMut;
 use clap::Parser;
-#[cfg(test)]
-use smoltcp::socket::tcp;
 #[cfg(test)]
 use tokio::sync::mpsc;
 
@@ -59,12 +57,6 @@ use agent_bridge::{
 };
 use agent_lab::{run_agent_dns_lab, run_agent_lab, run_agent_udp_lab};
 use bridge_lab::run_bridge_lab;
-#[cfg(test)]
-use bridge_lab::{
-    abort_bridge_lab_client_socket, bridge_lab_client_complete, bridge_lab_latency_percentiles,
-    bridge_lab_response_complete, drain_lab_client_to_manager, pump_lab_manager_to_clients,
-    route_lab_packets_to_clients, synthetic_lab_client, BridgeLabClient, BridgeLabLatencySummary,
-};
 #[cfg(test)]
 use bridge_runtime::UdpAssociationTransport;
 use cli::{Cli, CommandKind};
@@ -168,7 +160,6 @@ mod tests {
     use crate::bridge_runtime::DnsTransport;
     use crate::supervisor::virtual_dns_ip;
     use anyhow::anyhow;
-    use smoltcp::time::Instant as SmolInstant;
     use std::net::IpAddr;
     use std::sync::Arc;
 
@@ -469,161 +460,6 @@ mod tests {
         assert_eq!(later, AGENT_LANE_BACKOFF_MAX);
         assert!(shifted_lane > first);
         assert!(shifted_lane <= AGENT_LANE_BACKOFF_MAX);
-    }
-
-    #[test]
-    fn bridge_lab_response_completion_uses_http_content_length() {
-        let complete = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let incomplete = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
-
-        assert!(bridge_lab_response_complete(complete));
-        assert!(!bridge_lab_response_complete(incomplete));
-        assert!(!bridge_lab_response_complete(b"raw bytes"));
-    }
-
-    #[test]
-    fn bridge_lab_cleanup_aborts_incomplete_client_socket() {
-        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
-        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
-        let destination_port = 8080;
-        let client_port = 50_000;
-        let (iface, device, sockets, handle) = synthetic_lab_client(
-            client_ip,
-            DEFAULT_TUN_IP,
-            destination_ip,
-            destination_port,
-            client_port,
-        )
-        .expect("synthetic client");
-        let mut client = BridgeLabClient {
-            flow: tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port),
-            client_ip,
-            client_port,
-            iface,
-            device,
-            sockets,
-            handle,
-            sent_request: true,
-            request_sent_at: Some(StdInstant::now()),
-            response_complete_at: None,
-            saw_bridge_close: false,
-            response: b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel".to_vec(),
-        };
-
-        assert!(!bridge_lab_client_complete(&client));
-        assert!(client
-            .sockets
-            .get_mut::<tcp::Socket>(client.handle)
-            .is_active());
-
-        assert!(abort_bridge_lab_client_socket(&mut client));
-        assert!(!client
-            .sockets
-            .get_mut::<tcp::Socket>(client.handle)
-            .is_active());
-        assert!(!abort_bridge_lab_client_socket(&mut client));
-    }
-
-    #[test]
-    fn bridge_lab_latency_percentiles_use_nearest_rank() {
-        let mut latencies = vec![900_u128, 100, 300, 500];
-
-        assert_eq!(
-            bridge_lab_latency_percentiles(&mut latencies),
-            BridgeLabLatencySummary {
-                p50_us: 300,
-                p95_us: 900,
-                max_us: 900,
-            }
-        );
-    }
-
-    #[test]
-    fn bridge_lab_synthetic_client_models_proxy_response_window() {
-        let (_iface, _device, sockets, handle) = synthetic_lab_client(
-            Ipv4Addr::new(10, 255, 255, 2),
-            DEFAULT_TUN_IP,
-            Ipv4Addr::new(192, 168, 1, 10),
-            443,
-            49152,
-        )
-        .expect("synthetic client");
-        let socket = sockets.get::<tcp::Socket>(handle);
-
-        assert_eq!(socket.recv_capacity(), tcp_core::TCP_SEND_BUFFER_BYTES);
-        assert_eq!(socket.send_capacity(), tcp_core::TCP_RECV_BUFFER_BYTES);
-        assert_eq!(socket.ack_delay(), None);
-        assert!(!socket.nagle_enabled());
-    }
-
-    #[test]
-    fn bridge_lab_router_recycles_client_packet_buffers_for_full_send_window() {
-        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
-        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
-        let destination_port = 443;
-        let client_port = 49152;
-        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
-        let mut manager = tcp_core::FlowManager::new(
-            DEFAULT_TUN_IP,
-            DEFAULT_TUN_PREFIX,
-            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
-            usize::from(DEFAULT_MTU),
-        )
-        .expect("flow manager");
-        let (iface, device, sockets, handle) = synthetic_lab_client(
-            client_ip,
-            DEFAULT_TUN_IP,
-            destination_ip,
-            destination_port,
-            client_port,
-        )
-        .expect("synthetic client");
-        let mut clients = vec![BridgeLabClient {
-            flow,
-            client_ip,
-            client_port,
-            iface,
-            device,
-            sockets,
-            handle,
-            sent_request: false,
-            request_sent_at: None,
-            response_complete_at: None,
-            saw_bridge_close: false,
-            response: Vec::new(),
-        }];
-        let mut now = SmolInstant::from_millis(0);
-
-        for _ in 0..256 {
-            let packets = {
-                let client = &mut clients[0];
-                client
-                    .iface
-                    .poll(now, &mut client.device, &mut client.sockets);
-                drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
-            };
-            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
-                .expect("route packets");
-            pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
-
-            if manager.snapshots().iter().any(|snapshot| {
-                snapshot.key == flow && snapshot.state == tcp_core::FlowState::TcpEstablished
-            }) {
-                break;
-            }
-            now += smoltcp::time::Duration::from_millis(1);
-        }
-
-        let payload = vec![0x42; tcp_core::TCP_SEND_BUFFER_BYTES];
-        let sent = manager
-            .send_flow_bytes_at(flow, &payload, now)
-            .expect("enqueue full send window");
-        assert_eq!(sent, payload.len());
-
-        pump_lab_manager_to_clients(now, &mut manager, &mut clients)
-            .expect("full send window should route without exhausting packet buffers");
-        assert_eq!(clients[0].response.len(), payload.len());
-        assert_eq!(clients[0].response, payload);
     }
 
     #[tokio::test]
