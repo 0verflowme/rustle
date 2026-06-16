@@ -39,6 +39,47 @@ impl HelperKind {
         helper_command_labels(self).1
     }
 
+    pub(crate) fn controller_log_prefix(self) -> &'static str {
+        match self {
+            Self::StdioAgent => "agent",
+            Self::QuicAgent => "quic-agent",
+            Self::QuicBridgeNative => "quic-native",
+        }
+    }
+
+    fn sidecar_noun(self) -> &'static str {
+        match self {
+            Self::StdioAgent => "agent",
+            Self::QuicAgent | Self::QuicBridgeNative => "helper",
+        }
+    }
+
+    fn platform_probe_context(self) -> &'static str {
+        match self {
+            Self::StdioAgent => "failed to determine remote platform for Rustle agent bootstrap",
+            Self::QuicAgent => {
+                "failed to determine remote platform for Rustle QUIC agent bootstrap"
+            }
+            Self::QuicBridgeNative => {
+                "failed to determine remote platform for native QUIC bridge bootstrap"
+            }
+        }
+    }
+
+    pub(crate) fn uploaded_start_context(self, remote_path: &str) -> String {
+        match self {
+            Self::StdioAgent => {
+                format!("uploaded Rustle agent failed to start from {remote_path}")
+            }
+            Self::QuicAgent => {
+                format!("uploaded Rustle QUIC agent failed to start from {remote_path}")
+            }
+            Self::QuicBridgeNative => {
+                format!("uploaded native QUIC bridge helper failed to start from {remote_path}")
+            }
+        }
+    }
+
     pub(crate) fn for_bridge_transport(transport: BridgeTransportKind) -> Self {
         match transport {
             BridgeTransportKind::QuicAgent => Self::QuicAgent,
@@ -55,6 +96,33 @@ pub(crate) fn helper_command_labels(kind: HelperKind) -> (&'static str, &'static
         HelperKind::StdioAgent => ("agent", DEFAULT_AGENT_COMMAND),
         HelperKind::QuicAgent => ("quic-agent", DEFAULT_QUIC_AGENT_COMMAND),
         HelperKind::QuicBridgeNative => ("quic-bridge-agent", DEFAULT_QUIC_BRIDGE_AGENT_COMMAND),
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UploadedHelperCommand {
+    pub(crate) kind: HelperKind,
+    pub(crate) platform: RemotePlatform,
+    pub(crate) local_path: PathBuf,
+    pub(crate) remote_path: String,
+    pub(crate) command: String,
+}
+
+impl UploadedHelperCommand {
+    fn new(
+        kind: HelperKind,
+        platform: RemotePlatform,
+        local_path: PathBuf,
+        remote_path: String,
+    ) -> Self {
+        let command = uploaded_helper_command(&remote_path, platform, kind.subcommand());
+        Self {
+            kind,
+            platform,
+            local_path,
+            remote_path,
+            command,
+        }
     }
 }
 
@@ -151,8 +219,9 @@ impl RemotePlatform {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn uploaded_agent_command(remote_path: &str, platform: RemotePlatform) -> String {
-    uploaded_helper_command(remote_path, platform, "agent")
+    uploaded_helper_command(remote_path, platform, HelperKind::StdioAgent.subcommand())
 }
 
 pub(crate) fn uploaded_helper_command(
@@ -220,6 +289,37 @@ pub(crate) async fn upload_agent_binary(
         });
     }
     Ok(remote_path)
+}
+
+pub(crate) async fn stage_uploaded_helper_command(
+    handle: &Handle<Client>,
+    kind: HelperKind,
+) -> Result<UploadedHelperCommand> {
+    let platform = probe_remote_platform(handle)
+        .await
+        .context(kind.platform_probe_context())?;
+    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
+    let local_path = local_agent_binary_for_platform(&current_exe, platform)?;
+    if helper_uses_sidecar(&current_exe, &local_path) {
+        eprintln!(
+            "{}: using local {} {} sidecar {}",
+            kind.controller_log_prefix(),
+            platform.label(),
+            kind.sidecar_noun(),
+            local_path.display()
+        );
+    }
+    let remote_path = upload_agent_binary(handle, &local_path, platform).await?;
+    Ok(UploadedHelperCommand::new(
+        kind,
+        platform,
+        local_path,
+        remote_path,
+    ))
+}
+
+fn helper_uses_sidecar(current_exe: &Path, local_path: &Path) -> bool {
+    local_path != current_exe
 }
 
 pub(crate) fn remote_agent_upload_command(platform: RemotePlatform) -> &'static str {
@@ -694,6 +794,43 @@ mod tests {
     }
 
     #[test]
+    fn helper_kind_metadata_preserves_controller_labels_and_contexts() {
+        let cases = [
+            (
+                HelperKind::StdioAgent,
+                "agent",
+                "agent",
+                "failed to determine remote platform for Rustle agent bootstrap",
+                "uploaded Rustle agent failed to start from /tmp/rustle-agent",
+            ),
+            (
+                HelperKind::QuicAgent,
+                "quic-agent",
+                "helper",
+                "failed to determine remote platform for Rustle QUIC agent bootstrap",
+                "uploaded Rustle QUIC agent failed to start from /tmp/rustle-agent",
+            ),
+            (
+                HelperKind::QuicBridgeNative,
+                "quic-native",
+                "helper",
+                "failed to determine remote platform for native QUIC bridge bootstrap",
+                "uploaded native QUIC bridge helper failed to start from /tmp/rustle-agent",
+            ),
+        ];
+
+        for (kind, log_prefix, sidecar_noun, probe_context, start_context) in cases {
+            assert_eq!(kind.controller_log_prefix(), log_prefix);
+            assert_eq!(kind.sidecar_noun(), sidecar_noun);
+            assert_eq!(kind.platform_probe_context(), probe_context);
+            assert_eq!(
+                kind.uploaded_start_context("/tmp/rustle-agent"),
+                start_context
+            );
+        }
+    }
+
+    #[test]
     fn helper_kind_maps_bridge_transports_to_helper_commands() {
         assert_eq!(
             HelperKind::for_bridge_transport(BridgeTransportKind::QuicAgent),
@@ -719,12 +856,43 @@ mod tests {
 
     #[test]
     fn helper_command_plan_resolves_effective_commands() {
-        assert_eq!(
-            HelperCommandPlan::from_command_options(HelperKind::QuicAgent, None, None)
-                .expect("default command")
+        let cases = [
+            (
+                HelperKind::StdioAgent,
+                DEFAULT_AGENT_COMMAND,
+                "'/tmp/rustle dir/rustle'\\''bin' agent",
+            ),
+            (
+                HelperKind::QuicAgent,
+                DEFAULT_QUIC_AGENT_COMMAND,
+                "'/tmp/rustle dir/rustle'\\''bin' quic-agent",
+            ),
+            (
+                HelperKind::QuicBridgeNative,
+                DEFAULT_QUIC_BRIDGE_AGENT_COMMAND,
+                "'/tmp/rustle dir/rustle'\\''bin' quic-bridge-agent",
+            ),
+        ];
+
+        for (kind, default_command, path_command) in cases {
+            assert_eq!(
+                HelperCommandPlan::from_command_options(kind, None, None)
+                    .expect("default command")
+                    .command,
+                default_command,
+            );
+            assert_eq!(
+                HelperCommandPlan::from_command_options(
+                    kind,
+                    None,
+                    Some("/tmp/rustle dir/rustle'bin"),
+                )
+                .expect("explicit path")
                 .command,
-            DEFAULT_QUIC_AGENT_COMMAND,
-        );
+                path_command,
+            );
+        }
+
         assert_eq!(
             HelperCommandPlan::from_command_options(
                 HelperKind::StdioAgent,
@@ -734,16 +902,6 @@ mod tests {
             .expect("explicit command")
             .command,
             "/opt/rustle quic-agent",
-        );
-        assert_eq!(
-            HelperCommandPlan::from_command_options(
-                HelperKind::QuicBridgeNative,
-                None,
-                Some("/tmp/rustle dir/rustle'bin"),
-            )
-            .expect("explicit path")
-            .command,
-            "'/tmp/rustle dir/rustle'\\''bin' quic-bridge-agent",
         );
     }
 
@@ -893,19 +1051,89 @@ mod tests {
     }
 
     #[test]
-    fn uploaded_helper_command_selects_requested_subcommand() {
+    fn uploaded_agent_command_matches_stdio_uploaded_helper_command() {
+        let posix = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        assert_eq!(
+            uploaded_agent_command("/tmp/rustle-agent", posix),
+            uploaded_helper_command(
+                "/tmp/rustle-agent",
+                posix,
+                HelperKind::StdioAgent.subcommand()
+            )
+        );
+
+        let windows = RemotePlatform {
+            os: "windows",
+            arch: "x86_64",
+        };
+        assert_eq!(
+            uploaded_agent_command("C:\\Temp\\rustle-agent.exe", windows),
+            uploaded_helper_command(
+                "C:\\Temp\\rustle-agent.exe",
+                windows,
+                HelperKind::StdioAgent.subcommand()
+            )
+        );
+    }
+
+    #[test]
+    fn uploaded_helper_command_new_constructs_metadata_and_command_for_each_kind() {
+        let platform = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let local_path = PathBuf::from("/local/rustle");
+
+        for (kind, subcommand) in [
+            (HelperKind::StdioAgent, "agent"),
+            (HelperKind::QuicAgent, "quic-agent"),
+            (HelperKind::QuicBridgeNative, "quic-bridge-agent"),
+        ] {
+            let helper = UploadedHelperCommand::new(
+                kind,
+                platform,
+                local_path.clone(),
+                "/tmp/rustle-agent".to_owned(),
+            );
+
+            assert_eq!(helper.kind, kind);
+            assert_eq!(helper.platform, platform);
+            assert_eq!(helper.local_path, local_path);
+            assert_eq!(helper.remote_path, "/tmp/rustle-agent");
+            assert!(helper.command.contains(&format!("\"$tmp\" {subcommand}")));
+        }
+    }
+
+    #[test]
+    fn helper_uses_sidecar_only_when_selected_path_differs_from_current_exe() {
+        let current = PathBuf::from("/opt/rustle/rustle");
+
+        assert!(!helper_uses_sidecar(&current, &current));
+        assert!(helper_uses_sidecar(
+            &current,
+            &PathBuf::from("/opt/rustle/rustle-agent-linux-x86_64")
+        ));
+    }
+
+    #[test]
+    fn posix_uploaded_helper_command_constructs_command_for_each_helper_kind() {
         let platform = RemotePlatform {
             os: "linux",
             arch: "x86_64",
         };
 
-        let quic_agent = uploaded_helper_command("/tmp/rustle-agent", platform, "quic-agent");
-        let quic_bridge =
-            uploaded_helper_command("/tmp/rustle-agent", platform, "quic-bridge-agent");
+        for (kind, subcommand) in [
+            (HelperKind::StdioAgent, "agent"),
+            (HelperKind::QuicAgent, "quic-agent"),
+            (HelperKind::QuicBridgeNative, "quic-bridge-agent"),
+        ] {
+            let command = uploaded_helper_command("/tmp/rustle-agent", platform, kind.subcommand());
 
-        assert!(quic_agent.contains("\"$tmp\" quic-agent"));
-        assert!(!quic_agent.contains("\"$tmp\" agent"));
-        assert!(quic_bridge.contains("\"$tmp\" quic-bridge-agent"));
+            assert!(command.contains(&format!("\"$tmp\" {subcommand}")));
+        }
     }
 
     #[test]
@@ -937,15 +1165,22 @@ mod tests {
     }
 
     #[test]
-    fn windows_uploaded_helper_command_selects_requested_subcommand() {
+    fn windows_uploaded_helper_command_constructs_command_for_each_helper_kind() {
         let platform = RemotePlatform {
             os: "windows",
             arch: "x86_64",
         };
 
-        let command = uploaded_helper_command("C:\\Temp\\rustle-agent.exe", platform, "quic-agent");
+        for (kind, subcommand) in [
+            (HelperKind::StdioAgent, "agent"),
+            (HelperKind::QuicAgent, "quic-agent"),
+            (HelperKind::QuicBridgeNative, "quic-bridge-agent"),
+        ] {
+            let command =
+                uploaded_helper_command("C:\\Temp\\rustle-agent.exe", platform, kind.subcommand());
 
-        assert!(command.contains("& $tmp quic-agent"));
+            assert!(command.contains(&format!("& $tmp {subcommand}")));
+        }
     }
 
     #[test]

@@ -1,4 +1,3 @@
-use std::env;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 
@@ -11,10 +10,7 @@ use crate::agent_bridge::{
     AgentBridgeTransport, QuicNativeBridge, ReconnectingAgentBridge,
 };
 use crate::data_plane::{BridgeRuntime, DnsTransport};
-use crate::remote_helper::{
-    local_agent_binary_for_platform, probe_remote_platform, upload_agent_binary,
-    uploaded_agent_command, uploaded_helper_command, HelperCommandPlan,
-};
+use crate::remote_helper::{stage_uploaded_helper_command, HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,
     resolve_agent_session_count, resolve_ssh_target, Client, PreparedSshConnection,
@@ -402,39 +398,22 @@ async fn connect_uploaded_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
-    connect_uploaded_agent_bridge_transport_with_command_prepared(prepared, mtu, "agent")
+    connect_uploaded_stdio_agent_bridge_transport_prepared(prepared, mtu)
         .await
         .map(|(transport, _)| transport)
 }
 
-async fn connect_uploaded_agent_bridge_transport_with_command_prepared(
+async fn connect_uploaded_stdio_agent_bridge_transport_prepared(
     prepared: &PreparedSshConnection,
     mtu: u16,
-    helper_subcommand: &str,
 ) -> Result<(AgentBridgeTransport, String)> {
     let handle = connect_prepared_ssh(prepared).await?;
-    let platform = probe_remote_platform(&handle)
+    let kind = HelperKind::StdioAgent;
+    let helper = stage_uploaded_helper_command(&handle, kind).await?;
+    let transport = connect_agent_bridge_transport_on_handle(handle, &helper.command, mtu)
         .await
-        .context("failed to determine remote platform for Rustle agent bootstrap")?;
-    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
-    let local_agent = local_agent_binary_for_platform(&current_exe, platform)?;
-    if local_agent != current_exe {
-        eprintln!(
-            "agent: using local {} agent sidecar {}",
-            platform.label(),
-            local_agent.display()
-        );
-    }
-    let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
-    let agent_command = if helper_subcommand == "agent" {
-        uploaded_agent_command(&remote_path, platform)
-    } else {
-        uploaded_helper_command(&remote_path, platform, helper_subcommand)
-    };
-    let transport = connect_agent_bridge_transport_on_handle(handle, &agent_command, mtu)
-        .await
-        .with_context(|| format!("uploaded Rustle agent failed to start from {remote_path}"))?;
-    Ok((transport, agent_command))
+        .with_context(|| kind.uploaded_start_context(&helper.remote_path))?;
+    Ok((transport, helper.command))
 }
 
 async fn connect_uploaded_quic_agent_bridge_transport_prepared(
@@ -442,52 +421,24 @@ async fn connect_uploaded_quic_agent_bridge_transport_prepared(
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
     let handle = connect_prepared_ssh(prepared).await?;
-    let platform = probe_remote_platform(&handle)
-        .await
-        .context("failed to determine remote platform for Rustle QUIC agent bootstrap")?;
-    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
-    let local_agent = local_agent_binary_for_platform(&current_exe, platform)?;
-    if local_agent != current_exe {
-        eprintln!(
-            "quic-agent: using local {} helper sidecar {}",
-            platform.label(),
-            local_agent.display()
-        );
-    }
-    let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
-    let agent_command = uploaded_helper_command(&remote_path, platform, "quic-agent");
+    let helper = stage_uploaded_helper_command(&handle, HelperKind::QuicAgent).await?;
     connect_quic_agent_bridge_transport_on_handle(
         handle,
         prepared.remote_host(),
-        &agent_command,
+        &helper.command,
         mtu,
     )
     .await
-    .with_context(|| format!("uploaded Rustle QUIC agent failed to start from {remote_path}"))
+    .with_context(|| HelperKind::QuicAgent.uploaded_start_context(&helper.remote_path))
 }
 
 async fn connect_uploaded_quic_native_bridge(ssh: &SshArgs) -> Result<QuicNativeBridge> {
     let prepared = prepare_ssh_connection(ssh)?;
     let handle = connect_prepared_ssh(&prepared).await?;
-    let platform = probe_remote_platform(&handle)
+    let helper = stage_uploaded_helper_command(&handle, HelperKind::QuicBridgeNative).await?;
+    connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &helper.command)
         .await
-        .context("failed to determine remote platform for native QUIC bridge bootstrap")?;
-    let current_exe = env::current_exe().context("failed to locate current Rustle executable")?;
-    let local_agent = local_agent_binary_for_platform(&current_exe, platform)?;
-    if local_agent != current_exe {
-        eprintln!(
-            "quic-native: using local {} helper sidecar {}",
-            platform.label(),
-            local_agent.display()
-        );
-    }
-    let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
-    let agent_command = uploaded_helper_command(&remote_path, platform, "quic-bridge-agent");
-    connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &agent_command)
-        .await
-        .with_context(|| {
-            format!("uploaded native QUIC bridge helper failed to start from {remote_path}")
-        })
+        .with_context(|| HelperKind::QuicBridgeNative.uploaded_start_context(&helper.remote_path))
 }
 
 pub(crate) async fn connect_bridge_runtime(
