@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::net::Ipv4Addr;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
@@ -13,8 +16,8 @@ use crate::agent_bridge::{
 use crate::agent_transport;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
-    BridgeAdmissionLimits, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot, Destination,
-    DnsResponseEvent, UdpAssociationEvents, UdpFlowKey,
+    BridgeAdmissionLimits, DataPlaneCaps, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot,
+    Destination, DnsResponseEvent, UdpAssociationEvents, UdpFlowKey,
 };
 use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core};
 
@@ -22,6 +25,48 @@ pub(crate) const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
+
+pub(crate) type DataPlaneSnapshotFuture<'a> =
+    Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
+pub(crate) type DataPlaneDnsFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
+
+pub(crate) trait DataPlane: Send + Sync {
+    fn label(&self) -> &'static str;
+    fn udp_label(&self) -> Option<&'static str>;
+    fn caps(&self) -> DataPlaneCaps;
+    fn admission_limits(&self) -> BridgeAdmissionLimits;
+    fn snapshot(&self) -> DataPlaneSnapshotFuture<'_>;
+    fn spawn_tcp_bridge(
+        &self,
+        id: tcp_core::FlowId,
+        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    ) -> ssh_bridge::FlowBridge;
+    fn query_dns(
+        &self,
+        remote: Destination,
+        query: Bytes,
+        originator_ip: Ipv4Addr,
+    ) -> DataPlaneDnsFuture<'_>;
+    fn spawn_udp_association(
+        &self,
+        key: UdpFlowKey,
+        from_local: mpsc::Receiver<Bytes>,
+        events: UdpAssociationEvents,
+        idle_timeout: Duration,
+    );
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeDataPlane {
+    bridge: BridgeRuntime,
+    dns: DnsTransport,
+}
+
+impl RuntimeDataPlane {
+    pub(crate) fn new(bridge: BridgeRuntime, dns: DnsTransport) -> Self {
+        Self { bridge, dns }
+    }
+}
 
 fn data_plane_runtime_snapshot_from_agent(
     snapshot: AgentBridgeSnapshot,
@@ -45,6 +90,7 @@ fn data_plane_runtime_snapshot_from_agent(
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum BridgeRuntime {
     DirectTcpip(SshSessionPool),
     Agent(ReconnectingAgentBridge),
@@ -101,6 +147,68 @@ impl BridgeRuntime {
                 spawn_quic_native_tcp_bridge(id, event_tx, bridge)
             }
         }
+    }
+}
+
+impl DataPlane for RuntimeDataPlane {
+    fn label(&self) -> &'static str {
+        self.dns.label()
+    }
+
+    fn udp_label(&self) -> Option<&'static str> {
+        self.dns.udp_label()
+    }
+
+    fn caps(&self) -> DataPlaneCaps {
+        DataPlaneCaps {
+            udp_associations: self.dns.udp_transport().is_some(),
+        }
+    }
+
+    fn admission_limits(&self) -> BridgeAdmissionLimits {
+        self.bridge.admission_limits()
+    }
+
+    fn snapshot(&self) -> DataPlaneSnapshotFuture<'_> {
+        let bridge = self.bridge.clone();
+        Box::pin(async move { bridge.snapshot().await })
+    }
+
+    fn spawn_tcp_bridge(
+        &self,
+        id: tcp_core::FlowId,
+        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    ) -> ssh_bridge::FlowBridge {
+        self.bridge.spawn_tcp_bridge(id, event_tx)
+    }
+
+    fn query_dns(
+        &self,
+        remote: Destination,
+        query: Bytes,
+        originator_ip: Ipv4Addr,
+    ) -> DataPlaneDnsFuture<'_> {
+        let transport = self.dns.clone();
+        Box::pin(async move {
+            query_dns_over_transport(transport, &remote, query.as_ref(), originator_ip).await
+        })
+    }
+
+    fn spawn_udp_association(
+        &self,
+        key: UdpFlowKey,
+        from_local: mpsc::Receiver<Bytes>,
+        events: UdpAssociationEvents,
+        idle_timeout: Duration,
+    ) {
+        let Some(transport) = self.dns.udp_transport() else {
+            let _ = events.try_send_closed(
+                key,
+                Some("data plane does not support generic UDP associations".to_owned()),
+            );
+            return;
+        };
+        spawn_udp_association_with_idle_timeout(transport, key, from_local, events, idle_timeout);
     }
 }
 
@@ -673,6 +781,14 @@ impl DnsTransport {
         }
     }
 
+    fn udp_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Agent(_) => Some("agent"),
+            Self::QuicNative(_) => Some("quic-native"),
+            Self::DirectTcpip(_) => None,
+        }
+    }
+
     pub(crate) fn udp_transport(&self) -> Option<UdpAssociationTransport> {
         match self {
             Self::Agent(agent) => Some(UdpAssociationTransport::Agent(agent.clone())),
@@ -689,6 +805,7 @@ pub(crate) enum UdpAssociationTransport {
 }
 
 impl UdpAssociationTransport {
+    #[cfg(test)]
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Agent(_) => "agent",
@@ -768,18 +885,22 @@ impl AgentIoStream {
     }
 }
 
-pub(crate) fn spawn_dns_query(
-    transport: DnsTransport,
+pub(crate) fn spawn_dns_query_on_data_plane(
+    data_plane: Arc<dyn DataPlane>,
     remote: Destination,
     request: dns::UdpDnsRequest,
     event_tx: mpsc::Sender<DnsResponseEvent>,
     originator_ip: Ipv4Addr,
 ) {
     tokio::spawn(async move {
-        let result =
-            query_dns_over_transport(transport, &remote, request.payload.as_ref(), originator_ip)
-                .await
-                .map_err(|err| err.to_string());
+        let result = data_plane
+            .query_dns(
+                remote,
+                Bytes::copy_from_slice(request.payload.as_ref()),
+                originator_ip,
+            )
+            .await
+            .map_err(|err| err.to_string());
         send_dns_response_event(&event_tx, DnsResponseEvent { request, result });
     });
 }

@@ -14,7 +14,7 @@ use tokio::sync::Semaphore;
 use tun_rs::DeviceBuilder;
 
 use crate::connect_bridge_runtime;
-use crate::data_plane::{query_dns_over_transport, spawn_dns_query, BridgeRuntime, DnsTransport};
+use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
 use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, execute_udp_ingress_actions, expire_stale_flows,
     handle_bridge_event_into, parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel,
@@ -127,6 +127,8 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         },
     )
     .await?;
+    let data_plane: Arc<dyn DataPlane> =
+        Arc::new(RuntimeDataPlane::new(bridge_runtime, dns_transport));
     let control_route = match ssh_control_ip {
         Some(ip) => add_ssh_control_route(ip)?,
         None => None,
@@ -137,7 +139,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         let system_dns_ip = platform::system_dns_server_ip(virtual_dns_ip);
         let local_dns_proxy = if system_dns_ip.is_loopback() {
             Some(
-                start_local_dns_proxy(system_dns_ip, dns_transport.clone(), dns_remote.clone())
+                start_local_dns_proxy(system_dns_ip, Arc::clone(&data_plane), dns_remote.clone())
                     .await
                     .with_context(|| {
                         format!("failed to start local DNS proxy on {system_dns_ip}:53")
@@ -166,8 +168,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     let result = run_tunnel_loop(
         dev,
         flow_manager,
-        bridge_runtime,
-        dns_transport,
+        data_plane,
         dns_remote,
         Duration::from_millis(args.udp_idle_timeout_ms),
         Box::pin(shutdown_signal()),
@@ -183,8 +184,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
 pub(crate) async fn run_tunnel_loop(
     dev: tun_rs::AsyncDevice,
     mut flow_manager: tcp_core::FlowManager,
-    bridge_runtime: BridgeRuntime,
-    dns_transport: DnsTransport,
+    data_plane: Arc<dyn DataPlane>,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
     mut shutdown: ShutdownSignalFuture,
@@ -234,7 +234,7 @@ pub(crate) async fn run_tunnel_loop(
                         &remote_backlogs,
                         &dns_inflight,
                         &udp_inflight,
-                        bridge_runtime.snapshot().await,
+                        data_plane.snapshot().await,
                     )
                 );
                 return Ok(());
@@ -253,13 +253,13 @@ pub(crate) async fn run_tunnel_loop(
                         request.src_port,
                         request.dst_ip,
                         request.dst_port,
-                        dns_transport.label(),
+                        data_plane.label(),
                         dns_remote.host,
                         dns_remote.port
                     );
                     if dns_inflight.try_admit() {
-                        spawn_dns_query(
-                            dns_transport.clone(),
+                        spawn_dns_query_on_data_plane(
+                            Arc::clone(&data_plane),
                             dns_remote.clone(),
                             request,
                             dns_tx.clone(),
@@ -285,9 +285,12 @@ pub(crate) async fn run_tunnel_loop(
                     continue;
                 }
                 if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
-                    let udp_transport = dns_transport
-                        .udp_transport()
-                        .map(|transport| UdpAssociationTransportPlan::new(transport.label(), transport));
+                    let udp_transport = data_plane.caps().udp_associations.then(|| {
+                        let label = data_plane
+                            .udp_label()
+                            .expect("UDP-capable data plane must provide a UDP label");
+                        UdpAssociationTransportPlan::new(label, Arc::clone(&data_plane))
+                    });
                     plan_udp_datagram_actions(
                         udp_transport,
                         request,
@@ -303,13 +306,7 @@ pub(crate) async fn run_tunnel_loop(
                         &mut udp_inflight,
                         &mut stats,
                         &mut |transport, key, from_local, events, idle_timeout| {
-                            crate::data_plane::spawn_udp_association_with_idle_timeout(
-                                transport,
-                                key,
-                                from_local,
-                                events,
-                                idle_timeout,
-                            );
+                            transport.spawn_udp_association(key, from_local, events, idle_timeout);
                         },
                     );
                     continue;
@@ -324,8 +321,8 @@ pub(crate) async fn run_tunnel_loop(
                 let admission_stats = ensure_bridges(
                     &mut flow_manager,
                     &mut bridges,
-                    bridge_runtime.admission_limits(),
-                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
+                    data_plane.admission_limits(),
+                    |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
                     event_tx.clone(),
                     &mut ready_flow_ids,
                     now,
@@ -458,7 +455,7 @@ pub(crate) async fn run_tunnel_loop(
                         &remote_backlogs,
                         &dns_inflight,
                         &udp_inflight,
-                        bridge_runtime.snapshot().await,
+                        data_plane.snapshot().await,
                     )
                 );
             }
@@ -483,8 +480,8 @@ pub(crate) async fn run_tunnel_loop(
                 let admission_stats = ensure_bridges(
                     &mut flow_manager,
                     &mut bridges,
-                    bridge_runtime.admission_limits(),
-                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
+                    data_plane.admission_limits(),
+                    |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
                     event_tx.clone(),
                     &mut ready_flow_ids,
                     now,
@@ -953,7 +950,7 @@ impl Drop for LocalDnsProxy {
 
 pub(crate) async fn start_local_dns_proxy(
     bind_ip: Ipv4Addr,
-    transport: DnsTransport,
+    data_plane: Arc<dyn DataPlane>,
     remote: Destination,
 ) -> Result<LocalDnsProxy> {
     let socket = Arc::new(
@@ -989,23 +986,19 @@ pub(crate) async fn start_local_dns_proxy(
             };
 
             let socket = Arc::clone(&socket);
-            let transport = transport.clone();
+            let data_plane = Arc::clone(&data_plane);
             let remote = remote.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 eprintln!(
                     "dns: forwarding local resolver query from {peer} over {} to {}:{}",
-                    transport.label(),
+                    data_plane.label(),
                     remote.host,
                     remote.port
                 );
-                let response = match query_dns_over_transport(
-                    transport,
-                    &remote,
-                    query.as_ref(),
-                    DEFAULT_TUN_IP,
-                )
-                .await
+                let response = match data_plane
+                    .query_dns(remote, query.clone(), DEFAULT_TUN_IP)
+                    .await
                 {
                     Ok(response) => response,
                     Err(err) => {

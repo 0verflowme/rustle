@@ -33,6 +33,11 @@ pub(crate) struct BridgeAdmissionLimits {
     pub(crate) opening: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DataPlaneCaps {
+    pub(crate) udp_associations: bool,
+}
+
 impl BridgeAdmissionLimits {
     pub(crate) const fn direct_tcpip() -> Self {
         Self {
