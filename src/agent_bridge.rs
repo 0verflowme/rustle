@@ -15,6 +15,14 @@ use crate::{agent_proto, agent_transport, quic_agent};
 pub(crate) const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 pub(crate) const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
+const TCP_PROTOCOL_NUMBER: u8 = 6;
+const UDP_PROTOCOL_NUMBER: u8 = 17;
+const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const SECONDARY_LANE_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+const LANE_BACKOFF_MAX_SHIFT: u32 = 7;
+const LANE_BACKOFF_JITTER_LANE_FACTOR: u64 = 37;
+const LANE_BACKOFF_JITTER_FAILURE_FACTOR: u64 = 11;
+const LANE_BACKOFF_JITTER_MODULUS: u64 = 100;
 
 pub(crate) type AgentBridgeConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentBridgeTransport>> + Send + 'a>>;
@@ -383,16 +391,105 @@ enum AgentTcpOpenMode {
     Optimistic,
 }
 
-impl AgentTcpOpenMode {
-    async fn open(
-        self,
-        transport: &agent_transport::AgentTransport,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AgentOpenRequest {
+    TcpIpv4 {
         open: agent_proto::AgentOpenIpv4,
+        mode: AgentTcpOpenMode,
+    },
+    TcpHost(agent_proto::AgentOpenHost),
+    UdpIpv4(agent_proto::AgentOpenIpv4),
+}
+
+impl AgentOpenRequest {
+    fn lane_hash(&self) -> u64 {
+        match self {
+            Self::TcpIpv4 { open, .. } => agent_ipv4_lane_hash(open, TCP_PROTOCOL_NUMBER),
+            Self::TcpHost(open) => agent_host_lane_hash(open, TCP_PROTOCOL_NUMBER),
+            Self::UdpIpv4(open) => agent_ipv4_lane_hash(open, UDP_PROTOCOL_NUMBER),
+        }
+    }
+
+    async fn open(
+        &self,
+        transport: &agent_transport::AgentTransport,
     ) -> Result<agent_transport::AgentStream> {
         match self {
-            Self::Strict => transport.open_tcp_ipv4(open).await,
-            Self::Optimistic => transport.open_tcp_ipv4_optimistic(open).await,
+            Self::TcpIpv4 {
+                open,
+                mode: AgentTcpOpenMode::Strict,
+            } => transport.open_tcp_ipv4(*open).await,
+            Self::TcpIpv4 {
+                open,
+                mode: AgentTcpOpenMode::Optimistic,
+            } => transport.open_tcp_ipv4_optimistic(*open).await,
+            Self::TcpHost(open) => transport.open_tcp_host(open.clone()).await,
+            Self::UdpIpv4(open) => transport.open_udp_ipv4(*open).await,
         }
+    }
+
+    fn repaired_lane_context(&self) -> &'static str {
+        match self {
+            Self::TcpIpv4 { .. } => "failed to open agent TCP stream on repaired lane",
+            Self::TcpHost(_) => "failed to open agent hostname TCP stream on repaired lane",
+            Self::UdpIpv4(_) => "failed to open agent UDP stream on repaired lane",
+        }
+    }
+
+    fn alternate_lane_context(&self, lane_index: usize) -> String {
+        match self {
+            Self::TcpIpv4 { .. } => {
+                format!("failed to open agent TCP stream on alternate lane {lane_index}")
+            }
+            Self::TcpHost(_) => {
+                format!("failed to open agent hostname TCP stream on alternate lane {lane_index}")
+            }
+            Self::UdpIpv4(_) => {
+                format!("failed to open agent UDP stream on alternate lane {lane_index}")
+            }
+        }
+    }
+
+    fn repaired_alternate_lane_context(&self, lane_index: usize) -> String {
+        match self {
+            Self::TcpIpv4 { .. } => {
+                format!("failed to open agent TCP stream on repaired alternate lane {lane_index}")
+            }
+            Self::TcpHost(_) => {
+                format!(
+                    "failed to open agent hostname TCP stream on repaired alternate lane {lane_index}"
+                )
+            }
+            Self::UdpIpv4(_) => {
+                format!("failed to open agent UDP stream on repaired alternate lane {lane_index}")
+            }
+        }
+    }
+
+    fn no_alternate_succeeded_context(&self) -> &'static str {
+        match self {
+            Self::TcpIpv4 { .. } => {
+                "failed to open agent TCP stream on preferred lane and no alternate agent lane succeeded"
+            }
+            Self::TcpHost(_) => {
+                "failed to open agent hostname TCP stream on preferred lane and no alternate agent lane succeeded"
+            }
+            Self::UdpIpv4(_) => {
+                "failed to open agent UDP stream on preferred lane and no alternate agent lane succeeded"
+            }
+        }
+    }
+
+    fn log_alternate_opened(&self, lane_index: usize, skipped_index: usize, repaired: bool) {
+        let request = match self {
+            Self::TcpIpv4 { .. } => "TCP stream",
+            Self::TcpHost(_) => "hostname TCP stream",
+            Self::UdpIpv4(_) => "UDP stream",
+        };
+        let repaired = if repaired { "repaired " } else { "" };
+        eprintln!(
+            "agent: opened {request} on {repaired}alternate lane {lane_index} after lane {skipped_index} failed"
+        );
     }
 }
 
@@ -475,176 +572,45 @@ impl ReconnectingAgentBridge {
         &self,
         open: agent_proto::AgentOpenIpv4,
     ) -> Result<AgentBridgeStream> {
-        self.open_tcp_ipv4_with_mode(open, AgentTcpOpenMode::Strict)
-            .await
+        self.open_request(AgentOpenRequest::TcpIpv4 {
+            open,
+            mode: AgentTcpOpenMode::Strict,
+        })
+        .await
     }
 
     pub(crate) async fn open_tcp_ipv4_optimistic(
         &self,
         open: agent_proto::AgentOpenIpv4,
     ) -> Result<AgentBridgeStream> {
-        self.open_tcp_ipv4_with_mode(open, AgentTcpOpenMode::Optimistic)
-            .await
-    }
-
-    async fn open_tcp_ipv4_with_mode(
-        &self,
-        open: agent_proto::AgentOpenIpv4,
-        mode: AgentTcpOpenMode,
-    ) -> Result<AgentBridgeStream> {
-        let (primary, secondary) =
-            agent_lane_candidates(agent_ipv4_lane_hash(&open, 6), self.lanes.len());
-        let lane_index = self.choose_lane_index(primary, secondary).await;
-        let lane = &self.lanes[lane_index];
-        if let Some(err) = self.quarantined_lane_error(lane).await {
-            return self
-                .open_tcp_ipv4_on_alternate_lane_with_mode(open, lane_index, err, mode)
-                .await;
-        }
-        let lease = self.reserve_lane(lane);
-        let transport = match self.current_transport(lane).await {
-            Some(transport) => transport,
-            None => match self
-                .reconnect_failed_lane(lane, "missing startup exec transport".to_owned())
-                .await
-            {
-                Ok(replacement) => replacement,
-                Err(reconnect_err) => {
-                    drop(lease);
-                    return self
-                        .open_tcp_ipv4_on_alternate_lane_with_mode(
-                            open,
-                            lane_index,
-                            reconnect_err,
-                            mode,
-                        )
-                        .await;
-                }
-            },
-        };
-        match mode.open(&transport, open).await {
-            Ok(stream) => {
-                self.mark_lane_open_success(lane).await;
-                Ok(lease.into_stream(stream))
-            }
-            Err(err) => {
-                let Some(failure) = transport.failure_message().await else {
-                    return Err(err);
-                };
-                let replacement = match self.reconnect_failed_lane(lane, failure).await {
-                    Ok(replacement) => replacement,
-                    Err(reconnect_err) => {
-                        drop(lease);
-                        return self
-                            .open_tcp_ipv4_on_alternate_lane_with_mode(
-                                open,
-                                lane_index,
-                                reconnect_err,
-                                mode,
-                            )
-                            .await;
-                    }
-                };
-                match mode.open(&replacement, open).await {
-                    Ok(stream) => {
-                        self.mark_lane_open_success(lane).await;
-                        Ok(lease.into_stream(stream))
-                    }
-                    Err(err) => {
-                        if replacement.failure_message().await.is_some() {
-                            drop(lease);
-                            self.open_tcp_ipv4_on_alternate_lane_with_mode(
-                                open, lane_index, err, mode,
-                            )
-                            .await
-                        } else {
-                            Err(err).context("failed to open agent TCP stream on repaired lane")
-                        }
-                    }
-                }
-            }
-        }
+        self.open_request(AgentOpenRequest::TcpIpv4 {
+            open,
+            mode: AgentTcpOpenMode::Optimistic,
+        })
+        .await
     }
 
     pub(crate) async fn open_tcp_host(
         &self,
         open: agent_proto::AgentOpenHost,
     ) -> Result<AgentBridgeStream> {
-        let (primary, secondary) =
-            agent_lane_candidates(agent_host_lane_hash(&open, 6), self.lanes.len());
-        let lane_index = self.choose_lane_index(primary, secondary).await;
-        let lane = &self.lanes[lane_index];
-        if let Some(err) = self.quarantined_lane_error(lane).await {
-            return self
-                .open_tcp_host_on_alternate_lane(open, lane_index, err)
-                .await;
-        }
-        let lease = self.reserve_lane(lane);
-        let transport = match self.current_transport(lane).await {
-            Some(transport) => transport,
-            None => match self
-                .reconnect_failed_lane(lane, "missing startup exec transport".to_owned())
-                .await
-            {
-                Ok(replacement) => replacement,
-                Err(reconnect_err) => {
-                    drop(lease);
-                    return self
-                        .open_tcp_host_on_alternate_lane(open, lane_index, reconnect_err)
-                        .await;
-                }
-            },
-        };
-        match transport.open_tcp_host(open.clone()).await {
-            Ok(stream) => {
-                self.mark_lane_open_success(lane).await;
-                Ok(lease.into_stream(stream))
-            }
-            Err(err) => {
-                let Some(failure) = transport.failure_message().await else {
-                    return Err(err);
-                };
-                let replacement = match self.reconnect_failed_lane(lane, failure).await {
-                    Ok(replacement) => replacement,
-                    Err(reconnect_err) => {
-                        drop(lease);
-                        return self
-                            .open_tcp_host_on_alternate_lane(open, lane_index, reconnect_err)
-                            .await;
-                    }
-                };
-                match replacement.open_tcp_host(open.clone()).await {
-                    Ok(stream) => {
-                        self.mark_lane_open_success(lane).await;
-                        Ok(lease.into_stream(stream))
-                    }
-                    Err(err) => {
-                        if replacement.failure_message().await.is_some() {
-                            drop(lease);
-                            self.open_tcp_host_on_alternate_lane(open, lane_index, err)
-                                .await
-                        } else {
-                            Err(err).context(
-                                "failed to open agent hostname TCP stream on repaired lane",
-                            )
-                        }
-                    }
-                }
-            }
-        }
+        self.open_request(AgentOpenRequest::TcpHost(open)).await
     }
 
     pub(crate) async fn open_udp_ipv4(
         &self,
         open: agent_proto::AgentOpenIpv4,
     ) -> Result<AgentBridgeStream> {
-        let (primary, secondary) =
-            agent_lane_candidates(agent_ipv4_lane_hash(&open, 17), self.lanes.len());
+        self.open_request(AgentOpenRequest::UdpIpv4(open)).await
+    }
+
+    async fn open_request(&self, request: AgentOpenRequest) -> Result<AgentBridgeStream> {
+        let (primary, secondary) = agent_lane_candidates(request.lane_hash(), self.lanes.len());
         let lane_index = self.choose_lane_index(primary, secondary).await;
         let lane = &self.lanes[lane_index];
         if let Some(err) = self.quarantined_lane_error(lane).await {
             return self
-                .open_udp_ipv4_on_alternate_lane(open, lane_index, err)
+                .open_request_on_alternate_lane(request, lane_index, err)
                 .await;
         }
         let lease = self.reserve_lane(lane);
@@ -658,12 +624,12 @@ impl ReconnectingAgentBridge {
                 Err(reconnect_err) => {
                     drop(lease);
                     return self
-                        .open_udp_ipv4_on_alternate_lane(open, lane_index, reconnect_err)
+                        .open_request_on_alternate_lane(request, lane_index, reconnect_err)
                         .await;
                 }
             },
         };
-        match transport.open_udp_ipv4(open).await {
+        match request.open(&transport).await {
             Ok(stream) => {
                 self.mark_lane_open_success(lane).await;
                 Ok(lease.into_stream(stream))
@@ -677,11 +643,11 @@ impl ReconnectingAgentBridge {
                     Err(reconnect_err) => {
                         drop(lease);
                         return self
-                            .open_udp_ipv4_on_alternate_lane(open, lane_index, reconnect_err)
+                            .open_request_on_alternate_lane(request, lane_index, reconnect_err)
                             .await;
                     }
                 };
-                match replacement.open_udp_ipv4(open).await {
+                match request.open(&replacement).await {
                     Ok(stream) => {
                         self.mark_lane_open_success(lane).await;
                         Ok(lease.into_stream(stream))
@@ -689,10 +655,10 @@ impl ReconnectingAgentBridge {
                     Err(err) => {
                         if replacement.failure_message().await.is_some() {
                             drop(lease);
-                            self.open_udp_ipv4_on_alternate_lane(open, lane_index, err)
+                            self.open_request_on_alternate_lane(request, lane_index, err)
                                 .await
                         } else {
-                            Err(err).context("failed to open agent UDP stream on repaired lane")
+                            Err(err).context(request.repaired_lane_context())
                         }
                     }
                 }
@@ -700,87 +666,9 @@ impl ReconnectingAgentBridge {
         }
     }
 
-    async fn open_tcp_ipv4_on_alternate_lane_with_mode(
+    async fn open_request_on_alternate_lane(
         &self,
-        open: agent_proto::AgentOpenIpv4,
-        skipped_index: usize,
-        original_err: anyhow::Error,
-        mode: AgentTcpOpenMode,
-    ) -> Result<AgentBridgeStream> {
-        let mut last_err = original_err;
-        let mut tried_lanes = 0_u64;
-        while let Some(lane) = self.next_alternate_lane_by_load(skipped_index, tried_lanes) {
-            tried_lanes |= agent_lane_bit(lane.index);
-            let transport = match self.alternate_transport_or_repair(lane).await {
-                Ok(Some(transport)) => transport,
-                Ok(None) => continue,
-                Err(err) => {
-                    last_err = err;
-                    continue;
-                }
-            };
-            let lease = self.reserve_lane(lane);
-            match mode.open(&transport, open).await {
-                Ok(stream) => {
-                    self.mark_lane_open_success(lane).await;
-                    eprintln!(
-                        "agent: opened TCP stream on alternate lane {} after lane {} failed",
-                        lane.index, skipped_index
-                    );
-                    return Ok(lease.into_stream(stream));
-                }
-                Err(err) => {
-                    let Some(failure) = transport.failure_message().await else {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "failed to open agent TCP stream on alternate lane {}",
-                                lane.index
-                            )
-                        });
-                    };
-                    drop(lease);
-                    let repaired = match self.reconnect_failed_lane(lane, failure).await {
-                        Ok(repaired) => repaired,
-                        Err(reconnect_err) => {
-                            last_err = reconnect_err;
-                            continue;
-                        }
-                    };
-                    let lease = self.reserve_lane(lane);
-                    match mode.open(&repaired, open).await {
-                        Ok(stream) => {
-                            self.mark_lane_open_success(lane).await;
-                            eprintln!(
-                                "agent: opened TCP stream on repaired alternate lane {} after lane {} failed",
-                                lane.index, skipped_index
-                            );
-                            return Ok(lease.into_stream(stream));
-                        }
-                        Err(err) => {
-                            if repaired.failure_message().await.is_some() {
-                                drop(lease);
-                                last_err = err;
-                                continue;
-                            }
-                            return Err(err).with_context(|| {
-                                format!(
-                                    "failed to open agent TCP stream on repaired alternate lane {}",
-                                    lane.index
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        Err(last_err).context(
-            "failed to open agent TCP stream on preferred lane and no alternate agent lane succeeded",
-        )
-    }
-
-    async fn open_tcp_host_on_alternate_lane(
-        &self,
-        open: agent_proto::AgentOpenHost,
+        request: AgentOpenRequest,
         skipped_index: usize,
         original_err: anyhow::Error,
     ) -> Result<AgentBridgeStream> {
@@ -797,23 +685,16 @@ impl ReconnectingAgentBridge {
                 }
             };
             let lease = self.reserve_lane(lane);
-            match transport.open_tcp_host(open.clone()).await {
+            match request.open(&transport).await {
                 Ok(stream) => {
                     self.mark_lane_open_success(lane).await;
-                    eprintln!(
-                        "agent: opened hostname TCP stream on alternate lane {} after lane {} failed",
-                        lane.index, skipped_index
-                    );
+                    request.log_alternate_opened(lane.index, skipped_index, false);
                     return Ok(lease.into_stream(stream));
                 }
                 Err(err) => {
                     let Some(failure) = transport.failure_message().await else {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "failed to open agent hostname TCP stream on alternate lane {}",
-                                lane.index
-                            )
-                        });
+                        return Err(err)
+                            .with_context(|| request.alternate_lane_context(lane.index));
                     };
                     drop(lease);
                     let repaired = match self.reconnect_failed_lane(lane, failure).await {
@@ -824,13 +705,10 @@ impl ReconnectingAgentBridge {
                         }
                     };
                     let lease = self.reserve_lane(lane);
-                    match repaired.open_tcp_host(open.clone()).await {
+                    match request.open(&repaired).await {
                         Ok(stream) => {
                             self.mark_lane_open_success(lane).await;
-                            eprintln!(
-                                "agent: opened hostname TCP stream on repaired alternate lane {} after lane {} failed",
-                                lane.index, skipped_index
-                            );
+                            request.log_alternate_opened(lane.index, skipped_index, true);
                             return Ok(lease.into_stream(stream));
                         }
                         Err(err) => {
@@ -840,96 +718,14 @@ impl ReconnectingAgentBridge {
                                 continue;
                             }
                             return Err(err).with_context(|| {
-                                format!(
-                                    "failed to open agent hostname TCP stream on repaired alternate lane {}",
-                                    lane.index
-                                )
+                                request.repaired_alternate_lane_context(lane.index)
                             });
                         }
                     }
                 }
             }
         }
-        Err(last_err).context(
-            "failed to open agent hostname TCP stream on preferred lane and no alternate agent lane succeeded",
-        )
-    }
-
-    async fn open_udp_ipv4_on_alternate_lane(
-        &self,
-        open: agent_proto::AgentOpenIpv4,
-        skipped_index: usize,
-        original_err: anyhow::Error,
-    ) -> Result<AgentBridgeStream> {
-        let mut last_err = original_err;
-        let mut tried_lanes = 0_u64;
-        while let Some(lane) = self.next_alternate_lane_by_load(skipped_index, tried_lanes) {
-            tried_lanes |= agent_lane_bit(lane.index);
-            let transport = match self.alternate_transport_or_repair(lane).await {
-                Ok(Some(transport)) => transport,
-                Ok(None) => continue,
-                Err(err) => {
-                    last_err = err;
-                    continue;
-                }
-            };
-            let lease = self.reserve_lane(lane);
-            match transport.open_udp_ipv4(open).await {
-                Ok(stream) => {
-                    self.mark_lane_open_success(lane).await;
-                    eprintln!(
-                        "agent: opened UDP stream on alternate lane {} after lane {} failed",
-                        lane.index, skipped_index
-                    );
-                    return Ok(lease.into_stream(stream));
-                }
-                Err(err) => {
-                    let Some(failure) = transport.failure_message().await else {
-                        return Err(err).with_context(|| {
-                            format!(
-                                "failed to open agent UDP stream on alternate lane {}",
-                                lane.index
-                            )
-                        });
-                    };
-                    drop(lease);
-                    let repaired = match self.reconnect_failed_lane(lane, failure).await {
-                        Ok(repaired) => repaired,
-                        Err(reconnect_err) => {
-                            last_err = reconnect_err;
-                            continue;
-                        }
-                    };
-                    let lease = self.reserve_lane(lane);
-                    match repaired.open_udp_ipv4(open).await {
-                        Ok(stream) => {
-                            self.mark_lane_open_success(lane).await;
-                            eprintln!(
-                                "agent: opened UDP stream on repaired alternate lane {} after lane {} failed",
-                                lane.index, skipped_index
-                            );
-                            return Ok(lease.into_stream(stream));
-                        }
-                        Err(err) => {
-                            if repaired.failure_message().await.is_some() {
-                                drop(lease);
-                                last_err = err;
-                                continue;
-                            }
-                            return Err(err).with_context(|| {
-                                format!(
-                                    "failed to open agent UDP stream on repaired alternate lane {}",
-                                    lane.index
-                                )
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        Err(last_err).context(
-            "failed to open agent UDP stream on preferred lane and no alternate agent lane succeeded",
-        )
+        Err(last_err).context(request.no_alternate_succeeded_context())
     }
 
     fn next_alternate_lane_by_load(
@@ -1452,21 +1248,16 @@ pub(crate) fn agent_lane_index(
 }
 
 fn agent_ipv4_lane_hash(open: &agent_proto::AgentOpenIpv4, protocol: u8) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in open.originator_ip.octets() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    for byte in open.originator_port.to_be_bytes() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    for byte in open.destination_ip.octets() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    for byte in open.destination_port.to_be_bytes() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    hash = fnv1a_mix(hash, protocol);
-    hash
+    mix_lane_hash_protocol(
+        mix_lane_hash_u16(
+            mix_lane_hash_ipv4(
+                agent_lane_hash_origin(open.originator_ip, open.originator_port),
+                open.destination_ip,
+            ),
+            open.destination_port,
+        ),
+        protocol,
+    )
 }
 
 pub(crate) fn agent_lane_backoff_duration(
@@ -1474,11 +1265,13 @@ pub(crate) fn agent_lane_backoff_duration(
     consecutive_failures: u32,
 ) -> Duration {
     let failures = consecutive_failures.max(1);
-    let shift = failures.saturating_sub(1).min(7);
+    let shift = failures.saturating_sub(1).min(LANE_BACKOFF_MAX_SHIFT);
     let base_ms = (AGENT_LANE_BACKOFF_BASE.as_millis() as u64)
         .saturating_mul(1_u64 << shift)
         .min(AGENT_LANE_BACKOFF_MAX.as_millis() as u64);
-    let jitter_ms = ((lane_index as u64).saturating_mul(37) + u64::from(failures) * 11) % 100;
+    let jitter_ms = ((lane_index as u64).saturating_mul(LANE_BACKOFF_JITTER_LANE_FACTOR)
+        + u64::from(failures) * LANE_BACKOFF_JITTER_FAILURE_FACTOR)
+        % LANE_BACKOFF_JITTER_MODULUS;
     Duration::from_millis((base_ms + jitter_ms).min(AGENT_LANE_BACKOFF_MAX.as_millis() as u64))
 }
 
@@ -1493,21 +1286,16 @@ pub(crate) fn agent_host_lane_index(
 }
 
 fn agent_host_lane_hash(open: &agent_proto::AgentOpenHost, protocol: u8) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in open.originator_ip.octets() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    for byte in open.originator_port.to_be_bytes() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    for byte in open.destination_host.as_bytes() {
-        hash = fnv1a_mix(hash, byte.to_ascii_lowercase());
-    }
-    for byte in open.destination_port.to_be_bytes() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    hash = fnv1a_mix(hash, protocol);
-    hash
+    mix_lane_hash_protocol(
+        mix_lane_hash_u16(
+            mix_lane_hash_lowercase_host(
+                agent_lane_hash_origin(open.originator_ip, open.originator_port),
+                &open.destination_host,
+            ),
+            open.destination_port,
+        ),
+        protocol,
+    )
 }
 
 fn agent_lane_candidates(hash: u64, lanes: usize) -> (usize, usize) {
@@ -1517,12 +1305,44 @@ fn agent_lane_candidates(hash: u64, lanes: usize) -> (usize, usize) {
         return (primary, primary);
     }
 
-    let secondary_hash = hash ^ 0x9e37_79b9_7f4a_7c15_u64;
+    let secondary_hash = hash ^ SECONDARY_LANE_HASH_SALT;
     let mut secondary = (finalize_flow_hash(secondary_hash) % lanes as u64) as usize;
     if secondary == primary {
         secondary = (secondary + 1) % lanes;
     }
     (primary, secondary)
+}
+
+fn agent_lane_hash_origin(originator_ip: std::net::Ipv4Addr, originator_port: u16) -> u64 {
+    mix_lane_hash_u16(
+        mix_lane_hash_ipv4(FNV1A_OFFSET_BASIS, originator_ip),
+        originator_port,
+    )
+}
+
+fn mix_lane_hash_ipv4(mut hash: u64, addr: std::net::Ipv4Addr) -> u64 {
+    for byte in addr.octets() {
+        hash = fnv1a_mix(hash, byte);
+    }
+    hash
+}
+
+fn mix_lane_hash_lowercase_host(mut hash: u64, host: &str) -> u64 {
+    for byte in host.as_bytes() {
+        hash = fnv1a_mix(hash, byte.to_ascii_lowercase());
+    }
+    hash
+}
+
+fn mix_lane_hash_u16(mut hash: u64, value: u16) -> u64 {
+    for byte in value.to_be_bytes() {
+        hash = fnv1a_mix(hash, byte);
+    }
+    hash
+}
+
+fn mix_lane_hash_protocol(hash: u64, protocol: u8) -> u64 {
+    fnv1a_mix(hash, protocol)
 }
 
 pub(crate) fn agent_lane_bit(index: usize) -> u64 {
