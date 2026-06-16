@@ -402,14 +402,52 @@ mod tests {
     fn hello_payload_round_trips_capabilities() {
         let hello = AgentHello::current(1300);
         let decoded = AgentHello::decode(&hello.encode()).unwrap();
+        let expected_capabilities = CAP_TCP_CONNECT
+            | CAP_UDP_ASSOCIATE
+            | CAP_DNS_RELAY
+            | CAP_FLOW_CONTROL
+            | CAP_HEARTBEAT
+            | CAP_TCP_CONNECT_HOST;
 
         assert_eq!(decoded, hello);
         assert_eq!(decoded.protocol_version, AGENT_PROTOCOL_VERSION);
         assert_eq!(decoded.max_frame_payload, AGENT_MAX_FRAME_PAYLOAD as u32);
-        assert_ne!(decoded.capabilities & CAP_TCP_CONNECT, 0);
-        assert_ne!(decoded.capabilities & CAP_UDP_ASSOCIATE, 0);
-        assert_ne!(decoded.capabilities & CAP_HEARTBEAT, 0);
-        assert_ne!(decoded.capabilities & CAP_TCP_CONNECT_HOST, 0);
+        assert_eq!(decoded.capabilities, expected_capabilities);
+    }
+
+    #[test]
+    fn capability_wire_bits_are_stable() {
+        assert_eq!(CAP_TCP_CONNECT, 1);
+        assert_eq!(CAP_UDP_ASSOCIATE, 2);
+        assert_eq!(CAP_DNS_RELAY, 4);
+        assert_eq!(CAP_FLOW_CONTROL, 8);
+        assert_eq!(CAP_HEARTBEAT, 16);
+        assert_eq!(CAP_TCP_CONNECT_HOST, 32);
+    }
+
+    #[test]
+    fn frame_kind_wire_values_are_stable() {
+        let kinds = [
+            (1, AgentFrameKind::Hello),
+            (2, AgentFrameKind::OpenTcp),
+            (3, AgentFrameKind::OpenUdp),
+            (4, AgentFrameKind::Data),
+            (5, AgentFrameKind::Window),
+            (6, AgentFrameKind::Eof),
+            (7, AgentFrameKind::Close),
+            (8, AgentFrameKind::Reset),
+            (9, AgentFrameKind::Opened),
+            (10, AgentFrameKind::Ping),
+            (11, AgentFrameKind::Pong),
+            (12, AgentFrameKind::OpenTcpHost),
+        ];
+
+        for (wire, kind) in kinds {
+            assert_eq!(AgentFrameKind::try_from(wire).unwrap(), kind);
+            assert_eq!(kind as u8, wire);
+        }
+        assert!(AgentFrameKind::try_from(0).is_err());
+        assert!(AgentFrameKind::try_from(13).is_err());
     }
 
     #[test]
