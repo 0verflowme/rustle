@@ -1,5 +1,5 @@
 #[cfg(test)]
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 #[cfg(test)]
 use std::time::Duration;
@@ -55,8 +55,6 @@ use agent_bridge::{
 };
 use agent_lab::{run_agent_dns_lab, run_agent_lab, run_agent_udp_lab};
 use bridge_lab::run_bridge_lab;
-#[cfg(test)]
-use bridge_runtime::UdpAssociationTransport;
 use cli::{Cli, CommandKind};
 pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 use command_runtime::{run_compact_tunnel, run_direct_tcpip};
@@ -66,64 +64,16 @@ use control_plane::{
     connect_auto_agent_bridge_transports_from_connector,
 };
 #[cfg(test)]
-use data_plane::{spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout};
+use data_plane::spawn_agent_tcp_bridge;
 use helper_runtime::{run_agent, run_quic_agent, run_quic_bridge_agent};
-#[cfg(test)]
-use packet_engine::{
-    plan_udp_datagram_actions, DnsInflight, TunnelStats, UdpAssociationTransportPlan,
-    UdpIngressAction,
-};
 use supervisor::{run_tun_capture, run_tunnel};
-#[cfg(test)]
-use transport_model::{UdpAssociation, UdpAssociationEvents, UdpFlowKey};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;
 pub(crate) const DEFAULT_MTU: u16 = 1300;
 pub(crate) const DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS: u64 = 60_000;
-#[cfg(test)]
-const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
-    Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
 pub(crate) const DEFAULT_SSH_SESSIONS: usize = 4;
 pub(crate) const DEFAULT_AGENT_SESSIONS: usize = 1;
-
-#[cfg(test)]
-fn admit_udp_datagram(
-    transport: UdpAssociationTransport,
-    request: dns::UdpPacket,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    events: UdpAssociationEvents,
-    idle_timeout: Duration,
-    stats: &mut TunnelStats,
-) {
-    let mut actions = Vec::new();
-    let transport = UdpAssociationTransportPlan::new(transport.label(), transport);
-    plan_udp_datagram_actions(
-        Some(transport),
-        request,
-        associations,
-        association_limit,
-        events,
-        idle_timeout,
-        &mut actions,
-    );
-    packet_engine::execute_udp_ingress_actions(
-        &mut actions,
-        associations,
-        association_limit,
-        stats,
-        &mut |transport, key, from_local, events, idle_timeout| {
-            spawn_udp_association_with_idle_timeout(
-                transport,
-                key,
-                from_local,
-                events,
-                idle_timeout,
-            );
-        },
-    );
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -149,209 +99,6 @@ mod tests {
     use crate::agent_bridge::AgentBridgeConnector;
     use anyhow::anyhow;
     use std::sync::Arc;
-
-    #[tokio::test]
-    async fn udp_admission_moves_parsed_payload_bytes_into_association_queue() {
-        let (transport, agent) = test_agent_transport().await;
-        let bridge = ReconnectingAgentBridge::new(
-            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
-            vec![detached_bridge_transport(transport)],
-        );
-        let key = UdpFlowKey {
-            src_ip: Ipv4Addr::new(10, 255, 255, 2),
-            src_port: 49152,
-            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
-            dst_port: 53,
-        };
-        let payload = Bytes::from_static(b"client-datagram");
-        let payload_ptr = payload.as_ptr();
-        let (to_remote, mut from_local) = mpsc::channel(1);
-        let mut associations = HashMap::new();
-        associations.insert(key, UdpAssociation { to_remote });
-        let (response_tx, _response_rx) = mpsc::channel(1);
-        let (close_tx, _close_rx) = mpsc::channel(1);
-        let mut association_limit = DnsInflight::new(1);
-        let mut stats = TunnelStats::new();
-
-        admit_udp_datagram(
-            UdpAssociationTransport::Agent(bridge.clone()),
-            dns::UdpPacket {
-                src_ip: key.src_ip,
-                src_port: key.src_port,
-                dst_ip: key.dst_ip,
-                dst_port: key.dst_port,
-                payload,
-            },
-            &mut associations,
-            &mut association_limit,
-            UdpAssociationEvents {
-                response_tx,
-                close_tx,
-            },
-            UDP_ASSOCIATION_IDLE_TIMEOUT,
-            &mut stats,
-        );
-
-        let queued = from_local.try_recv().expect("queued UDP payload");
-        assert_eq!(queued.as_ref(), b"client-datagram");
-        assert_eq!(queued.as_ptr(), payload_ptr);
-        assert_eq!(stats.udp_forwarded, 1);
-        assert_eq!(stats.udp_dropped, 0);
-
-        drop(associations);
-        drop(bridge);
-        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
-            .await
-            .expect("agent exits")
-            .expect("agent join")
-            .expect("agent run");
-    }
-
-    #[tokio::test]
-    async fn udp_planner_starts_vacant_association_before_send() {
-        let (transport, agent) = test_agent_transport().await;
-        let bridge = ReconnectingAgentBridge::new(
-            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
-            vec![detached_bridge_transport(transport)],
-        );
-        let key = UdpFlowKey {
-            src_ip: Ipv4Addr::new(10, 255, 255, 2),
-            src_port: 49152,
-            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
-            dst_port: 53,
-        };
-        let payload = Bytes::from_static(b"first-datagram");
-        let payload_ptr = payload.as_ptr();
-        let (response_tx, _response_rx) = mpsc::channel(1);
-        let (close_tx, _close_rx) = mpsc::channel(1);
-        let mut associations = HashMap::new();
-        let mut association_limit = DnsInflight::new(1);
-        let mut actions = Vec::new();
-
-        plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new(
-                "agent",
-                UdpAssociationTransport::Agent(bridge.clone()),
-            )),
-            dns::UdpPacket {
-                src_ip: key.src_ip,
-                src_port: key.src_port,
-                dst_ip: key.dst_ip,
-                dst_port: key.dst_port,
-                payload,
-            },
-            &mut associations,
-            &mut association_limit,
-            UdpAssociationEvents {
-                response_tx,
-                close_tx,
-            },
-            UDP_ASSOCIATION_IDLE_TIMEOUT,
-            &mut actions,
-        );
-
-        assert_eq!(association_limit.current(), 1);
-        assert!(associations.contains_key(&key));
-        assert_eq!(actions.len(), 2);
-        match &actions[0] {
-            UdpIngressAction::StartAssociation {
-                key: action_key, ..
-            } => {
-                assert_eq!(*action_key, key);
-            }
-            _ => panic!("expected association start action first"),
-        }
-        match &actions[1] {
-            UdpIngressAction::SendDatagram {
-                key: action_key,
-                payload,
-                transport_label,
-                ..
-            } => {
-                assert_eq!(*action_key, key);
-                assert_eq!(payload.as_ref(), b"first-datagram");
-                assert_eq!(payload.as_ptr(), payload_ptr);
-                assert_eq!(*transport_label, "agent");
-            }
-            _ => panic!("expected UDP send action second"),
-        }
-
-        drop(actions);
-        drop(associations);
-        drop(bridge);
-        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
-            .await
-            .expect("agent exits")
-            .expect("agent join")
-            .expect("agent run");
-    }
-
-    #[tokio::test]
-    async fn udp_planner_reuses_existing_association_without_restarting() {
-        let (transport, agent) = test_agent_transport().await;
-        let bridge = ReconnectingAgentBridge::new(
-            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
-            vec![detached_bridge_transport(transport)],
-        );
-        let key = UdpFlowKey {
-            src_ip: Ipv4Addr::new(10, 255, 255, 2),
-            src_port: 49152,
-            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
-            dst_port: 53,
-        };
-        let (to_remote, _from_local) = mpsc::channel(1);
-        let (response_tx, _response_rx) = mpsc::channel(1);
-        let (close_tx, _close_rx) = mpsc::channel(1);
-        let mut associations = HashMap::new();
-        associations.insert(key, UdpAssociation { to_remote });
-        let mut association_limit = DnsInflight::new(1);
-        let mut actions = Vec::new();
-
-        plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new(
-                "agent",
-                UdpAssociationTransport::Agent(bridge.clone()),
-            )),
-            dns::UdpPacket {
-                src_ip: key.src_ip,
-                src_port: key.src_port,
-                dst_ip: key.dst_ip,
-                dst_port: key.dst_port,
-                payload: Bytes::from_static(b"existing"),
-            },
-            &mut associations,
-            &mut association_limit,
-            UdpAssociationEvents {
-                response_tx,
-                close_tx,
-            },
-            UDP_ASSOCIATION_IDLE_TIMEOUT,
-            &mut actions,
-        );
-
-        assert_eq!(association_limit.current(), 0);
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            UdpIngressAction::SendDatagram {
-                key: action_key,
-                payload,
-                ..
-            } => {
-                assert_eq!(*action_key, key);
-                assert_eq!(payload.as_ref(), b"existing");
-            }
-            _ => panic!("expected existing association to emit only a send action"),
-        }
-
-        drop(actions);
-        drop(associations);
-        drop(bridge);
-        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
-            .await
-            .expect("agent exits")
-            .expect("agent join")
-            .expect("agent run");
-    }
 
     #[test]
     fn agent_lane_index_spreads_many_flows_across_pool() {

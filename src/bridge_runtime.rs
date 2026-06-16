@@ -20,13 +20,3 @@ pub(crate) enum UdpAssociationTransport {
     Agent(ReconnectingAgentBridge),
     QuicNative(QuicNativeBridge),
 }
-
-impl UdpAssociationTransport {
-    #[cfg(test)]
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Agent(_) => "agent",
-            Self::QuicNative(_) => "quic-native",
-        }
-    }
-}

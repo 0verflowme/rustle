@@ -1537,6 +1537,188 @@ mod tests {
         }
     }
 
+    fn admit_udp_datagram_for_test(
+        request: dns::UdpPacket,
+        associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
+        association_limit: &mut DnsInflight,
+        events: UdpAssociationEvents,
+        idle_timeout: Duration,
+        stats: &mut TunnelStats,
+    ) {
+        let mut actions = Vec::new();
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransportPlan::new("agent", ())),
+            request,
+            associations,
+            association_limit,
+            events,
+            idle_timeout,
+            &mut actions,
+        );
+        execute_udp_ingress_actions(
+            &mut actions,
+            associations,
+            association_limit,
+            stats,
+            &mut |(), _, _, _, _| {},
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_admission_moves_parsed_payload_bytes_into_association_queue() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let payload = Bytes::from_static(b"client-datagram");
+        let payload_ptr = payload.as_ptr();
+        let (to_remote, mut from_local) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut association_limit = DnsInflight::new(1);
+        let mut stats = TunnelStats::new();
+
+        admit_udp_datagram_for_test(
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload,
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut stats,
+        );
+
+        let queued = from_local.try_recv().expect("queued UDP payload");
+        assert_eq!(queued.as_ref(), b"client-datagram");
+        assert_eq!(queued.as_ptr(), payload_ptr);
+        assert_eq!(stats.udp_forwarded, 1);
+        assert_eq!(stats.udp_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn udp_planner_starts_vacant_association_before_send() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let payload = Bytes::from_static(b"first-datagram");
+        let payload_ptr = payload.as_ptr();
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransportPlan::new("agent", ())),
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload,
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        assert_eq!(association_limit.current(), 1);
+        assert!(associations.contains_key(&key));
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            UdpIngressAction::StartAssociation {
+                key: action_key, ..
+            } => {
+                assert_eq!(*action_key, key);
+            }
+            _ => panic!("expected association start action first"),
+        }
+        match &actions[1] {
+            UdpIngressAction::SendDatagram {
+                key: action_key,
+                payload,
+                transport_label,
+                ..
+            } => {
+                assert_eq!(*action_key, key);
+                assert_eq!(payload.as_ref(), b"first-datagram");
+                assert_eq!(payload.as_ptr(), payload_ptr);
+                assert_eq!(*transport_label, "agent");
+            }
+            _ => panic!("expected UDP send action second"),
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_planner_reuses_existing_association_without_restarting() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let (to_remote, _from_local) = mpsc::channel(1);
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransportPlan::new("agent", ())),
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload: Bytes::from_static(b"existing"),
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            UdpIngressAction::SendDatagram {
+                key: action_key,
+                payload,
+                ..
+            } => {
+                assert_eq!(*action_key, key);
+                assert_eq!(payload.as_ref(), b"existing");
+            }
+            _ => panic!("expected existing association to emit only a send action"),
+        }
+    }
+
     #[test]
     fn udp_executor_closed_sender_releases_association_slot() {
         let key = UdpFlowKey {
