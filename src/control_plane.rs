@@ -1,13 +1,15 @@
 use std::env;
-use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::pin::Pin;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use russh::client::Handle;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use crate::agent_bridge::{
+    AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
+    AgentBridgeTransport, BridgeRuntime, QuicNativeBridge, ReconnectingAgentBridge,
+};
 use crate::data_plane::{BridgeRuntimeOptions, BridgeTransportKind};
 use crate::remote_helper::{
     local_agent_binary_for_platform, probe_remote_platform, upload_agent_binary,
@@ -16,23 +18,10 @@ use crate::remote_helper::{
 use crate::{
     agent_proto, agent_transport, connect_prepared_ssh, connect_ssh, connect_ssh_pool,
     prepare_ssh_connection, quic_agent, resolve_agent_session_count, resolve_ssh_target,
-    validate_agent_session_count, AgentBridgeTransport, BridgeRuntime, Client, Destination,
-    DnsTransport, PreparedSshConnection, QuicNativeBridge, ReconnectingAgentBridge, SshArgs,
-    AGENT_FAST_START_WARMUP_DELAY, AGENT_INITIAL_CONNECT_BATCH, AGENT_INITIAL_CONNECT_RETRY_ROUNDS,
-    AUTO_AGENT_SESSIONS, QUIC_AGENT_BOOTSTRAP_TIMEOUT,
+    validate_agent_session_count, Client, Destination, DnsTransport, PreparedSshConnection,
+    SshArgs, AGENT_FAST_START_WARMUP_DELAY, AGENT_INITIAL_CONNECT_BATCH,
+    AGENT_INITIAL_CONNECT_RETRY_ROUNDS, AUTO_AGENT_SESSIONS, QUIC_AGENT_BOOTSTRAP_TIMEOUT,
 };
-
-pub(crate) type AgentBridgeConnectFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<AgentBridgeTransport>> + Send + 'a>>;
-pub(crate) type AgentBridgeConnectManyFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<AgentBridgeTransport>>> + Send + 'a>>;
-
-pub(crate) trait AgentBridgeConnector: Send + Sync {
-    fn primary_command(&self) -> &str;
-    fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_>;
-    fn connect_primary(&self) -> AgentBridgeConnectFuture<'_>;
-    fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a>;
-}
 
 #[derive(Clone)]
 pub(crate) struct SshAgentBridgeConnector {
@@ -193,7 +182,7 @@ pub(crate) async fn connect_agent_bridge_transports_from_connector(
     let mut transports = Vec::with_capacity(desired_sessions);
 
     let first = connector.connect_primary().await?;
-    let additional_agent_command = first.agent_command.clone();
+    let additional_agent_command = first.agent_command().to_owned();
     transports.push(first);
 
     let mut index = 1;
@@ -761,9 +750,10 @@ fn ensure_agent_dns_remote_supported(
         return Ok(());
     };
     if remote.host.parse::<Ipv4Addr>().is_ok() {
-        if transports.iter().all(|transport| {
-            transport.transport.peer_hello().capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0
-        }) {
+        if transports
+            .iter()
+            .all(|transport| transport.peer_capabilities() & agent_proto::CAP_UDP_ASSOCIATE != 0)
+        {
             return Ok(());
         }
         bail!(
@@ -771,9 +761,10 @@ fn ensure_agent_dns_remote_supported(
             remote.host
         );
     }
-    if transports.iter().all(|transport| {
-        transport.transport.peer_hello().capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0
-    }) {
+    if transports
+        .iter()
+        .all(|transport| transport.peer_capabilities() & agent_proto::CAP_TCP_CONNECT_HOST != 0)
+    {
         return Ok(());
     }
     bail!(
