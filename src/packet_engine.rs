@@ -400,6 +400,7 @@ pub(crate) struct TunnelEngine {
     started_at: StdInstant,
     outbound_packets: Vec<tcp_core::PacketBuf>,
     ready_flow_ids: Vec<tcp_core::FlowId>,
+    opening_flow_keys: Vec<tcp_core::FlowKey>,
     flow_keys: Vec<tcp_core::FlowKey>,
     backlog_flow_ids: Vec<tcp_core::FlowId>,
     backlog_closed_flows: Vec<tcp_core::FlowKey>,
@@ -421,6 +422,7 @@ impl TunnelEngine {
             started_at: StdInstant::now(),
             outbound_packets: Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY),
             ready_flow_ids: Vec::new(),
+            opening_flow_keys: Vec::new(),
             flow_keys: Vec::new(),
             backlog_flow_ids: Vec::new(),
             backlog_closed_flows: Vec::new(),
@@ -507,27 +509,31 @@ impl TunnelEngine {
         self.flow_manager.poll_into(now, &mut self.outbound_packets);
     }
 
-    pub(crate) fn ensure_bridges<F>(
+    pub(crate) fn plan_bridge_starts(
         &mut self,
         limits: BridgeAdmissionLimits,
-        spawn_bridge: F,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> Result<BridgeAdmissionStats>
-    where
-        F: FnMut(tcp_core::FlowId, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
-    {
+        starts: &mut Vec<TcpBridgeStart>,
+    ) -> Result<BridgeAdmissionStats> {
         let now = self.now();
-        let admission_stats = ensure_bridges(
+        let admission_stats = plan_bridge_starts(
             &mut self.flow_manager,
-            &mut self.bridges,
+            &self.bridges,
             limits,
-            spawn_bridge,
-            event_tx,
             &mut self.ready_flow_ids,
+            &mut self.opening_flow_keys,
             now,
+            starts,
         )?;
         self.stats.record_bridge_admission(admission_stats);
         Ok(admission_stats)
+    }
+
+    pub(crate) fn register_tcp_bridge(
+        &mut self,
+        start: TcpBridgeStart,
+        bridge: ssh_bridge::FlowBridge,
+    ) -> Result<()> {
+        register_tcp_bridge(&mut self.flow_manager, &mut self.bridges, start, bridge)
     }
 
     pub(crate) fn drain_local_bytes_to_bridges(&mut self) -> Result<LocalDrainStats> {
@@ -640,6 +646,11 @@ impl TunnelEngine {
 pub(crate) struct BridgeAdmissionStats {
     pub(crate) deferred_active_limit: u64,
     pub(crate) deferred_open_limit: u64,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct TcpBridgeStart {
+    pub(crate) id: tcp_core::FlowId,
 }
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
@@ -925,8 +936,35 @@ pub(crate) fn ensure_bridges<F>(
 where
     F: FnMut(tcp_core::FlowId, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
 {
+    let mut starts = Vec::new();
+    let mut opening_flow_keys = Vec::new();
+    let stats = plan_bridge_starts(
+        flow_manager,
+        bridges,
+        limits,
+        ready_flow_ids,
+        &mut opening_flow_keys,
+        now,
+        &mut starts,
+    )?;
+    for start in starts.drain(..) {
+        let bridge = spawn_bridge(start.id, event_tx.clone());
+        register_tcp_bridge(flow_manager, bridges, start, bridge)?;
+    }
+    Ok(stats)
+}
+
+pub(crate) fn plan_bridge_starts(
+    flow_manager: &mut tcp_core::FlowManager,
+    bridges: &HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    limits: BridgeAdmissionLimits,
+    ready_flow_ids: &mut Vec<tcp_core::FlowId>,
+    opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
+    now: SmolInstant,
+    starts: &mut Vec<TcpBridgeStart>,
+) -> Result<BridgeAdmissionStats> {
     let mut stats = BridgeAdmissionStats::default();
-    let mut active_channels = bridges.len();
+    let mut active_channels = active_bridge_reservations(flow_manager, bridges, opening_flow_keys);
     let mut opening_channels = flow_manager.opening_flow_count();
 
     flow_manager.ready_to_bridge_flow_ids_into(ready_flow_ids);
@@ -948,12 +986,51 @@ where
         }
 
         flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::SshOpening, now)?;
-        let bridge = spawn_bridge(id, event_tx.clone());
-        bridges.insert(bridge.id.key, bridge);
+        starts.push(TcpBridgeStart { id });
         active_channels += 1;
         opening_channels += 1;
     }
     Ok(stats)
+}
+
+fn active_bridge_reservations(
+    flow_manager: &tcp_core::FlowManager,
+    bridges: &HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
+) -> usize {
+    flow_manager.opening_flow_keys_into(opening_flow_keys);
+    let unregistered_opening = opening_flow_keys
+        .iter()
+        .filter(|flow| !bridges.contains_key(flow))
+        .count();
+    bridges.len().saturating_add(unregistered_opening)
+}
+
+pub(crate) fn register_tcp_bridge(
+    flow_manager: &mut tcp_core::FlowManager,
+    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    start: TcpBridgeStart,
+    bridge: ssh_bridge::FlowBridge,
+) -> Result<()> {
+    if bridge.id != start.id {
+        anyhow::bail!(
+            "bridge registration mismatch: planned {:?}, spawned {:?}",
+            start.id,
+            bridge.id
+        );
+    }
+    if !flow_manager.contains_flow_id(start.id) {
+        anyhow::bail!("bridge registration for missing flow {:?}", start.id);
+    }
+    match bridges.entry(bridge.id.key) {
+        Entry::Occupied(_) => {
+            anyhow::bail!("bridge already registered for flow {:?}", bridge.id.key);
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(bridge);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn drain_local_bytes_to_bridges(
@@ -2761,6 +2838,209 @@ mod tests {
         }
 
         panic!("synthetic flow did not reach TcpEstablished");
+    }
+
+    #[test]
+    fn planned_bridge_start_marks_flow_ssh_opening() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("plan bridge starts");
+
+        assert_eq!(stats, BridgeAdmissionStats::default());
+        assert_eq!(starts, vec![TcpBridgeStart { id }]);
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::SshOpening
+        );
+        assert!(bridges.is_empty());
+    }
+
+    #[tokio::test]
+    async fn planned_bridge_registration_inserts_spawned_bridge() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+        plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("plan bridge starts");
+        let start = starts.pop().expect("planned start");
+        assert_eq!(start.id, id);
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let bridge =
+            ssh_bridge::spawn_bridge_task(start.id, event_tx, |_id, _local_rx, _event_tx| async {
+                std::future::pending::<()>().await;
+            });
+        register_tcp_bridge(&mut manager, &mut bridges, start, bridge)
+            .expect("register planned bridge");
+
+        assert_eq!(bridges.len(), 1);
+        assert!(bridges.contains_key(&flow));
+    }
+
+    #[test]
+    fn unregistered_opening_start_reserves_active_admission_slot() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let first_client_port = 49152;
+        let second_client_port = 49153;
+        let first_flow = tcp_core::FlowKey::tcp(
+            client_ip,
+            first_client_port,
+            destination_ip,
+            destination_port,
+        );
+        let second_flow = tcp_core::FlowKey::tcp(
+            client_ip,
+            second_client_port,
+            destination_ip,
+            destination_port,
+        );
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            first_client_port,
+        );
+        establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            second_client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let limits = BridgeAdmissionLimits {
+            active: 1,
+            opening: 128,
+        };
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let first_stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            limits,
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("first bridge start plan");
+
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            first_stats,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert_eq!(manager.opening_flow_count(), 1);
+        assert!(matches!(
+            manager.flow_state(first_flow).expect("first flow state"),
+            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+        ));
+        assert!(matches!(
+            manager.flow_state(second_flow).expect("second flow state"),
+            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+        ));
+
+        starts.clear();
+        let second_stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            limits,
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(11),
+            &mut starts,
+        )
+        .expect("second bridge start plan");
+
+        assert!(starts.is_empty());
+        assert_eq!(
+            second_stats,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert_eq!(manager.opening_flow_count(), 1);
     }
 
     #[tokio::test]

@@ -435,6 +435,16 @@ impl FlowManager {
             .count()
     }
 
+    pub fn opening_flow_keys_into(&self, out: &mut Vec<FlowKey>) {
+        out.clear();
+        out.reserve(self.flows.len());
+        out.extend(
+            self.flows
+                .iter()
+                .filter_map(|(&key, entry)| (entry.state == FlowState::SshOpening).then_some(key)),
+        );
+    }
+
     pub fn flow_keys(&self) -> Vec<FlowKey> {
         let mut keys = Vec::with_capacity(self.flows.len());
         self.flow_keys_into(&mut keys);

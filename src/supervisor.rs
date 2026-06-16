@@ -9,8 +9,8 @@ use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPla
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
-    TunnelEngine, UdpAssociationStart, UdpAssociationTransportPlan, UdpIngressAction,
-    MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
+    TcpBridgeStart, TunnelEngine, UdpAssociationStart, UdpAssociationTransportPlan,
+    UdpIngressAction, MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
 };
 use crate::remote_helper::bridge_agent_command_plan;
 use crate::routing::{
@@ -27,7 +27,7 @@ use crate::tunnel_lifecycle::{
     open_tun, open_tunnel_host, shutdown_signal, ShutdownSignalFuture, TunConfig, TunnelCleanup,
     TunnelHostConfig,
 };
-use crate::{platform, tcp_core, TunCaptureArgs, TunnelArgs};
+use crate::{platform, ssh_bridge, tcp_core, TunCaptureArgs, TunnelArgs};
 
 const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
 const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
@@ -193,6 +193,7 @@ impl TunnelSupervisor {
 
         let tun = TunWriter::new(dev);
         let mut buf = vec![0_u8; PACKET_BUF_SIZE];
+        let mut tcp_bridge_starts = Vec::new();
         let mut udp_actions = Vec::new();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
         let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel(DNS_EVENT_CHANNEL_DEPTH);
@@ -285,10 +286,15 @@ impl TunnelSupervisor {
                         .ingest_tcp_packet(packet)
                         .context("failed to feed packet into userspace TCP engine")?;
                     tun.write_engine_packets(&mut engine).await?;
-                    engine.ensure_bridges(
+                    engine.plan_bridge_starts(
                         data_plane.admission_limits(),
-                        |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
-                        event_tx.clone(),
+                        &mut tcp_bridge_starts,
+                    )?;
+                    execute_tcp_bridge_starts(
+                        &mut engine,
+                        &mut tcp_bridge_starts,
+                        &data_plane,
+                        &event_tx,
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.flush_remote_backlogs()?;
@@ -346,10 +352,15 @@ impl TunnelSupervisor {
                     tun.write_engine_packets(&mut engine).await?;
                     engine.flush_remote_backlogs()?;
                     tun.write_engine_packets(&mut engine).await?;
-                    engine.ensure_bridges(
+                    engine.plan_bridge_starts(
                         data_plane.admission_limits(),
-                        |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
-                        event_tx.clone(),
+                        &mut tcp_bridge_starts,
+                    )?;
+                    execute_tcp_bridge_starts(
+                        &mut engine,
+                        &mut tcp_bridge_starts,
+                        &data_plane,
+                        &event_tx,
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.expire_and_prune()?;
@@ -357,6 +368,19 @@ impl TunnelSupervisor {
             }
         }
     }
+}
+
+fn execute_tcp_bridge_starts(
+    engine: &mut TunnelEngine,
+    starts: &mut Vec<TcpBridgeStart>,
+    data_plane: &Arc<dyn DataPlane>,
+    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
+) -> Result<()> {
+    for start in starts.drain(..) {
+        let bridge = data_plane.spawn_tcp_bridge(start.id, event_tx.clone());
+        engine.register_tcp_bridge(start, bridge)?;
+    }
+    Ok(())
 }
 
 fn execute_udp_ingress_actions(
