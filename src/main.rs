@@ -1301,11 +1301,7 @@ async fn connect_agent_bridge_transport_on_handle(
         bail!("remote Rustle agent advertised a zero max frame payload");
     }
 
-    Ok(AgentBridgeTransport {
-        carrier: AgentBridgeCarrier::Ssh(handle),
-        transport,
-        agent_command: agent_command.to_owned(),
-    })
+    Ok(AgentBridgeTransport::ssh(handle, transport, agent_command))
 }
 
 async fn connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
@@ -1314,8 +1310,13 @@ async fn connect_quic_agent_bridge_transport_fresh_prepared_ssh_command(
     mtu: u16,
 ) -> Result<AgentBridgeTransport> {
     let handle = connect_prepared_ssh(prepared).await?;
-    connect_quic_agent_bridge_transport_on_handle(handle, &prepared.target.host, agent_command, mtu)
-        .await
+    connect_quic_agent_bridge_transport_on_handle(
+        handle,
+        prepared.remote_host(),
+        agent_command,
+        mtu,
+    )
+    .await
 }
 
 async fn connect_quic_agent_bridge_transport_on_handle(
@@ -1354,15 +1355,13 @@ async fn connect_quic_agent_bridge_transport_on_handle(
     let client = quic_agent::connect_quic_agent(remote_addr, &bootstrap, mtu).await?;
     let (transport, session) = client.into_transport_and_session();
 
-    Ok(AgentBridgeTransport {
-        carrier: AgentBridgeCarrier::Quic(QuicAgentCarrier {
-            handle,
-            _session: session,
-            drain_task,
-        }),
+    Ok(AgentBridgeTransport::quic(
+        handle,
+        session,
+        drain_task,
         transport,
-        agent_command: agent_command.to_owned(),
-    })
+        agent_command,
+    ))
 }
 
 async fn connect_quic_native_bridge_fresh_ssh_command(
@@ -1424,13 +1423,9 @@ async fn connect_quic_native_bridge_on_handle(
     let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
     let client = quic_agent::connect_quic_bridge(remote_addr, &bootstrap).await?;
 
-    Ok(QuicNativeBridge {
-        client,
-        _carrier: Some(Arc::new(QuicNativeCarrier {
-            _handle: handle,
-            drain_task,
-        })),
-    })
+    Ok(QuicNativeBridge::with_ssh_carrier(
+        client, handle, drain_task,
+    ))
 }
 
 async fn drain_quic_agent_ssh_output<R>(mut reader: BufReader<R>)
@@ -1524,7 +1519,7 @@ async fn connect_uploaded_quic_agent_bridge_transport_prepared(
     let agent_command = uploaded_helper_command(&remote_path, platform, "quic-agent");
     connect_quic_agent_bridge_transport_on_handle(
         handle,
-        &prepared.target.host,
+        prepared.remote_host(),
         &agent_command,
         mtu,
     )
@@ -1549,7 +1544,7 @@ async fn connect_uploaded_quic_native_bridge(ssh: &SshArgs) -> Result<QuicNative
     }
     let remote_path = upload_agent_binary(&handle, &local_agent, platform).await?;
     let agent_command = uploaded_helper_command(&remote_path, platform, "quic-bridge-agent");
-    connect_quic_native_bridge_on_handle(handle, &prepared.target.host, &agent_command)
+    connect_quic_native_bridge_on_handle(handle, prepared.remote_host(), &agent_command)
         .await
         .with_context(|| {
             format!("uploaded native QUIC bridge helper failed to start from {remote_path}")
@@ -4470,6 +4465,28 @@ impl Drop for QuicNativeCarrier {
 }
 
 impl QuicNativeBridge {
+    #[cfg(test)]
+    fn detached(client: quic_agent::QuicBridgeClient) -> Self {
+        Self {
+            client,
+            _carrier: None,
+        }
+    }
+
+    fn with_ssh_carrier(
+        client: quic_agent::QuicBridgeClient,
+        handle: Handle<Client>,
+        drain_task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            client,
+            _carrier: Some(Arc::new(QuicNativeCarrier {
+                _handle: handle,
+                drain_task,
+            })),
+        }
+    }
+
     async fn open_tcp_ipv4_optimistic(
         &self,
         open: agent_proto::AgentOpenIpv4,
@@ -4535,6 +4552,18 @@ struct QuicAgentCarrier {
 }
 
 impl QuicAgentCarrier {
+    fn new(
+        handle: Handle<Client>,
+        session: quic_agent::QuicAgentSession,
+        drain_task: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            handle,
+            _session: session,
+            drain_task,
+        }
+    }
+
     async fn disconnect(&self, reason: &str) -> Result<()> {
         self.drain_task.abort();
         self.handle
@@ -4551,6 +4580,44 @@ struct AgentBridgeTransport {
 }
 
 impl AgentBridgeTransport {
+    fn ssh(
+        handle: Handle<Client>,
+        transport: agent_transport::AgentTransport,
+        agent_command: impl Into<String>,
+    ) -> Self {
+        Self {
+            carrier: AgentBridgeCarrier::Ssh(handle),
+            transport,
+            agent_command: agent_command.into(),
+        }
+    }
+
+    fn quic(
+        handle: Handle<Client>,
+        session: quic_agent::QuicAgentSession,
+        drain_task: tokio::task::JoinHandle<()>,
+        transport: agent_transport::AgentTransport,
+        agent_command: impl Into<String>,
+    ) -> Self {
+        Self {
+            carrier: AgentBridgeCarrier::Quic(QuicAgentCarrier::new(handle, session, drain_task)),
+            transport,
+            agent_command: agent_command.into(),
+        }
+    }
+
+    #[cfg(test)]
+    fn detached_for_test(
+        transport: agent_transport::AgentTransport,
+        agent_command: impl Into<String>,
+    ) -> Self {
+        Self {
+            carrier: AgentBridgeCarrier::Detached,
+            transport,
+            agent_command: agent_command.into(),
+        }
+    }
+
     async fn disconnect(&self, reason: &str) -> Result<()> {
         self.carrier.disconnect(reason).await
     }
@@ -7954,6 +8021,12 @@ struct PreparedSshConnection {
     connect_timeout: Duration,
 }
 
+impl PreparedSshConnection {
+    fn remote_host(&self) -> &str {
+        &self.target.host
+    }
+}
+
 async fn connect_ssh_pool(args: &SshArgs, desired_sessions: usize) -> Result<SshSessionPool> {
     validate_ssh_session_count(desired_sessions)?;
     let prepared = Arc::new(prepare_ssh_connection(args)?);
@@ -9118,13 +9191,7 @@ mod tests {
         let client = quic_agent::connect_quic_bridge(quic_addr, &bootstrap)
             .await
             .expect("connect native QUIC bridge");
-        (
-            QuicNativeBridge {
-                client,
-                _carrier: None,
-            },
-            bridge_task,
-        )
+        (QuicNativeBridge::detached(client), bridge_task)
     }
 
     #[test]
@@ -13891,11 +13958,7 @@ mod tests {
     fn detached_bridge_transport(
         transport: agent_transport::AgentTransport,
     ) -> AgentBridgeTransport {
-        AgentBridgeTransport {
-            carrier: AgentBridgeCarrier::Detached,
-            transport,
-            agent_command: "rustle agent".to_owned(),
-        }
+        AgentBridgeTransport::detached_for_test(transport, "rustle agent")
     }
 
     #[tokio::test]
@@ -14366,22 +14429,19 @@ mod tests {
         let (third_transport, third_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: first_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: second_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: third_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
             ],
         );
 
@@ -14426,22 +14486,19 @@ mod tests {
         let (third_transport, third_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: first_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: second_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: third_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
             ],
         );
 
@@ -14495,16 +14552,14 @@ mod tests {
         let (second_transport, second_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: first_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: second_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
+            vec![AgentBridgeTransport::detached_for_test(
+                second_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
         );
 
         let transports = connect_auto_agent_bridge_transports_from_connector(connector.as_ref(), 2)
@@ -14559,22 +14614,19 @@ mod tests {
         let (third_transport, third_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new_with_failures(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: first_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: second_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: third_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
             ],
             0,
             1,
@@ -14723,27 +14775,23 @@ mod tests {
         let (fourth_transport, fourth_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new_with_failures(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: first_transport,
-                agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: second_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: third_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: fourth_transport,
-                    agent_command: "/tmp/rustle-uploaded agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    fourth_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
             ],
             0,
             1,
@@ -14801,20 +14849,18 @@ mod tests {
         let (replacement_transport, replacement_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: replacement_transport,
-                agent_command: "rustle agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                replacement_transport,
+                "rustle agent".to_owned(),
+            )],
             Vec::new(),
         );
         let bridge = ReconnectingAgentBridge::new(
             connector,
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: failed_transport,
-                agent_command: "rustle agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                failed_transport,
+                "rustle agent".to_owned(),
+            )],
         );
 
         let destination = match destination {
@@ -14909,16 +14955,14 @@ mod tests {
         let bridge = ReconnectingAgentBridge::new(
             connector,
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: failed_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: healthy_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    failed_transport,
+                    "rustle agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    healthy_transport,
+                    "rustle agent".to_owned(),
+                ),
             ],
         );
 
@@ -15023,27 +15067,24 @@ mod tests {
         let (replacement_transport, replacement_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new_with_primary_failures(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: replacement_transport,
-                agent_command: "rustle agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                replacement_transport,
+                "rustle agent".to_owned(),
+            )],
             Vec::new(),
             1,
         );
         let bridge = ReconnectingAgentBridge::new(
             connector,
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: failed_primary_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: failed_alternate_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    failed_primary_transport,
+                    "rustle agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    failed_alternate_transport,
+                    "rustle agent".to_owned(),
+                ),
             ],
         );
 
@@ -15152,27 +15193,24 @@ mod tests {
         let (replacement_transport, replacement_agent) = test_agent_transport().await;
         let connector = QueuedAgentConnector::new_with_primary_failures(
             "rustle agent",
-            vec![AgentBridgeTransport {
-                carrier: AgentBridgeCarrier::Detached,
-                transport: replacement_transport,
-                agent_command: "rustle agent".to_owned(),
-            }],
+            vec![AgentBridgeTransport::detached_for_test(
+                replacement_transport,
+                "rustle agent".to_owned(),
+            )],
             Vec::new(),
             1,
         );
         let bridge = ReconnectingAgentBridge::new(
             connector,
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: failed_primary_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: dying_alternate_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    failed_primary_transport,
+                    "rustle agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    dying_alternate_transport,
+                    "rustle agent".to_owned(),
+                ),
             ],
         );
 
@@ -15279,16 +15317,14 @@ mod tests {
         let bridge = ReconnectingAgentBridge::new(
             connector,
             vec![
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: failed_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
-                AgentBridgeTransport {
-                    carrier: AgentBridgeCarrier::Detached,
-                    transport: healthy_transport,
-                    agent_command: "rustle agent".to_owned(),
-                },
+                AgentBridgeTransport::detached_for_test(
+                    failed_transport,
+                    "rustle agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    healthy_transport,
+                    "rustle agent".to_owned(),
+                ),
             ],
         );
 
