@@ -6,23 +6,27 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use russh::client::Handle;
 use tokio::sync::Mutex;
 
-use crate::ssh_control::{finalize_flow_hash, fnv1a_mix, Client};
-use crate::{agent_proto, agent_transport, quic_agent};
+use crate::{agent_proto, agent_transport};
 
-pub(crate) const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
-pub(crate) const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+mod affinity;
+mod carrier;
+
+use affinity::{
+    agent_host_lane_hash, agent_ipv4_lane_hash, agent_lane_candidates, TCP_PROTOCOL_NUMBER,
+    UDP_PROTOCOL_NUMBER,
+};
+#[cfg(test)]
+pub(crate) use affinity::{
+    agent_host_lane_index, agent_lane_index, AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
+};
+pub(crate) use affinity::{agent_lane_backoff_duration, agent_lane_bit};
+#[cfg(test)]
+pub(crate) use carrier::AgentBridgeCarrier;
+pub(crate) use carrier::{AgentBridgeTransport, QuicNativeBridge};
+
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
-const TCP_PROTOCOL_NUMBER: u8 = 6;
-const UDP_PROTOCOL_NUMBER: u8 = 17;
-const FNV1A_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const SECONDARY_LANE_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
-const LANE_BACKOFF_MAX_SHIFT: u32 = 7;
-const LANE_BACKOFF_JITTER_LANE_FACTOR: u64 = 37;
-const LANE_BACKOFF_JITTER_FAILURE_FACTOR: u64 = 11;
-const LANE_BACKOFF_JITTER_MODULUS: u64 = 100;
 
 pub(crate) type AgentBridgeConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentBridgeTransport>> + Send + 'a>>;
@@ -34,183 +38,6 @@ pub(crate) trait AgentBridgeConnector: Send + Sync {
     fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_>;
     fn connect_primary(&self) -> AgentBridgeConnectFuture<'_>;
     fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a>;
-}
-
-#[derive(Clone)]
-pub(crate) struct QuicNativeBridge {
-    client: quic_agent::QuicBridgeClient,
-    _carrier: Option<Arc<QuicNativeCarrier>>,
-}
-
-struct QuicNativeCarrier {
-    _handle: Handle<Client>,
-    drain_task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for QuicNativeCarrier {
-    fn drop(&mut self) {
-        self.drain_task.abort();
-    }
-}
-
-impl QuicNativeBridge {
-    #[cfg(test)]
-    pub(crate) fn detached(client: quic_agent::QuicBridgeClient) -> Self {
-        Self {
-            client,
-            _carrier: None,
-        }
-    }
-
-    pub(crate) fn with_ssh_carrier(
-        client: quic_agent::QuicBridgeClient,
-        handle: Handle<Client>,
-        drain_task: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            client,
-            _carrier: Some(Arc::new(QuicNativeCarrier {
-                _handle: handle,
-                drain_task,
-            })),
-        }
-    }
-
-    pub(crate) async fn open_tcp_ipv4_optimistic(
-        &self,
-        open: agent_proto::AgentOpenIpv4,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_tcp_ipv4_optimistic(open).await
-    }
-
-    pub(crate) async fn open_udp_ipv4(
-        &self,
-        open: agent_proto::AgentOpenIpv4,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_udp_ipv4(open).await
-    }
-
-    pub(crate) async fn open_tcp_host(
-        &self,
-        open: agent_proto::AgentOpenHost,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_tcp_host(open).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn close_for_test(&self, reason: &str) {
-        self.client.close(reason);
-    }
-}
-
-pub(crate) enum AgentBridgeCarrier {
-    Ssh(Handle<Client>),
-    Quic(QuicAgentCarrier),
-    #[allow(dead_code)]
-    Detached,
-}
-
-impl AgentBridgeCarrier {
-    pub(crate) async fn disconnect(&self, reason: &str) -> Result<()> {
-        match self {
-            Self::Ssh(handle) => handle
-                .disconnect(russh::Disconnect::ByApplication, reason, "en")
-                .await
-                .with_context(|| format!("failed to disconnect agent carrier: {reason}")),
-            Self::Quic(carrier) => carrier.disconnect(reason).await,
-            Self::Detached => Ok(()),
-        }
-    }
-}
-
-pub(crate) struct QuicAgentCarrier {
-    handle: Handle<Client>,
-    _session: quic_agent::QuicAgentSession,
-    drain_task: tokio::task::JoinHandle<()>,
-}
-
-impl QuicAgentCarrier {
-    fn new(
-        handle: Handle<Client>,
-        session: quic_agent::QuicAgentSession,
-        drain_task: tokio::task::JoinHandle<()>,
-    ) -> Self {
-        Self {
-            handle,
-            _session: session,
-            drain_task,
-        }
-    }
-
-    async fn disconnect(&self, reason: &str) -> Result<()> {
-        self.drain_task.abort();
-        self.handle
-            .disconnect(russh::Disconnect::ByApplication, reason, "en")
-            .await
-            .with_context(|| format!("failed to disconnect QUIC agent SSH carrier: {reason}"))
-    }
-}
-
-pub(crate) struct AgentBridgeTransport {
-    carrier: AgentBridgeCarrier,
-    transport: agent_transport::AgentTransport,
-    agent_command: String,
-}
-
-impl AgentBridgeTransport {
-    pub(crate) fn ssh(
-        handle: Handle<Client>,
-        transport: agent_transport::AgentTransport,
-        agent_command: impl Into<String>,
-    ) -> Self {
-        Self {
-            carrier: AgentBridgeCarrier::Ssh(handle),
-            transport,
-            agent_command: agent_command.into(),
-        }
-    }
-
-    pub(crate) fn quic(
-        handle: Handle<Client>,
-        session: quic_agent::QuicAgentSession,
-        drain_task: tokio::task::JoinHandle<()>,
-        transport: agent_transport::AgentTransport,
-        agent_command: impl Into<String>,
-    ) -> Self {
-        Self {
-            carrier: AgentBridgeCarrier::Quic(QuicAgentCarrier::new(handle, session, drain_task)),
-            transport,
-            agent_command: agent_command.into(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn detached_for_test(
-        transport: agent_transport::AgentTransport,
-        agent_command: impl Into<String>,
-    ) -> Self {
-        Self {
-            carrier: AgentBridgeCarrier::Detached,
-            transport,
-            agent_command: agent_command.into(),
-        }
-    }
-
-    pub(crate) async fn disconnect(&self, reason: &str) -> Result<()> {
-        self.carrier.disconnect(reason).await
-    }
-
-    pub(crate) fn transport(&self) -> &agent_transport::AgentTransport {
-        &self.transport
-    }
-
-    pub(crate) fn agent_command(&self) -> &str {
-        &self.agent_command
-    }
-
-    pub(crate) fn peer_capabilities(&self) -> u64 {
-        self.transport.peer_hello().capabilities
-    }
 }
 
 struct AgentBridgeLane {
@@ -1235,120 +1062,4 @@ impl ReconnectingAgentBridge {
             }
         }
     }
-}
-
-#[cfg(test)]
-pub(crate) fn agent_lane_index(
-    open: &agent_proto::AgentOpenIpv4,
-    protocol: u8,
-    lanes: usize,
-) -> usize {
-    let (primary, _) = agent_lane_candidates(agent_ipv4_lane_hash(open, protocol), lanes);
-    primary
-}
-
-fn agent_ipv4_lane_hash(open: &agent_proto::AgentOpenIpv4, protocol: u8) -> u64 {
-    mix_lane_hash_protocol(
-        mix_lane_hash_u16(
-            mix_lane_hash_ipv4(
-                agent_lane_hash_origin(open.originator_ip, open.originator_port),
-                open.destination_ip,
-            ),
-            open.destination_port,
-        ),
-        protocol,
-    )
-}
-
-pub(crate) fn agent_lane_backoff_duration(
-    lane_index: usize,
-    consecutive_failures: u32,
-) -> Duration {
-    let failures = consecutive_failures.max(1);
-    let shift = failures.saturating_sub(1).min(LANE_BACKOFF_MAX_SHIFT);
-    let base_ms = (AGENT_LANE_BACKOFF_BASE.as_millis() as u64)
-        .saturating_mul(1_u64 << shift)
-        .min(AGENT_LANE_BACKOFF_MAX.as_millis() as u64);
-    let jitter_ms = ((lane_index as u64).saturating_mul(LANE_BACKOFF_JITTER_LANE_FACTOR)
-        + u64::from(failures) * LANE_BACKOFF_JITTER_FAILURE_FACTOR)
-        % LANE_BACKOFF_JITTER_MODULUS;
-    Duration::from_millis((base_ms + jitter_ms).min(AGENT_LANE_BACKOFF_MAX.as_millis() as u64))
-}
-
-#[cfg(test)]
-pub(crate) fn agent_host_lane_index(
-    open: &agent_proto::AgentOpenHost,
-    protocol: u8,
-    lanes: usize,
-) -> usize {
-    let (primary, _) = agent_lane_candidates(agent_host_lane_hash(open, protocol), lanes);
-    primary
-}
-
-fn agent_host_lane_hash(open: &agent_proto::AgentOpenHost, protocol: u8) -> u64 {
-    mix_lane_hash_protocol(
-        mix_lane_hash_u16(
-            mix_lane_hash_lowercase_host(
-                agent_lane_hash_origin(open.originator_ip, open.originator_port),
-                &open.destination_host,
-            ),
-            open.destination_port,
-        ),
-        protocol,
-    )
-}
-
-fn agent_lane_candidates(hash: u64, lanes: usize) -> (usize, usize) {
-    assert!(lanes > 0, "agent lane count must be non-zero");
-    let primary = (finalize_flow_hash(hash) % lanes as u64) as usize;
-    if lanes == 1 {
-        return (primary, primary);
-    }
-
-    let secondary_hash = hash ^ SECONDARY_LANE_HASH_SALT;
-    let mut secondary = (finalize_flow_hash(secondary_hash) % lanes as u64) as usize;
-    if secondary == primary {
-        secondary = (secondary + 1) % lanes;
-    }
-    (primary, secondary)
-}
-
-fn agent_lane_hash_origin(originator_ip: std::net::Ipv4Addr, originator_port: u16) -> u64 {
-    mix_lane_hash_u16(
-        mix_lane_hash_ipv4(FNV1A_OFFSET_BASIS, originator_ip),
-        originator_port,
-    )
-}
-
-fn mix_lane_hash_ipv4(mut hash: u64, addr: std::net::Ipv4Addr) -> u64 {
-    for byte in addr.octets() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    hash
-}
-
-fn mix_lane_hash_lowercase_host(mut hash: u64, host: &str) -> u64 {
-    for byte in host.as_bytes() {
-        hash = fnv1a_mix(hash, byte.to_ascii_lowercase());
-    }
-    hash
-}
-
-fn mix_lane_hash_u16(mut hash: u64, value: u16) -> u64 {
-    for byte in value.to_be_bytes() {
-        hash = fnv1a_mix(hash, byte);
-    }
-    hash
-}
-
-fn mix_lane_hash_protocol(hash: u64, protocol: u8) -> u64 {
-    fnv1a_mix(hash, protocol)
-}
-
-pub(crate) fn agent_lane_bit(index: usize) -> u64 {
-    assert!(
-        index < u64::BITS as usize,
-        "agent lane bitset supports at most 64 lanes"
-    );
-    1_u64 << index
 }
