@@ -344,7 +344,7 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "remote_close_defers_flow_close_for_late_remote_data",
     "remote_backlog_pauses_bridge_events_at_high_watermark",
     "pub payload: Bytes",
-    "association.to_remote.try_send(request.payload)",
+    "to_remote.try_send(payload)",
     "udp_admission_moves_parsed_payload_bytes_into_association_queue",
     "drop_unsupported_direct_udp",
     "direct_tcpip_generic_udp_drop_is_counted_without_admission",

@@ -74,11 +74,12 @@ use data_plane::{
 use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
 use packet_engine::{
-    admit_udp_datagram, drain_local_bytes_to_bridges, drop_unsupported_direct_udp, format_bytes,
-    format_duration, handle_bridge_event, handle_bridge_event_into, should_log_stale_bridge_event,
+    admit_udp_datagram, drain_local_bytes_to_bridges, drop_unsupported_direct_udp,
+    execute_udp_ingress_action, format_bytes, format_duration, handle_bridge_event,
+    handle_bridge_event_into, plan_udp_datagram_actions, should_log_stale_bridge_event,
     BridgeAdmissionStats, BridgeEventStats, DnsInflight, LocalDrainStats, RemoteBacklogPush,
-    RemoteBacklogs, TunWriteStats, TunnelStats, MAX_ACTIVE_UDP_ASSOCIATIONS,
-    REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
+    RemoteBacklogs, TunWriteStats, TunnelStats, UdpDropReason, UdpIngressAction,
+    MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
     REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
@@ -1254,6 +1255,235 @@ mod tests {
             .expect("agent exits")
             .expect("agent join")
             .expect("agent run");
+    }
+
+    #[test]
+    fn udp_planner_drops_unsupported_transport_without_admission() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+
+        plan_udp_datagram_actions(
+            None,
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload: Bytes::from_static(b"unsupported"),
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        assert!(associations.is_empty());
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            UdpIngressAction::DropDatagram {
+                key: action_key,
+                reason,
+            } => {
+                assert_eq!(*action_key, key);
+                assert_eq!(*reason, UdpDropReason::UnsupportedTransport);
+            }
+            _ => panic!("expected unsupported UDP drop action"),
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_planner_starts_vacant_association_before_send() {
+        let (transport, agent) = test_agent_transport().await;
+        let bridge = ReconnectingAgentBridge::new(
+            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+            vec![detached_bridge_transport(transport)],
+        );
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let payload = Bytes::from_static(b"first-datagram");
+        let payload_ptr = payload.as_ptr();
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransport::Agent(bridge.clone())),
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload,
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        assert_eq!(association_limit.current(), 1);
+        assert!(associations.contains_key(&key));
+        assert_eq!(actions.len(), 2);
+        match &actions[0] {
+            UdpIngressAction::StartAssociation {
+                key: action_key, ..
+            } => {
+                assert_eq!(*action_key, key);
+            }
+            _ => panic!("expected association start action first"),
+        }
+        match &actions[1] {
+            UdpIngressAction::SendDatagram {
+                key: action_key,
+                payload,
+                transport_label,
+                ..
+            } => {
+                assert_eq!(*action_key, key);
+                assert_eq!(payload.as_ref(), b"first-datagram");
+                assert_eq!(payload.as_ptr(), payload_ptr);
+                assert_eq!(*transport_label, "agent");
+            }
+            _ => panic!("expected UDP send action second"),
+        }
+
+        drop(actions);
+        drop(associations);
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+    }
+
+    #[tokio::test]
+    async fn udp_planner_reuses_existing_association_without_restarting() {
+        let (transport, agent) = test_agent_transport().await;
+        let bridge = ReconnectingAgentBridge::new(
+            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+            vec![detached_bridge_transport(transport)],
+        );
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let (to_remote, _from_local) = mpsc::channel(1);
+        let (response_tx, _response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+        let mut associations = HashMap::new();
+        associations.insert(key, UdpAssociation { to_remote });
+        let mut association_limit = DnsInflight::new(1);
+        let mut actions = Vec::new();
+
+        plan_udp_datagram_actions(
+            Some(UdpAssociationTransport::Agent(bridge.clone())),
+            dns::UdpPacket {
+                src_ip: key.src_ip,
+                src_port: key.src_port,
+                dst_ip: key.dst_ip,
+                dst_port: key.dst_port,
+                payload: Bytes::from_static(b"existing"),
+            },
+            &mut associations,
+            &mut association_limit,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            UDP_ASSOCIATION_IDLE_TIMEOUT,
+            &mut actions,
+        );
+
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            UdpIngressAction::SendDatagram {
+                key: action_key,
+                payload,
+                ..
+            } => {
+                assert_eq!(*action_key, key);
+                assert_eq!(payload.as_ref(), b"existing");
+            }
+            _ => panic!("expected existing association to emit only a send action"),
+        }
+
+        drop(actions);
+        drop(associations);
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+    }
+
+    #[test]
+    fn udp_executor_closed_sender_releases_association_slot() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 2),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 168, 1, 10),
+            dst_port: 53,
+        };
+        let (to_remote, from_local) = mpsc::channel(1);
+        drop(from_local);
+        let mut associations = HashMap::new();
+        associations.insert(
+            key,
+            UdpAssociation {
+                to_remote: to_remote.clone(),
+            },
+        );
+        let mut association_limit = DnsInflight::new(1);
+        assert!(association_limit.try_admit());
+        let mut stats = TunnelStats::new();
+
+        execute_udp_ingress_action(
+            UdpIngressAction::SendDatagram {
+                key,
+                to_remote,
+                payload: Bytes::from_static(b"closed"),
+                transport_label: "agent",
+            },
+            &mut associations,
+            &mut association_limit,
+            &mut stats,
+        );
+
+        assert!(associations.is_empty());
+        assert_eq!(association_limit.current(), 0);
+        assert_eq!(association_limit.completed(), 1);
+        assert_eq!(stats.udp_forwarded, 0);
+        assert_eq!(stats.udp_dropped, 1);
+        assert_eq!(stats.udp_failed, 1);
     }
 
     #[test]
