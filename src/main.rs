@@ -50,7 +50,7 @@ use agent_bridge::{
     AgentBridgeTransport, AgentReconnectSnapshot, AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
 use agent_bridge::{
-    AgentBridgeConnector, AgentBridgeSnapshot, AgentBridgeStream, BridgeRuntime, QuicNativeBridge,
+    AgentBridgeConnector, AgentBridgeSnapshot, AgentBridgeStream, QuicNativeBridge,
     ReconnectingAgentBridge,
 };
 #[cfg(test)]
@@ -63,7 +63,8 @@ use control_plane::{connect_bridge_runtime, SshAgentBridgeConnector};
 #[cfg(test)]
 use data_plane::BridgeAdmissionLimits;
 use data_plane::{
-    bridge_admission_decision, BridgeAdmissionDecision, BridgeRuntimeOptions, BridgeTransportKind,
+    bridge_admission_decision, BridgeAdmissionDecision, BridgeRuntime, BridgeRuntimeOptions,
+    BridgeTransportKind, DnsTransport, UdpAssociationTransport,
 };
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
 
@@ -2907,37 +2908,6 @@ async fn start_local_dns_proxy(
     });
 
     Ok(LocalDnsProxy { task })
-}
-
-#[derive(Clone)]
-enum DnsTransport {
-    DirectTcpip(SshSessionPool),
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
-}
-
-impl DnsTransport {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::DirectTcpip(_) => "SSH",
-            Self::Agent(_) => "agent",
-            Self::QuicNative(_) => "native QUIC",
-        }
-    }
-
-    fn udp_transport(&self) -> Option<UdpAssociationTransport> {
-        match self {
-            Self::Agent(agent) => Some(UdpAssociationTransport::Agent(agent.clone())),
-            Self::QuicNative(bridge) => Some(UdpAssociationTransport::QuicNative(bridge.clone())),
-            Self::DirectTcpip(_) => None,
-        }
-    }
-}
-
-#[derive(Clone)]
-enum UdpAssociationTransport {
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
 }
 
 enum AgentIoStream {

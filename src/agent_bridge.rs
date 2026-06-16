@@ -9,10 +9,7 @@ use bytes::Bytes;
 use russh::client::Handle;
 use tokio::sync::Mutex;
 
-use crate::data_plane::BridgeAdmissionLimits;
-use crate::{
-    agent_proto, agent_transport, finalize_flow_hash, fnv1a_mix, quic_agent, Client, SshSessionPool,
-};
+use crate::{agent_proto, agent_transport, finalize_flow_hash, fnv1a_mix, quic_agent, Client};
 
 pub(crate) const AGENT_LANE_BACKOFF_BASE: Duration = Duration::from_millis(250);
 pub(crate) const AGENT_LANE_BACKOFF_MAX: Duration = Duration::from_secs(30);
@@ -28,12 +25,6 @@ pub(crate) trait AgentBridgeConnector: Send + Sync {
     fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_>;
     fn connect_primary(&self) -> AgentBridgeConnectFuture<'_>;
     fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a>;
-}
-
-pub(crate) enum BridgeRuntime {
-    DirectTcpip(SshSessionPool),
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
 }
 
 #[derive(Clone)]
@@ -100,22 +91,6 @@ impl QuicNativeBridge {
     #[cfg(test)]
     pub(crate) fn close_for_test(&self, reason: &str) {
         self.client.close(reason);
-    }
-}
-
-impl BridgeRuntime {
-    pub(crate) fn admission_limits(&self) -> BridgeAdmissionLimits {
-        match self {
-            Self::DirectTcpip(_) => BridgeAdmissionLimits::direct_tcpip(),
-            Self::Agent(_) | Self::QuicNative(_) => BridgeAdmissionLimits::agent(),
-        }
-    }
-
-    pub(crate) async fn agent_snapshot(&self) -> AgentBridgeSnapshot {
-        match self {
-            Self::DirectTcpip(_) | Self::QuicNative(_) => AgentBridgeSnapshot::default(),
-            Self::Agent(agent) => agent.snapshot().await,
-        }
     }
 }
 
