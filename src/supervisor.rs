@@ -114,7 +114,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
         args.mtu, args.tun_ip, args.tun_prefix
     );
 
-    let (bridge_runtime, dns_transport) = connect_bridge_runtime(
+    let (bridge_runtime, _dns_transport) = connect_bridge_runtime(
         &args.ssh,
         args.bridge_transport,
         helper_plan,
@@ -128,7 +128,7 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     )
     .await?;
     let data_plane: Arc<dyn DataPlane> =
-        Arc::new(RuntimeDataPlane::new(bridge_runtime, dns_transport));
+        Arc::new(RuntimeDataPlane::from_bridge_runtime(bridge_runtime));
     let control_route = match ssh_control_ip {
         Some(ip) => add_ssh_control_route(ip)?,
         None => None,
