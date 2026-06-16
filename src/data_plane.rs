@@ -97,6 +97,15 @@ pub(crate) enum UdpAssociationTransport {
     QuicNative(QuicNativeBridge),
 }
 
+impl UdpAssociationTransport {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Agent(_) => "agent",
+            Self::QuicNative(_) => "quic-native",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct DnsResponseEvent {
     pub(crate) request: dns::UdpDnsRequest,

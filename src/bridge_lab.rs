@@ -16,12 +16,12 @@ use crate::control_plane::connect_bridge_runtime;
 use crate::data_plane::{BridgeRuntimeOptions, BridgeTransportKind};
 use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
-    prune_closed_flows, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
+    prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
 use crate::remote_helper::effective_bridge_agent_command;
 use crate::{
-    default_http_request, parse_ipv4_destination, percentile_nearest_rank, smol_now, ssh_bridge,
-    tcp_core, SshArgs, DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP,
+    default_http_request, parse_ipv4_destination, percentile_nearest_rank, ssh_bridge, tcp_core,
+    SshArgs, DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP,
     DEFAULT_TUN_PREFIX,
 };
 

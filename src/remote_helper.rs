@@ -20,6 +20,95 @@ pub(crate) const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -No
 pub(crate) const RUSTLE_AGENT_DIR_ENV: &str = "RUSTLE_AGENT_DIR";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HelperKind {
+    StdioAgent,
+    QuicAgent,
+    QuicBridgeNative,
+}
+
+impl HelperKind {
+    pub(crate) fn subcommand(self) -> &'static str {
+        helper_command_labels(self).0
+    }
+
+    pub(crate) fn default_command(self) -> &'static str {
+        helper_command_labels(self).1
+    }
+
+    pub(crate) fn for_bridge_transport(transport: BridgeTransportKind) -> Self {
+        match transport {
+            BridgeTransportKind::QuicAgent => Self::QuicAgent,
+            BridgeTransportKind::QuicNative => Self::QuicBridgeNative,
+            BridgeTransportKind::Auto
+            | BridgeTransportKind::DirectTcpip
+            | BridgeTransportKind::Agent => Self::StdioAgent,
+        }
+    }
+}
+
+pub(crate) fn helper_command_labels(kind: HelperKind) -> (&'static str, &'static str) {
+    match kind {
+        HelperKind::StdioAgent => ("agent", DEFAULT_AGENT_COMMAND),
+        HelperKind::QuicAgent => ("quic-agent", DEFAULT_QUIC_AGENT_COMMAND),
+        HelperKind::QuicBridgeNative => ("quic-bridge-agent", DEFAULT_QUIC_BRIDGE_AGENT_COMMAND),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum BootstrapPolicy {
+    BuiltInCommandWithUploadFallback,
+    ExplicitCommandNoFallback,
+    ExplicitUploadAllowed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HelperCommandPlan {
+    pub(crate) kind: HelperKind,
+    pub(crate) command: String,
+    pub(crate) policy: BootstrapPolicy,
+}
+
+impl HelperCommandPlan {
+    pub(crate) fn from_command_options(
+        kind: HelperKind,
+        agent_command: Option<&str>,
+        agent_path: Option<&str>,
+    ) -> Result<Self> {
+        match (agent_command, agent_path) {
+            (Some(_), Some(_)) => {
+                bail!("--agent-command cannot be combined with --agent-path");
+            }
+            (Some(command), None) => {
+                if command.trim().is_empty() {
+                    bail!("--agent-command must not be empty");
+                }
+                Ok(Self {
+                    kind,
+                    command: command.to_owned(),
+                    policy: BootstrapPolicy::ExplicitCommandNoFallback,
+                })
+            }
+            (None, Some(path)) => {
+                if path.trim().is_empty() {
+                    bail!("--agent-path must not be empty");
+                }
+                Ok(Self {
+                    kind,
+                    command: format!("{} {}", shell_quote(path), kind.subcommand()),
+                    policy: BootstrapPolicy::ExplicitCommandNoFallback,
+                })
+            }
+            (None, None) => Ok(Self {
+                kind,
+                command: kind.default_command().to_owned(),
+                policy: BootstrapPolicy::BuiltInCommandWithUploadFallback,
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RemotePlatform {
     pub(crate) os: &'static str,
     pub(crate) arch: &'static str,
@@ -451,31 +540,21 @@ pub(crate) fn effective_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(agent_command, agent_path, "agent", DEFAULT_AGENT_COMMAND)
+    effective_remote_helper_command(agent_command, agent_path, HelperKind::StdioAgent)
 }
 
 fn effective_quic_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(
-        agent_command,
-        agent_path,
-        "quic-agent",
-        DEFAULT_QUIC_AGENT_COMMAND,
-    )
+    effective_remote_helper_command(agent_command, agent_path, HelperKind::QuicAgent)
 }
 
 fn effective_quic_bridge_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    effective_remote_helper_command(
-        agent_command,
-        agent_path,
-        "quic-bridge-agent",
-        DEFAULT_QUIC_BRIDGE_AGENT_COMMAND,
-    )
+    effective_remote_helper_command(agent_command, agent_path, HelperKind::QuicBridgeNative)
 }
 
 pub(crate) fn effective_bridge_agent_command(
@@ -483,41 +562,21 @@ pub(crate) fn effective_bridge_agent_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
 ) -> Result<String> {
-    match transport {
-        BridgeTransportKind::QuicAgent => effective_quic_agent_command(agent_command, agent_path),
-        BridgeTransportKind::QuicNative => {
+    match HelperKind::for_bridge_transport(transport) {
+        HelperKind::QuicAgent => effective_quic_agent_command(agent_command, agent_path),
+        HelperKind::QuicBridgeNative => {
             effective_quic_bridge_agent_command(agent_command, agent_path)
         }
-        BridgeTransportKind::Auto
-        | BridgeTransportKind::DirectTcpip
-        | BridgeTransportKind::Agent => effective_agent_command(agent_command, agent_path),
+        HelperKind::StdioAgent => effective_agent_command(agent_command, agent_path),
     }
 }
 
 fn effective_remote_helper_command(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
-    helper_subcommand: &str,
-    default_command: &str,
+    helper: HelperKind,
 ) -> Result<String> {
-    match (agent_command, agent_path) {
-        (Some(_), Some(_)) => {
-            bail!("--agent-command cannot be combined with --agent-path");
-        }
-        (Some(command), None) => {
-            if command.trim().is_empty() {
-                bail!("--agent-command must not be empty");
-            }
-            Ok(command.to_owned())
-        }
-        (None, Some(path)) => {
-            if path.trim().is_empty() {
-                bail!("--agent-path must not be empty");
-            }
-            Ok(format!("{} {helper_subcommand}", shell_quote(path)))
-        }
-        (None, None) => Ok(default_command.to_owned()),
-    }
+    Ok(HelperCommandPlan::from_command_options(helper, agent_command, agent_path)?.command)
 }
 
 pub(crate) fn powershell_quote(value: &str) -> String {
@@ -564,5 +623,135 @@ pub(crate) fn normalize_remote_arch(value: &str) -> Option<&'static str> {
         "x86_64" | "amd64" => Some("x86_64"),
         "aarch64" | "arm64" => Some("aarch64"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn helper_kind_maps_to_subcommands_and_default_commands() {
+        let cases = [
+            (HelperKind::StdioAgent, "agent", DEFAULT_AGENT_COMMAND),
+            (
+                HelperKind::QuicAgent,
+                "quic-agent",
+                DEFAULT_QUIC_AGENT_COMMAND,
+            ),
+            (
+                HelperKind::QuicBridgeNative,
+                "quic-bridge-agent",
+                DEFAULT_QUIC_BRIDGE_AGENT_COMMAND,
+            ),
+        ];
+
+        for (kind, subcommand, default_command) in cases {
+            assert_eq!(helper_command_labels(kind), (subcommand, default_command));
+            assert_eq!(kind.subcommand(), subcommand);
+            assert_eq!(kind.default_command(), default_command);
+        }
+    }
+
+    #[test]
+    fn helper_kind_maps_bridge_transports_to_helper_commands() {
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::QuicAgent),
+            HelperKind::QuicAgent
+        );
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::QuicNative),
+            HelperKind::QuicBridgeNative
+        );
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::Agent),
+            HelperKind::StdioAgent
+        );
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::DirectTcpip),
+            HelperKind::StdioAgent
+        );
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::Auto),
+            HelperKind::StdioAgent
+        );
+    }
+
+    #[test]
+    fn helper_command_plan_resolves_effective_commands() {
+        assert_eq!(
+            HelperCommandPlan::from_command_options(HelperKind::QuicAgent, None, None)
+                .expect("default command")
+                .command,
+            DEFAULT_QUIC_AGENT_COMMAND,
+        );
+        assert_eq!(
+            HelperCommandPlan::from_command_options(
+                HelperKind::StdioAgent,
+                Some("/opt/rustle quic-agent"),
+                None,
+            )
+            .expect("explicit command")
+            .command,
+            "/opt/rustle quic-agent",
+        );
+        assert_eq!(
+            HelperCommandPlan::from_command_options(
+                HelperKind::QuicBridgeNative,
+                None,
+                Some("/tmp/rustle dir/rustle'bin"),
+            )
+            .expect("explicit path")
+            .command,
+            "'/tmp/rustle dir/rustle'\\''bin' quic-bridge-agent",
+        );
+    }
+
+    #[test]
+    fn helper_command_plan_assigns_bootstrap_policy() {
+        assert_eq!(
+            HelperCommandPlan::from_command_options(HelperKind::StdioAgent, None, None)
+                .expect("default policy")
+                .policy,
+            BootstrapPolicy::BuiltInCommandWithUploadFallback,
+        );
+        assert_eq!(
+            HelperCommandPlan::from_command_options(
+                HelperKind::StdioAgent,
+                Some("rustle agent"),
+                None,
+            )
+            .expect("explicit command policy")
+            .policy,
+            BootstrapPolicy::ExplicitCommandNoFallback,
+        );
+        assert_eq!(
+            HelperCommandPlan::from_command_options(
+                HelperKind::StdioAgent,
+                None,
+                Some("/tmp/rustle"),
+            )
+            .expect("explicit path policy")
+            .policy,
+            BootstrapPolicy::ExplicitCommandNoFallback,
+        );
+    }
+
+    #[test]
+    fn helper_command_plan_validates_command_options() {
+        assert!(
+            HelperCommandPlan::from_command_options(HelperKind::StdioAgent, Some(" "), None)
+                .is_err()
+        );
+        assert!(
+            HelperCommandPlan::from_command_options(HelperKind::StdioAgent, None, Some(" "))
+                .is_err()
+        );
+        assert!(HelperCommandPlan::from_command_options(
+            HelperKind::StdioAgent,
+            Some("rustle agent"),
+            Some("/tmp/rustle"),
+        )
+        .is_err());
     }
 }

@@ -1,4 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
@@ -15,9 +17,7 @@ use crate::data_plane::{
     UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
     UDP_DATAGRAMS_PER_ASSOCIATION,
 };
-use crate::{
-    agent_proto, dns, quic_agent, shutdown_signal, smol_now, ssh_bridge, tcp_core, DEFAULT_TUN_IP,
-};
+use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core, DEFAULT_TUN_IP};
 
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;
 pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
@@ -36,6 +36,13 @@ const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
 const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) type ShutdownSignalFuture = Pin<Box<dyn Future<Output = Result<&'static str>> + Send>>;
+
+pub(crate) fn smol_now(started_at: StdInstant) -> SmolInstant {
+    let millis = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    SmolInstant::from_millis(millis)
+}
 
 pub(crate) fn parse_dns_request_for_tunnel(packet: &[u8]) -> Option<dns::UdpDnsRequest> {
     match dns::parse_udp_dns_request(packet) {
@@ -173,6 +180,7 @@ pub(crate) async fn run_tunnel_loop(
     dns_transport: DnsTransport,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
+    mut shutdown: ShutdownSignalFuture,
 ) -> Result<()> {
     let mut buf = vec![0_u8; PACKET_BUF_SIZE];
     let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
@@ -204,8 +212,6 @@ pub(crate) async fn run_tunnel_loop(
         STATS_LOG_INTERVAL,
     );
     stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut shutdown = Box::pin(shutdown_signal());
-
     loop {
         tokio::select! {
             signal = &mut shutdown => {
@@ -775,6 +781,7 @@ pub(crate) fn admit_udp_datagram(
     stats: &mut TunnelStats,
 ) {
     let key = UdpFlowKey::from_packet(&request);
+    let transport_label = transport.label();
     let association = match associations.entry(key) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
@@ -804,8 +811,8 @@ pub(crate) fn admit_udp_datagram(
         Ok(()) => {
             stats.udp_forwarded = stats.udp_forwarded.saturating_add(1);
             eprintln!(
-                "udp: forwarding datagram {}:{} -> {}:{} over data plane",
-                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
+                "udp: forwarding datagram {}:{} -> {}:{} over {}",
+                key.src_ip, key.src_port, key.dst_ip, key.dst_port, transport_label,
             );
         }
         Err(mpsc::error::TrySendError::Full(_)) => {
