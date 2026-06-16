@@ -67,16 +67,17 @@ use data_plane::BridgeAdmissionLimits;
 use data_plane::{
     bridge_admission_decision, query_dns_over_agent, query_dns_over_agent_udp,
     query_udp_over_agent, run_udp_association, run_udp_association_transport,
-    send_dns_response_event, spawn_udp_association_with_idle_timeout, BridgeAdmissionDecision,
-    DnsResponseEvent, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
+    send_dns_response_event, spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout,
+    BridgeAdmissionDecision, DnsResponseEvent, UdpAssociation, UdpAssociationEvents,
+    UdpAssociationTransport, UdpFlowKey,
 };
 use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
 use packet_engine::{
     admit_udp_datagram, drain_local_bytes_to_bridges, drop_unsupported_direct_udp, format_bytes,
     format_duration, handle_bridge_event, handle_bridge_event_into, should_log_stale_bridge_event,
-    spawn_agent_tcp_bridge, BridgeAdmissionStats, BridgeEventStats, DnsInflight, LocalDrainStats,
-    RemoteBacklogPush, RemoteBacklogs, TunWriteStats, TunnelStats, MAX_ACTIVE_UDP_ASSOCIATIONS,
+    BridgeAdmissionStats, BridgeEventStats, DnsInflight, LocalDrainStats, RemoteBacklogPush,
+    RemoteBacklogs, TunWriteStats, TunnelStats, MAX_ACTIVE_UDP_ASSOCIATIONS,
     REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
     REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
