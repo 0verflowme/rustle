@@ -1,14 +1,16 @@
 #[cfg(test)]
 use std::collections::{HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::net::Ipv4Addr;
+#[cfg(test)]
+use std::net::SocketAddr;
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 #[cfg(test)]
 use bytes::BytesMut;
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::Parser;
+#[cfg(test)]
 use ipnet::Ipv4Net;
 #[cfg(test)]
 use smoltcp::socket::tcp;
@@ -25,6 +27,7 @@ mod agent_runtime;
 mod agent_transport;
 mod agent_window;
 mod bridge_lab;
+mod cli;
 mod control_plane;
 mod data_plane;
 mod dns;
@@ -47,13 +50,18 @@ use agent_bridge::{
     AgentBridgeTransport, AgentReconnectSnapshot, QuicNativeBridge, ReconnectingAgentBridge,
     AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
+use bridge_lab::run_bridge_lab;
 #[cfg(test)]
 use bridge_lab::{
     abort_bridge_lab_client_socket, bridge_lab_client_complete, bridge_lab_latency_percentiles,
     bridge_lab_response_complete, drain_lab_client_to_manager, pump_lab_manager_to_clients,
     route_lab_packets_to_clients, synthetic_lab_client, BridgeLabClient, BridgeLabLatencySummary,
 };
-use bridge_lab::{run_bridge_lab, BridgeLabArgs};
+use cli::{
+    AgentArgs, AgentDnsLabArgs, AgentLabArgs, AgentUdpLabArgs, Cli, CommandKind, CompactTunnelArgs,
+    DirectTcpipArgs, QuicAgentArgs, QuicBridgeAgentArgs,
+};
+pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 #[cfg(test)]
 use control_plane::{
     connect_agent_bridge_transports_from_connector,
@@ -81,7 +89,9 @@ use packet_engine::{
 use remote_helper::{agent_command_plan, bridge_agent_command_plan};
 #[cfg(test)]
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
-use ssh_control::{connect_ssh, DEFAULT_SSH_CONNECT_TIMEOUT_SECS};
+use ssh_control::connect_ssh;
+#[cfg(test)]
+use ssh_control::DEFAULT_SSH_CONNECT_TIMEOUT_SECS;
 #[cfg(test)]
 use ssh_control::{
     home_dir, known_hosts_entry_matches, parse_ssh_config_for_host, parse_ssh_endpoint,
@@ -93,6 +103,8 @@ use ssh_control::{
     MAX_AUTO_AGENT_SESSIONS, MAX_SSH_SESSIONS,
 };
 #[cfg(test)]
+use supervisor::parse_target_cidr;
+#[cfg(test)]
 use supervisor::{
     add_ssh_control_route_with, add_target_routes_with, expand_target_routes,
     linux_control_route_command, linux_route_command, macos_control_route_command,
@@ -102,7 +114,7 @@ use supervisor::{
     windows_route_command, ControlRouteCommandExecutor, ExistingRoute, RouteAction,
     RouteCommandExecutor,
 };
-use supervisor::{parse_target_cidr, run_tun_capture, run_tunnel};
+use supervisor::{run_tun_capture, run_tunnel};
 #[cfg(test)]
 use transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
@@ -110,9 +122,9 @@ use transport_model::{
     UdpAssociation, UdpAssociationEvents, UdpFlowKey, MAX_AGENT_ACTIVE_STREAMS,
     MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
 };
-use transport_model::{
-    parse_destination, BridgeRuntimeOptions, BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION,
-};
+use transport_model::{parse_destination, BridgeRuntimeOptions};
+#[cfg(test)]
+use transport_model::{BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;
@@ -161,427 +173,6 @@ fn admit_udp_datagram(
             );
         },
     );
-}
-
-#[derive(Debug, Parser)]
-#[command(name = "rustle", about = "User-space SSH network pivot")]
-struct Cli {
-    #[command(flatten)]
-    compact: CompactTunnelArgs,
-
-    #[command(subcommand)]
-    command: Option<CommandKind>,
-}
-
-#[derive(Debug, Subcommand)]
-enum CommandKind {
-    /// Phase 1: authenticate to SSH and open one direct-tcpip channel.
-    #[command(hide = true)]
-    DirectTcpip(DirectTcpipArgs),
-
-    /// Phase 2: create a TUN, route CIDRs into it, and log raw packets.
-    #[command(hide = true)]
-    TunCapture(TunCaptureArgs),
-
-    /// Phase 4: create a TUN, terminate TCP locally, and bridge flows over SSH.
-    #[command(hide = true)]
-    Tunnel(TunnelArgs),
-
-    /// Lab: exercise FlowManager and the real SSH bridge without TUN privileges.
-    #[command(hide = true)]
-    BridgeLab(BridgeLabArgs),
-
-    /// Lab: exercise the framed agent transport over SSH exec.
-    #[command(hide = true)]
-    AgentLab(AgentLabArgs),
-
-    /// Lab: exercise framed agent UDP over SSH exec.
-    #[command(hide = true)]
-    AgentUdpLab(AgentUdpLabArgs),
-
-    /// Lab: measure DNS query latency through Rustle's DNS transport.
-    #[command(hide = true)]
-    AgentDnsLab(AgentDnsLabArgs),
-
-    /// Remote helper: run the Rustle agent protocol over a QUIC listener.
-    #[command(hide = true)]
-    QuicAgent(QuicAgentArgs),
-
-    /// Remote helper: run native per-flow QUIC bridge streams.
-    #[command(hide = true)]
-    QuicBridgeAgent(QuicBridgeAgentArgs),
-
-    /// Remote helper: run the Rustle agent protocol on stdin/stdout.
-    #[command(hide = true)]
-    Agent(AgentArgs),
-}
-
-#[derive(Debug, Clone, ClapArgs)]
-pub(crate) struct SshArgs {
-    /// SSH server, either host or host:port.
-    #[arg(short = 'r', long = "remote")]
-    ssh_server: Option<String>,
-
-    /// SSH username. Usually supplied as user@host in --remote.
-    #[arg(short = 'u', long = "user")]
-    ssh_user: Option<String>,
-
-    /// Private key path for public-key authentication.
-    #[arg(short = 'i', long = "identity")]
-    identity: Option<PathBuf>,
-
-    /// Use password authentication. If no value is supplied, prompt interactively.
-    #[arg(
-        short = 'p',
-        long = "password",
-        num_args = 0..=1,
-        require_equals = true,
-        conflicts_with = "password_file"
-    )]
-    password: Option<Option<String>>,
-
-    /// Read the SSH password from a local file instead of argv or a prompt.
-    #[arg(
-        long = "password-file",
-        value_name = "PATH",
-        conflicts_with = "password"
-    )]
-    password_file: Option<PathBuf>,
-
-    /// Skip host-key verification. Intended for controlled development labs only.
-    #[arg(long = "insecure-accept-host-key")]
-    insecure_accept_host_key: bool,
-
-    /// Trust and record a new SSH host key, but still reject changed known keys.
-    #[arg(
-        long = "accept-new-host-key",
-        conflicts_with = "insecure_accept_host_key"
-    )]
-    accept_new_host_key: bool,
-
-    /// OpenSSH known_hosts file to use for host-key verification.
-    #[arg(long = "known-hosts")]
-    known_hosts: Option<PathBuf>,
-
-    /// OpenSSH client config file to use for Host aliases.
-    #[arg(long = "ssh-config", value_name = "PATH", hide = true)]
-    ssh_config: Option<PathBuf>,
-
-    /// Timeout for establishing the SSH control TCP connection.
-    #[arg(
-        long = "ssh-connect-timeout",
-        default_value_t = DEFAULT_SSH_CONNECT_TIMEOUT_SECS,
-        value_name = "SECONDS",
-        hide = true
-    )]
-    ssh_connect_timeout_secs: u64,
-}
-
-#[derive(Debug, Clone, ClapArgs)]
-struct CompactTunnelArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// Explicit IPv4 CIDRs to route into the tunnel.
-    #[arg(value_name = "CIDR", value_parser = parse_target_cidr)]
-    targets: Vec<Ipv4Net>,
-
-    /// TUN interface IPv4 address.
-    #[arg(long = "tun-ip", default_value_t = DEFAULT_TUN_IP, hide = true)]
-    tun_ip: Ipv4Addr,
-
-    /// TUN interface IPv4 prefix length.
-    #[arg(long = "tun-prefix", default_value_t = DEFAULT_TUN_PREFIX, hide = true)]
-    tun_prefix: u8,
-
-    /// TUN interface MTU.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU, hide = true)]
-    mtu: u16,
-
-    /// Optional requested interface name. On macOS, omit this to let utun pick.
-    #[arg(long = "name", hide = true)]
-    name: Option<String>,
-
-    /// Configure the host resolver to send DNS queries through Rustle.
-    #[arg(long = "dns")]
-    configure_dns: bool,
-
-    /// Remote DNS TCP resolver to use for intercepted UDP/53 queries.
-    #[arg(long = "dns-remote", default_value = "127.0.0.53:53")]
-    dns_remote: String,
-
-    /// Number of SSH transports to open for flow hashing.
-    #[arg(long = "ssh-sessions", default_value_t = DEFAULT_SSH_SESSIONS, hide = true)]
-    ssh_sessions: usize,
-
-    /// Number of Rustle agent exec transports to open for flow hashing.
-    #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
-    agent_sessions: usize,
-
-    /// Hidden switch for comparing direct-tcpip with the framed agent transport.
-    #[arg(
-        long = "bridge-transport",
-        value_enum,
-        default_value = "agent",
-        hide = true
-    )]
-    bridge_transport: BridgeTransportKind,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
-    agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
-    agent_path: Option<String>,
-
-    /// Hidden lab override for generic UDP association idle cleanup.
-    #[arg(
-        long = "udp-idle-timeout-ms",
-        default_value_t = DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
-        hide = true
-    )]
-    udp_idle_timeout_ms: u64,
-}
-
-#[derive(Debug, Parser)]
-struct DirectTcpipArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// TCP target to open from the remote SSH server, in host:port form.
-    #[arg(short = 'd', long = "destination", default_value = "1.1.1.1:80")]
-    destination: String,
-
-    /// Raw request payload to send through the direct-tcpip channel.
-    #[arg(long = "request")]
-    request: Option<String>,
-}
-
-#[derive(Debug, Parser)]
-struct TunCaptureArgs {
-    /// Explicit IPv4 CIDRs to route into the TUN device.
-    #[arg(short = 't', long = "target", required = true, num_args = 1.., value_parser = parse_target_cidr)]
-    targets: Vec<Ipv4Net>,
-
-    /// TUN interface IPv4 address.
-    #[arg(long = "tun-ip", default_value_t = DEFAULT_TUN_IP)]
-    tun_ip: Ipv4Addr,
-
-    /// TUN interface IPv4 prefix length.
-    #[arg(long = "tun-prefix", default_value_t = DEFAULT_TUN_PREFIX)]
-    tun_prefix: u8,
-
-    /// TUN interface MTU.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-
-    /// Optional requested interface name. On macOS, omit this to let utun pick.
-    #[arg(long = "name")]
-    name: Option<String>,
-
-    /// Exit cleanly after capturing this many packets. Intended for smoke tests.
-    #[arg(long = "exit-after-packets", hide = true)]
-    exit_after_packets: Option<u64>,
-}
-
-#[derive(Debug, Parser)]
-struct TunnelArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// Explicit IPv4 CIDRs to route into the TUN device.
-    #[arg(short = 't', long = "target", required = true, num_args = 1.., value_parser = parse_target_cidr)]
-    targets: Vec<Ipv4Net>,
-
-    /// TUN interface IPv4 address.
-    #[arg(long = "tun-ip", default_value_t = DEFAULT_TUN_IP)]
-    tun_ip: Ipv4Addr,
-
-    /// TUN interface IPv4 prefix length.
-    #[arg(long = "tun-prefix", default_value_t = DEFAULT_TUN_PREFIX)]
-    tun_prefix: u8,
-
-    /// TUN interface MTU.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-
-    /// Optional requested interface name. On macOS, omit this to let utun pick.
-    #[arg(long = "name")]
-    name: Option<String>,
-
-    /// Configure the host resolver to send DNS queries through Rustle.
-    #[arg(long = "dns")]
-    configure_dns: bool,
-
-    /// Remote DNS TCP resolver to use for intercepted UDP/53 queries.
-    #[arg(long = "dns-remote", default_value = "127.0.0.53:53")]
-    dns_remote: String,
-
-    /// Number of SSH transports to open for flow hashing.
-    #[arg(long = "ssh-sessions", default_value_t = DEFAULT_SSH_SESSIONS, hide = true)]
-    ssh_sessions: usize,
-
-    /// Number of Rustle agent exec transports to open for flow hashing.
-    #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
-    agent_sessions: usize,
-
-    /// Hidden switch for comparing direct-tcpip with the framed agent transport.
-    #[arg(
-        long = "bridge-transport",
-        value_enum,
-        default_value = "agent",
-        hide = true
-    )]
-    bridge_transport: BridgeTransportKind,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
-    agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
-    agent_path: Option<String>,
-
-    /// Hidden lab override for generic UDP association idle cleanup.
-    #[arg(
-        long = "udp-idle-timeout-ms",
-        default_value_t = DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
-        hide = true
-    )]
-    udp_idle_timeout_ms: u64,
-}
-
-#[derive(Debug, Parser)]
-struct AgentLabArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// IPv4 TCP target to open from the remote agent, in ip:port form.
-    #[arg(short = 'd', long = "destination")]
-    destination: String,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", conflicts_with = "agent_path")]
-    agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", conflicts_with = "agent_command")]
-    agent_path: Option<String>,
-
-    /// Raw request payload to send through the agent stream.
-    #[arg(long = "request")]
-    request: Option<String>,
-
-    /// MTU advertised to the remote agent.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-}
-
-#[derive(Debug, Parser)]
-struct AgentUdpLabArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// IPv4 UDP target to open from the remote agent, in ip:port form.
-    #[arg(short = 'd', long = "destination")]
-    destination: String,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", conflicts_with = "agent_path")]
-    agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", conflicts_with = "agent_command")]
-    agent_path: Option<String>,
-
-    /// Raw UDP datagram payload to send through the agent stream.
-    #[arg(long = "request", default_value = "rustle-agent-udp-ping")]
-    request: String,
-
-    /// Number of UDP datagrams to send on one agent association.
-    #[arg(long = "messages", default_value_t = 2)]
-    messages: usize,
-
-    /// Maximum datagrams to keep outstanding before reading responses.
-    #[arg(long = "pipeline", default_value_t = UDP_DATAGRAMS_PER_ASSOCIATION)]
-    pipeline: usize,
-
-    /// Print a compact benchmark summary instead of response datagrams.
-    #[arg(long = "summary", hide = true)]
-    summary: bool,
-
-    /// MTU advertised to the remote agent.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-}
-
-#[derive(Debug, Parser)]
-struct AgentDnsLabArgs {
-    #[command(flatten)]
-    ssh: SshArgs,
-
-    /// Remote DNS resolver to query through the selected Rustle transport.
-    #[arg(long = "dns-remote")]
-    dns_remote: String,
-
-    /// DNS name to query.
-    #[arg(long = "name", default_value = "rustle-smoke.example.com")]
-    name: String,
-
-    /// Number of DNS queries to send sequentially.
-    #[arg(long = "queries", default_value_t = 32)]
-    queries: usize,
-
-    /// Hidden transport switch for DNS latency labs.
-    #[arg(
-        long = "bridge-transport",
-        value_enum,
-        default_value = "agent",
-        hide = true
-    )]
-    bridge_transport: BridgeTransportKind,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
-    agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
-    agent_path: Option<String>,
-
-    /// Number of Rustle agent exec transports to open for DNS queries.
-    #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
-    agent_sessions: usize,
-
-    /// MTU advertised to the remote agent.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-}
-
-#[derive(Debug, Parser)]
-struct AgentArgs {
-    /// MTU advertised to the local Rustle controller.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-}
-
-#[derive(Debug, Parser)]
-struct QuicAgentArgs {
-    /// UDP address the QUIC agent should listen on.
-    #[arg(long = "bind", default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
-
-    /// MTU advertised to the local Rustle controller.
-    #[arg(long = "mtu", default_value_t = DEFAULT_MTU)]
-    mtu: u16,
-}
-
-#[derive(Debug, Parser)]
-struct QuicBridgeAgentArgs {
-    /// UDP address the native QUIC bridge helper should listen on.
-    #[arg(long = "bind", default_value = "0.0.0.0:0")]
-    bind: SocketAddr,
 }
 
 #[tokio::main]

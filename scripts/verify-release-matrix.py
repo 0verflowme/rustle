@@ -1492,7 +1492,6 @@ def main() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
     build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
-    main_source = MAIN_SOURCE.read_text(encoding="utf-8")
     rust_sources = rust_source_text()
     readme = README_FILE.read_text(encoding="utf-8")
     notes = RELEASE_NOTES.read_text(encoding="utf-8")
@@ -1555,8 +1554,8 @@ def main() -> None:
     ]
     if missing_main:
         fail(f"src/*.rs is missing required transport snippets: {missing_main!r}")
-    if main_source.count('default_value = "agent"') < 3:
-        fail("src/main.rs must keep compact, tunnel, and bridge-lab defaulting to agent")
+    if rust_sources.count('default_value = "agent"') < 3:
+        fail("src/*.rs must keep compact, tunnel, and bridge-lab defaulting to agent")
 
     ci_os = parse_ci_os_matrix(ci_workflow)
     if ci_os != EXPECTED_CI_OS:
