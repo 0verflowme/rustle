@@ -25,6 +25,50 @@ pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DataPlaneReconnectSnapshot {
+    pub(crate) attempts: u64,
+    pub(crate) successes: u64,
+    pub(crate) failures: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DataPlaneRuntimeSnapshot {
+    pub(crate) reconnects: DataPlaneReconnectSnapshot,
+    pub(crate) lanes_total: usize,
+    pub(crate) lanes_desired: usize,
+    pub(crate) lanes_available: usize,
+    pub(crate) lanes_failed: usize,
+    pub(crate) lanes_missing: usize,
+    pub(crate) lanes_quarantined: usize,
+    pub(crate) lanes_repairing: usize,
+    pub(crate) active_streams: usize,
+    pub(crate) max_lane_load: usize,
+    pub(crate) max_quarantine_ms: u64,
+}
+
+impl From<AgentBridgeSnapshot> for DataPlaneRuntimeSnapshot {
+    fn from(snapshot: AgentBridgeSnapshot) -> Self {
+        Self {
+            reconnects: DataPlaneReconnectSnapshot {
+                attempts: snapshot.reconnects.attempts,
+                successes: snapshot.reconnects.successes,
+                failures: snapshot.reconnects.failures,
+            },
+            lanes_total: snapshot.lanes_total,
+            lanes_desired: snapshot.lanes_desired,
+            lanes_available: snapshot.lanes_available,
+            lanes_failed: snapshot.lanes_failed,
+            lanes_missing: snapshot.lanes_missing,
+            lanes_quarantined: snapshot.lanes_quarantined,
+            lanes_repairing: snapshot.lanes_repairing,
+            active_streams: snapshot.active_streams,
+            max_lane_load: snapshot.max_lane_load,
+            max_quarantine_ms: snapshot.max_quarantine_ms,
+        }
+    }
+}
+
 pub(crate) enum BridgeRuntime {
     DirectTcpip(SshSessionPool),
     Agent(ReconnectingAgentBridge),
@@ -39,10 +83,10 @@ impl BridgeRuntime {
         }
     }
 
-    pub(crate) async fn agent_snapshot(&self) -> AgentBridgeSnapshot {
+    pub(crate) async fn snapshot(&self) -> DataPlaneRuntimeSnapshot {
         match self {
-            Self::DirectTcpip(_) | Self::QuicNative(_) => AgentBridgeSnapshot::default(),
-            Self::Agent(agent) => agent.snapshot().await,
+            Self::DirectTcpip(_) | Self::QuicNative(_) => DataPlaneRuntimeSnapshot::default(),
+            Self::Agent(agent) => agent.snapshot().await.into(),
         }
     }
 

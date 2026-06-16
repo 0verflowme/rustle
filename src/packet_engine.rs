@@ -8,11 +8,11 @@ use bytes::Bytes;
 use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc;
 
-use crate::agent_bridge::AgentBridgeSnapshot;
 use crate::data_plane::{
     bridge_admission_decision, spawn_dns_query, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, BridgeRuntime, DnsResponseEvent, DnsTransport, UdpAssociation,
-    UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey, UDP_DATAGRAMS_PER_ASSOCIATION,
+    BridgeAdmissionDecision, BridgeRuntime, DataPlaneRuntimeSnapshot, DnsResponseEvent,
+    DnsTransport, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
+    UDP_DATAGRAMS_PER_ASSOCIATION,
 };
 use crate::transport_model::Destination;
 use crate::{dns, ssh_bridge, tcp_core, DEFAULT_TUN_IP};
@@ -221,7 +221,7 @@ pub(crate) async fn run_tunnel_loop(
                         &remote_backlogs,
                         &dns_inflight,
                         &udp_inflight,
-                        bridge_runtime.agent_snapshot().await,
+                        bridge_runtime.snapshot().await,
                     )
                 );
                 return Ok(());
@@ -430,7 +430,7 @@ pub(crate) async fn run_tunnel_loop(
                         &remote_backlogs,
                         &dns_inflight,
                         &udp_inflight,
-                        bridge_runtime.agent_snapshot().await,
+                        bridge_runtime.snapshot().await,
                     )
                 );
             }
@@ -655,7 +655,7 @@ impl TunnelStats {
         remote_backlogs: &RemoteBacklogs,
         dns_inflight: &DnsInflight,
         udp_inflight: &DnsInflight,
-        agent: AgentBridgeSnapshot,
+        agent: DataPlaneRuntimeSnapshot,
     ) -> String {
         let avg_open_ms = if self.ssh_opened == 0 {
             0

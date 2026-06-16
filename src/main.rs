@@ -44,8 +44,8 @@ use agent_bridge::AgentBridgeConnector;
 use agent_bridge::{
     agent_host_lane_index, agent_lane_backoff_duration, agent_lane_bit, agent_lane_index,
     AgentBridgeCarrier, AgentBridgeConnectFuture, AgentBridgeConnectManyFuture,
-    AgentBridgeSnapshot, AgentBridgeTransport, AgentReconnectSnapshot, QuicNativeBridge,
-    ReconnectingAgentBridge, AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
+    AgentBridgeTransport, AgentReconnectSnapshot, QuicNativeBridge, ReconnectingAgentBridge,
+    AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
 #[cfg(test)]
 use bridge_lab::{
@@ -68,8 +68,8 @@ use data_plane::{
     bridge_admission_decision, query_dns_over_agent, query_dns_over_agent_udp,
     query_udp_over_agent, run_udp_association, run_udp_association_transport,
     send_dns_response_event, spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout,
-    BridgeAdmissionDecision, DnsResponseEvent, UdpAssociation, UdpAssociationEvents,
-    UdpAssociationTransport, UdpFlowKey,
+    BridgeAdmissionDecision, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot,
+    DnsResponseEvent, UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
 };
 use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
@@ -1479,8 +1479,8 @@ mod tests {
             &RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW),
             &DnsInflight::new(MAX_IN_FLIGHT_DNS_QUERIES),
             &DnsInflight::new(MAX_ACTIVE_UDP_ASSOCIATIONS),
-            AgentBridgeSnapshot {
-                reconnects: AgentReconnectSnapshot {
+            DataPlaneRuntimeSnapshot {
+                reconnects: DataPlaneReconnectSnapshot {
                     attempts: 5,
                     successes: 4,
                     failures: 1,
