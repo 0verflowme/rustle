@@ -13,7 +13,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tun_rs::DeviceBuilder;
 
-use crate::connect_bridge_runtime;
+use crate::control_plane::connect_bridge_runtime;
 use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
 use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, execute_udp_ingress_actions, expire_stale_flows,

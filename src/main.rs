@@ -3,9 +3,11 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 #[cfg(test)]
 use std::net::SocketAddr;
+#[cfg(test)]
 use std::time::{Duration, Instant as StdInstant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
+#[cfg(test)]
 use bytes::Bytes;
 #[cfg(test)]
 use bytes::BytesMut;
@@ -21,6 +23,7 @@ use tokio::sync::mpsc;
 mod agent_bridge;
 #[cfg(test)]
 mod agent_client;
+mod agent_lab;
 #[allow(dead_code)]
 mod agent_proto;
 mod agent_runtime;
@@ -31,6 +34,8 @@ mod cli;
 mod control_plane;
 mod data_plane;
 mod dns;
+mod helper_runtime;
+mod lab_support;
 mod packet_engine;
 mod platform;
 mod quic_agent;
@@ -42,7 +47,6 @@ mod supervisor;
 mod tcp_core;
 mod transport_model;
 
-use agent_bridge::AgentBridgeConnector;
 #[cfg(test)]
 use agent_bridge::{
     agent_host_lane_index, agent_lane_backoff_duration, agent_lane_bit, agent_lane_index,
@@ -50,6 +54,7 @@ use agent_bridge::{
     AgentBridgeTransport, AgentReconnectSnapshot, QuicNativeBridge, ReconnectingAgentBridge,
     AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
+use agent_lab::{run_agent_dns_lab, run_agent_lab, run_agent_udp_lab};
 use bridge_lab::run_bridge_lab;
 #[cfg(test)]
 use bridge_lab::{
@@ -57,24 +62,21 @@ use bridge_lab::{
     bridge_lab_response_complete, drain_lab_client_to_manager, pump_lab_manager_to_clients,
     route_lab_packets_to_clients, synthetic_lab_client, BridgeLabClient, BridgeLabLatencySummary,
 };
-use cli::{
-    AgentArgs, AgentDnsLabArgs, AgentLabArgs, AgentUdpLabArgs, Cli, CommandKind, CompactTunnelArgs,
-    DirectTcpipArgs, QuicAgentArgs, QuicBridgeAgentArgs,
-};
+use cli::{Cli, CommandKind, CompactTunnelArgs, DirectTcpipArgs};
 pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 #[cfg(test)]
 use control_plane::{
     connect_agent_bridge_transports_from_connector,
     connect_auto_agent_bridge_transports_from_connector,
 };
-use control_plane::{connect_bridge_runtime, SshAgentBridgeConnector};
-use data_plane::query_dns_over_transport;
 #[cfg(test)]
 use data_plane::{
-    query_dns_over_agent, query_dns_over_agent_udp, query_udp_over_agent, run_udp_association,
-    run_udp_association_transport, send_dns_response_event, spawn_agent_tcp_bridge,
-    spawn_udp_association_with_idle_timeout, UdpAssociationTransport,
+    query_dns_over_agent, query_dns_over_agent_udp, query_dns_over_transport, query_udp_over_agent,
+    run_udp_association, run_udp_association_transport, send_dns_response_event,
+    spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout, UdpAssociationTransport,
 };
+use helper_runtime::{run_agent, run_quic_agent, run_quic_bridge_agent};
+use lab_support::default_http_request;
 #[cfg(test)]
 use packet_engine::{
     drain_local_bytes_to_bridges, drop_unsupported_direct_udp, execute_udp_ingress_action,
@@ -85,7 +87,6 @@ use packet_engine::{
     MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
     REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
-use remote_helper::{agent_command_plan, bridge_agent_command_plan};
 #[cfg(test)]
 use remote_helper::{effective_agent_command, effective_bridge_agent_command};
 use ssh_control::connect_ssh;
@@ -114,6 +115,7 @@ use supervisor::{
     RouteCommandExecutor,
 };
 use supervisor::{run_tun_capture, run_tunnel};
+use transport_model::parse_destination;
 #[cfg(test)]
 use transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
@@ -121,7 +123,6 @@ use transport_model::{
     UdpAssociation, UdpAssociationEvents, UdpFlowKey, MAX_AGENT_ACTIVE_STREAMS,
     MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
 };
-use transport_model::{parse_destination, BridgeRuntimeOptions};
 #[cfg(test)]
 use transport_model::{BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION};
 
@@ -132,7 +133,6 @@ const DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS: u64 = 60_000;
 #[cfg(test)]
 const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
     Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
-const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;
 pub(crate) const DEFAULT_SSH_SESSIONS: usize = 4;
 pub(crate) const DEFAULT_AGENT_SESSIONS: usize = 1;
 
@@ -190,374 +190,6 @@ async fn main() -> Result<()> {
         Some(CommandKind::Agent(args)) => run_agent(args).await,
         None => run_compact_tunnel(cli.compact).await,
     }
-}
-
-async fn run_quic_agent(args: QuicAgentArgs) -> Result<()> {
-    let server = quic_agent::start_quic_agent_server(args.bind)?;
-    {
-        use std::io::Write;
-
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{}", server.bootstrap().encode_line())
-            .context("failed to write QUIC agent bootstrap line")?;
-        stdout
-            .flush()
-            .context("failed to flush QUIC agent bootstrap line")?;
-    }
-    eprintln!("quic-agent: listening on {}", server.local_addr()?);
-    server
-        .run_one(agent_runtime::AgentRuntimeConfig::new(args.mtu))
-        .await
-}
-
-async fn run_quic_bridge_agent(args: QuicBridgeAgentArgs) -> Result<()> {
-    let server = quic_agent::start_quic_bridge_server(args.bind)?;
-    {
-        use std::io::Write;
-
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{}", server.bootstrap().encode_bridge_line())
-            .context("failed to write native QUIC bridge bootstrap line")?;
-        stdout
-            .flush()
-            .context("failed to flush native QUIC bridge bootstrap line")?;
-    }
-    eprintln!("quic-bridge-agent: listening on {}", server.local_addr()?);
-    server.run().await
-}
-
-async fn run_agent(args: AgentArgs) -> Result<()> {
-    agent_runtime::run_stdio(agent_runtime::AgentRuntimeConfig::new(args.mtu)).await
-}
-
-async fn run_agent_lab(args: AgentLabArgs) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(15), run_agent_lab_inner(args))
-        .await
-        .context("agent lab timed out")?
-}
-
-async fn run_agent_lab_inner(args: AgentLabArgs) -> Result<()> {
-    let destination = parse_ipv4_destination(&args.destination)?;
-    let request = args
-        .request
-        .clone()
-        .unwrap_or_else(|| default_http_request(&destination.host));
-
-    let helper_plan =
-        agent_command_plan(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), helper_plan, args.mtu)?;
-    let agent_runtime = connector.connect_primary().await?;
-    let mut stream = agent_runtime
-        .transport()
-        .open_tcp_ipv4(agent_proto::AgentOpenIpv4 {
-            destination_ip: destination.ip,
-            destination_port: destination.port,
-            originator_ip: DEFAULT_TUN_IP,
-            originator_port: 49152,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "agent failed to open TCP stream to {}:{}",
-                destination.ip, destination.port
-            )
-        })?;
-    let stream_id = stream.stream_id();
-    stream
-        .send_data(Bytes::copy_from_slice(request.as_bytes()))
-        .await
-        .context("failed to send request through Rustle agent")?;
-    stream
-        .send_eof()
-        .await
-        .context("failed to send EOF through Rustle agent")?;
-
-    let mut response = Vec::new();
-    let mut saw_eof = false;
-    loop {
-        let frame = stream
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("agent stream closed before response"))?;
-        match frame.kind {
-            agent_proto::AgentFrameKind::Data => {
-                response.extend_from_slice(&frame.payload);
-            }
-            agent_proto::AgentFrameKind::Eof => {
-                saw_eof = true;
-            }
-            agent_proto::AgentFrameKind::Close => break,
-            agent_proto::AgentFrameKind::Reset => {
-                let message = String::from_utf8_lossy(&frame.payload);
-                bail!("agent reset stream {stream_id}: {message}");
-            }
-            other => bail!("unexpected Rustle agent frame {other:?}"),
-        }
-    }
-
-    if !saw_eof {
-        bail!("agent closed stream {stream_id} before EOF");
-    }
-
-    let mut stdout = io::stdout();
-    stdout
-        .write_all(&response)
-        .await
-        .context("failed to write agent response to stdout")?;
-    stdout.flush().await.context("failed to flush stdout")?;
-
-    let _ = stream.close().await;
-    agent_runtime.disconnect("agent-lab done").await?;
-    Ok(())
-}
-
-async fn run_agent_udp_lab(args: AgentUdpLabArgs) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), run_agent_udp_lab_inner(args))
-        .await
-        .context("agent UDP lab timed out")?
-}
-
-async fn run_agent_udp_lab_inner(args: AgentUdpLabArgs) -> Result<()> {
-    if args.messages == 0 {
-        bail!("agent-udp-lab --messages must be greater than zero");
-    }
-    if args.messages > MAX_AGENT_UDP_LAB_MESSAGES {
-        bail!(
-            "agent-udp-lab --messages must not exceed {}",
-            MAX_AGENT_UDP_LAB_MESSAGES
-        );
-    }
-    if args.pipeline == 0 {
-        bail!("agent-udp-lab --pipeline must be greater than zero");
-    }
-
-    let destination = parse_ipv4_destination(&args.destination)?;
-    let helper_plan =
-        agent_command_plan(args.agent_command.as_deref(), args.agent_path.as_deref())?;
-    let connector = SshAgentBridgeConnector::new(args.ssh.clone(), helper_plan, args.mtu)?;
-    let agent_runtime = connector.connect_primary().await?;
-    let mut stream = agent_runtime
-        .transport()
-        .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
-            destination_ip: destination.ip,
-            destination_port: destination.port,
-            originator_ip: DEFAULT_TUN_IP,
-            originator_port: 49152,
-        })
-        .await
-        .with_context(|| {
-            format!(
-                "agent failed to open UDP stream to {}:{}",
-                destination.ip, destination.port
-            )
-        })?;
-    let stream_id = stream.stream_id();
-    let request = Bytes::copy_from_slice(args.request.as_bytes());
-
-    let mut stdout = io::stdout();
-    let started_at = StdInstant::now();
-    let mut sent = 0_usize;
-    let mut received = 0_usize;
-    let mut response_bytes = 0_usize;
-    while received < args.messages {
-        while sent < args.messages && sent.saturating_sub(received) < args.pipeline {
-            stream
-                .send_data(request.clone())
-                .await
-                .context("failed to send UDP datagram through Rustle agent")?;
-            sent += 1;
-        }
-
-        let frame = stream
-            .recv()
-            .await
-            .ok_or_else(|| anyhow!("agent UDP stream closed before response"))?;
-        match frame.kind {
-            agent_proto::AgentFrameKind::Data => {
-                response_bytes = response_bytes.saturating_add(frame.payload.len());
-                if !args.summary {
-                    stdout
-                        .write_all(&frame.payload)
-                        .await
-                        .context("failed to write UDP response to stdout")?;
-                    stdout
-                        .write_all(b"\n")
-                        .await
-                        .context("failed to write UDP response separator to stdout")?;
-                }
-                received += 1;
-            }
-            agent_proto::AgentFrameKind::Close => break,
-            agent_proto::AgentFrameKind::Reset => {
-                let message = String::from_utf8_lossy(&frame.payload);
-                bail!("agent reset UDP stream {stream_id}: {message}");
-            }
-            other => bail!("unexpected Rustle agent UDP frame {other:?}"),
-        }
-    }
-
-    if received != args.messages {
-        bail!(
-            "agent UDP stream {stream_id} returned {received} responses, expected {}",
-            args.messages
-        );
-    }
-
-    let elapsed = started_at.elapsed();
-    if args.summary {
-        println!(
-            "agent_udp_lab_summary messages={} pipeline={} response_bytes={} elapsed_ms={}",
-            args.messages,
-            args.pipeline,
-            response_bytes,
-            elapsed.as_millis()
-        );
-    }
-
-    stdout.flush().await.context("failed to flush stdout")?;
-    let _ = stream.close().await;
-    agent_runtime.disconnect("agent-udp-lab done").await?;
-    Ok(())
-}
-
-async fn run_agent_dns_lab(args: AgentDnsLabArgs) -> Result<()> {
-    tokio::time::timeout(Duration::from_secs(60), run_agent_dns_lab_inner(args))
-        .await
-        .context("agent DNS lab timed out")?
-}
-
-async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
-    if args.queries == 0 {
-        bail!("agent-dns-lab --queries must be greater than zero");
-    }
-    if args.queries > MAX_AGENT_UDP_LAB_MESSAGES {
-        bail!(
-            "agent-dns-lab --queries must not exceed {}",
-            MAX_AGENT_UDP_LAB_MESSAGES
-        );
-    }
-
-    let dns_remote = parse_destination(&args.dns_remote)
-        .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
-    let helper_plan = bridge_agent_command_plan(
-        args.bridge_transport,
-        args.agent_command.as_deref(),
-        args.agent_path.as_deref(),
-    )?;
-    let (bridge_runtime, dns_transport) = connect_bridge_runtime(
-        &args.ssh,
-        args.bridge_transport,
-        helper_plan,
-        args.mtu,
-        Some(&dns_remote),
-        BridgeRuntimeOptions {
-            ssh_sessions: DEFAULT_SSH_SESSIONS,
-            agent_sessions: args.agent_sessions,
-            fast_start_auto_agent_lanes: false,
-        },
-    )
-    .await?;
-
-    let mut latencies_us = Vec::with_capacity(args.queries);
-    let mut response_bytes = 0_usize;
-    let started_at = StdInstant::now();
-    for index in 0..args.queries {
-        let id = 0x5200_u16.wrapping_add(index as u16);
-        let query = build_dns_a_query(id, &args.name)?;
-        let query_started = StdInstant::now();
-        let response =
-            query_dns_over_transport(dns_transport.clone(), &dns_remote, &query, DEFAULT_TUN_IP)
-                .await
-                .with_context(|| {
-                    format!("DNS query {} through Rustle transport failed", index + 1)
-                })?;
-        let elapsed = query_started.elapsed().as_micros();
-        validate_dns_response(&query, response.as_ref())
-            .with_context(|| format!("invalid DNS response for query {}", index + 1))?;
-        response_bytes = response_bytes.saturating_add(response.len());
-        latencies_us.push(elapsed);
-    }
-
-    let elapsed = started_at.elapsed();
-    latencies_us.sort_unstable();
-    let p50_us = percentile_nearest_rank(&latencies_us, 50);
-    let p95_us = percentile_nearest_rank(&latencies_us, 95);
-    let max_us = *latencies_us.last().unwrap_or(&0);
-    println!(
-        "agent_dns_lab_summary transport={:?} queries={} response_bytes={} elapsed_ms={} p50_us={} p95_us={} max_us={}",
-        args.bridge_transport,
-        args.queries,
-        response_bytes,
-        elapsed.as_millis(),
-        p50_us,
-        p95_us,
-        max_us,
-    );
-
-    drop(bridge_runtime);
-    Ok(())
-}
-
-fn build_dns_a_query(id: u16, name: &str) -> Result<Vec<u8>> {
-    let name = name.trim_end_matches('.');
-    if name.is_empty() {
-        bail!("DNS query name must not be empty");
-    }
-
-    let mut query = Vec::with_capacity(12 + name.len() + 6);
-    query.extend_from_slice(&id.to_be_bytes());
-    query.extend_from_slice(&0x0100_u16.to_be_bytes());
-    query.extend_from_slice(&1_u16.to_be_bytes());
-    query.extend_from_slice(&0_u16.to_be_bytes());
-    query.extend_from_slice(&0_u16.to_be_bytes());
-    query.extend_from_slice(&0_u16.to_be_bytes());
-
-    let mut qname_len = 1_usize;
-    for label in name.split('.') {
-        if label.is_empty() {
-            bail!("DNS query name contains an empty label: {name}");
-        }
-        if label.len() > 63 {
-            bail!("DNS label is too long in query name: {label}");
-        }
-        qname_len = qname_len
-            .checked_add(1 + label.len())
-            .ok_or_else(|| anyhow!("DNS query name is too long: {name}"))?;
-        if qname_len > 255 {
-            bail!("DNS query name is too long: {name}");
-        }
-        query.push(label.len() as u8);
-        query.extend_from_slice(label.as_bytes());
-    }
-    query.push(0);
-    query.extend_from_slice(&1_u16.to_be_bytes());
-    query.extend_from_slice(&1_u16.to_be_bytes());
-    Ok(query)
-}
-
-fn validate_dns_response(query: &[u8], response: &[u8]) -> Result<()> {
-    if query.len() < 2 || response.len() < 12 {
-        bail!("DNS response is too short");
-    }
-    if response[0..2] != query[0..2] {
-        bail!("DNS response ID does not match query ID");
-    }
-    let flags = u16::from_be_bytes([response[2], response[3]]);
-    if flags & 0x8000 == 0 {
-        bail!("DNS response is not marked as a response");
-    }
-    let rcode = flags & 0x000f;
-    if rcode != 0 {
-        bail!("DNS response returned rcode {rcode}");
-    }
-    Ok(())
-}
-
-pub(crate) fn percentile_nearest_rank(sorted: &[u128], percentile: usize) -> u128 {
-    debug_assert!(!sorted.is_empty());
-    let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
-    let index = rank.saturating_sub(1).min(sorted.len() - 1);
-    sorted[index]
 }
 
 async fn run_direct_tcpip(args: DirectTcpipArgs) -> Result<()> {
@@ -649,35 +281,13 @@ async fn run_compact_tunnel(args: CompactTunnelArgs) -> Result<()> {
     .await
 }
 
-#[derive(Debug)]
-pub(crate) struct Ipv4Destination {
-    pub(crate) host: String,
-    pub(crate) ip: Ipv4Addr,
-    pub(crate) port: u16,
-}
-
-pub(crate) fn parse_ipv4_destination(input: &str) -> Result<Ipv4Destination> {
-    let destination = parse_destination(input)?;
-    let ip = destination
-        .host
-        .parse::<Ipv4Addr>()
-        .with_context(|| format!("destination must use an IPv4 address for the MVP: {input}"))?;
-    Ok(Ipv4Destination {
-        host: destination.host,
-        ip,
-        port: destination.port,
-    })
-}
-
-pub(crate) fn default_http_request(host: &str) -> String {
-    format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_bridge::AgentBridgeConnector;
     use crate::packet_engine::MAX_IN_FLIGHT_DNS_QUERIES;
     use crate::{data_plane::DnsTransport, packet_engine::tun_ipv4_packet};
+    use anyhow::anyhow;
     use clap::CommandFactory;
     use ring::hmac;
     use russh::keys::{PrivateKey, PublicKey};

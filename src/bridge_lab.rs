@@ -13,6 +13,7 @@ use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::control_plane::connect_bridge_runtime;
+use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
     prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
@@ -20,9 +21,8 @@ use crate::packet_engine::{
 use crate::remote_helper::bridge_agent_command_plan;
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind};
 use crate::{
-    default_http_request, parse_ipv4_destination, percentile_nearest_rank, ssh_bridge, tcp_core,
-    SshArgs, DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP,
-    DEFAULT_TUN_PREFIX,
+    ssh_bridge, tcp_core, SshArgs, DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS,
+    DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX,
 };
 
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
