@@ -7,15 +7,14 @@ use tokio::io::{self, AsyncWriteExt};
 use crate::agent_bridge::AgentBridgeConnector;
 use crate::agent_proto;
 use crate::cli::{AgentDnsLabArgs, AgentLabArgs, AgentUdpLabArgs};
-use crate::control_plane::{connect_bridge_runtime, SshAgentBridgeConnector};
-use crate::data_plane::query_dns_over_transport;
+use crate::control_plane::{connect_tunnel_runtime, SshAgentBridgeConnector};
 use crate::defaults::{DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP};
 use crate::lab_support::{
     build_dns_a_query, default_http_request, parse_ipv4_destination, percentile_nearest_rank,
     validate_dns_response,
 };
 use crate::remote_helper::{agent_command_plan, bridge_agent_command_plan};
-use crate::transport_model::{parse_destination, BridgeRuntimeOptions};
+use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
 
 const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;
 
@@ -233,19 +232,20 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),
     )?;
-    let (bridge_runtime, dns_transport) = connect_bridge_runtime(
+    let runtime = connect_tunnel_runtime(
         &args.ssh,
         args.bridge_transport,
         helper_plan,
         args.mtu,
         Some(&dns_remote),
-        BridgeRuntimeOptions {
+        TunnelRuntimeOptions {
             ssh_sessions: DEFAULT_SSH_SESSIONS,
             agent_sessions: args.agent_sessions,
             fast_start_auto_agent_lanes: false,
         },
     )
     .await?;
+    let data_plane = runtime.data_plane();
 
     let mut latencies_us = Vec::with_capacity(args.queries);
     let mut response_bytes = 0_usize;
@@ -254,12 +254,14 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
         let id = 0x5200_u16.wrapping_add(index as u16);
         let query = build_dns_a_query(id, &args.name)?;
         let query_started = StdInstant::now();
-        let response =
-            query_dns_over_transport(dns_transport.clone(), &dns_remote, &query, DEFAULT_TUN_IP)
-                .await
-                .with_context(|| {
-                    format!("DNS query {} through Rustle transport failed", index + 1)
-                })?;
+        let response = data_plane
+            .query_dns(
+                dns_remote.clone(),
+                Bytes::copy_from_slice(&query),
+                DEFAULT_TUN_IP,
+            )
+            .await
+            .with_context(|| format!("DNS query {} through Rustle transport failed", index + 1))?;
         let elapsed = query_started.elapsed().as_micros();
         validate_dns_response(&query, response.as_ref())
             .with_context(|| format!("invalid DNS response for query {}", index + 1))?;
@@ -283,6 +285,5 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
         max_us,
     );
 
-    drop(bridge_runtime);
     Ok(())
 }

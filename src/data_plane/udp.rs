@@ -4,10 +4,10 @@ use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::agent_bridge::{QuicNativeBridge, ReconnectingAgentBridge};
 use crate::agent_proto;
 #[cfg(test)]
 use crate::agent_transport;
-use crate::bridge_runtime::UdpAssociationTransport;
 #[cfg(test)]
 use crate::dns;
 use crate::transport_model::{UdpAssociationEvents, UdpFlowKey};
@@ -17,7 +17,13 @@ use super::stream::AgentIoStream;
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) fn spawn_udp_association_with_idle_timeout(
+#[derive(Clone)]
+pub(super) enum UdpAssociationTransport {
+    Agent(ReconnectingAgentBridge),
+    QuicNative(QuicNativeBridge),
+}
+
+pub(super) fn spawn_udp_association_with_idle_timeout(
     transport: UdpAssociationTransport,
     key: UdpFlowKey,
     from_local: mpsc::Receiver<Bytes>,

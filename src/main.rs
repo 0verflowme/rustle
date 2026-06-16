@@ -11,7 +11,6 @@ mod agent_runtime;
 mod agent_transport;
 mod agent_window;
 mod bridge_lab;
-mod bridge_runtime;
 mod cli;
 mod command_runtime;
 mod control_plane;

@@ -12,7 +12,7 @@ use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::cli::BridgeLabArgs;
-use crate::control_plane::connect_bridge_runtime;
+use crate::control_plane::connect_tunnel_runtime;
 use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_PREFIX};
 use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
@@ -20,7 +20,7 @@ use crate::packet_engine::{
     prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
 use crate::remote_helper::bridge_agent_command_plan;
-use crate::transport_model::BridgeRuntimeOptions;
+use crate::transport_model::TunnelRuntimeOptions;
 use crate::{ssh_bridge, tcp_core};
 
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
@@ -167,19 +167,20 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),
     )?;
-    let (bridge_runtime, _) = connect_bridge_runtime(
+    let runtime = connect_tunnel_runtime(
         &args.ssh,
         args.bridge_transport,
         helper_plan,
         DEFAULT_MTU,
         None,
-        BridgeRuntimeOptions {
+        TunnelRuntimeOptions {
             ssh_sessions: args.ssh_sessions,
             agent_sessions: args.agent_sessions,
             fast_start_auto_agent_lanes: false,
         },
     )
     .await?;
+    let data_plane = runtime.data_plane();
 
     let mut flow_manager = tcp_core::FlowManager::new(
         args.tun_ip,
@@ -259,8 +260,8 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         ensure_bridges(
             &mut flow_manager,
             &mut bridges,
-            bridge_runtime.admission_limits(),
-            |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
+            data_plane.admission_limits(),
+            |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
             event_tx.clone(),
             &mut ready_flow_ids,
             now,

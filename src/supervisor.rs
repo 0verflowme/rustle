@@ -4,8 +4,8 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
 
-use crate::control_plane::{connect_bridge_runtime, validate_agent_session_request_count};
-use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
+use crate::control_plane::{connect_tunnel_runtime, validate_agent_session_request_count};
+use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
@@ -18,7 +18,7 @@ use crate::routing::{
 };
 use crate::ssh_control::validate_ssh_session_count;
 use crate::transport_model::{
-    parse_destination, BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsResponseEvent,
+    parse_destination, BridgeTransportKind, Destination, DnsResponseEvent, TunnelRuntimeOptions,
     UdpAssociationEvents,
 };
 use crate::tun_io::TunWriter;
@@ -93,21 +93,20 @@ impl PreparedTunnel {
         let tun_config = TunConfig::new(args.tun_ip, args.tun_prefix, args.mtu, args.name);
         let tun = open_tun(&tun_config)?;
 
-        let (bridge_runtime, _dns_transport) = connect_bridge_runtime(
+        let runtime = connect_tunnel_runtime(
             &args.ssh,
             args.bridge_transport,
             helper_plan,
             args.mtu,
             Some(&dns_remote),
-            BridgeRuntimeOptions {
+            TunnelRuntimeOptions {
                 ssh_sessions: args.ssh_sessions,
                 agent_sessions: args.agent_sessions,
                 fast_start_auto_agent_lanes: true,
             },
         )
         .await?;
-        let data_plane: Arc<dyn DataPlane> =
-            Arc::new(RuntimeDataPlane::from_bridge_runtime(bridge_runtime));
+        let data_plane = runtime.data_plane();
         let host = open_tunnel_host(TunnelHostConfig {
             tun_config,
             tun,

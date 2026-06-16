@@ -10,7 +10,6 @@ use super::{DataPlane, DataPlaneDnsFuture};
 use crate::agent_bridge::{QuicNativeBridge, ReconnectingAgentBridge};
 #[cfg(test)]
 use crate::agent_transport;
-use crate::bridge_runtime::DnsTransport;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{Destination, DnsResponseEvent};
 use crate::{agent_proto, dns, ssh_bridge};
@@ -50,23 +49,6 @@ pub(crate) fn send_dns_response_event(
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
-    }
-}
-
-pub(crate) async fn query_dns_over_transport(
-    transport: DnsTransport,
-    remote: &Destination,
-    query: &[u8],
-    originator_ip: Ipv4Addr,
-) -> Result<Bytes> {
-    match transport {
-        DnsTransport::DirectTcpip(ssh) => query_dns_over_ssh(ssh, remote, query).await,
-        DnsTransport::Agent(agent) => {
-            query_dns_over_reconnecting_agent(agent, remote, query, originator_ip).await
-        }
-        DnsTransport::QuicNative(bridge) => {
-            query_dns_over_quic_native(bridge, remote, query, originator_ip).await
-        }
     }
 }
 
@@ -608,8 +590,8 @@ mod tests {
         };
         let (bridge, bridge_task) = test_quic_native_bridge().await;
 
-        let response = query_dns_over_transport(
-            DnsTransport::QuicNative(bridge.clone()),
+        let response = query_dns_over_quic_native(
+            bridge.clone(),
             &remote,
             b"\x12\x34native-query",
             DEFAULT_TUN_IP,
@@ -726,8 +708,8 @@ mod tests {
         };
         let (bridge, bridge_task) = test_quic_native_bridge().await;
 
-        let response = query_dns_over_transport(
-            DnsTransport::QuicNative(bridge.clone()),
+        let response = query_dns_over_quic_native(
+            bridge.clone(),
             &remote,
             b"\xab\xcdnative-name-query",
             DEFAULT_TUN_IP,

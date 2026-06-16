@@ -10,7 +10,6 @@ use tokio::sync::mpsc;
 use crate::agent_bridge::{AgentBridgeSnapshot, QuicNativeBridge, ReconnectingAgentBridge};
 #[cfg(test)]
 use crate::agent_transport;
-use crate::bridge_runtime::{BridgeRuntime, UdpAssociationTransport};
 #[cfg(test)]
 use crate::quic_agent;
 use crate::ssh_control::SshSessionPool;
@@ -27,10 +26,11 @@ mod tcp;
 mod test_support;
 mod udp;
 
-pub(crate) use dns::{query_dns_over_transport, spawn_dns_query_on_data_plane};
+pub(crate) use dns::spawn_dns_query_on_data_plane;
 pub(crate) use tcp::spawn_agent_tcp_bridge;
 use tcp::{spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge};
-pub(crate) use udp::spawn_udp_association_with_idle_timeout;
+use udp::spawn_udp_association_with_idle_timeout;
+use udp::UdpAssociationTransport;
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
@@ -70,12 +70,16 @@ pub(crate) enum RuntimeDataPlane {
 }
 
 impl RuntimeDataPlane {
-    pub(crate) fn from_bridge_runtime(bridge: BridgeRuntime) -> Self {
-        match bridge {
-            BridgeRuntime::DirectTcpip(ssh) => Self::DirectTcpip(DirectTcpipDataPlane::new(ssh)),
-            BridgeRuntime::Agent(agent) => Self::FramedAgent(FramedAgentDataPlane::new(agent)),
-            BridgeRuntime::QuicNative(bridge) => Self::QuicNative(QuicNativeDataPlane::new(bridge)),
-        }
+    pub(crate) fn direct_tcpip(ssh: SshSessionPool) -> Self {
+        Self::DirectTcpip(DirectTcpipDataPlane::new(ssh))
+    }
+
+    pub(crate) fn framed_agent(agent: ReconnectingAgentBridge) -> Self {
+        Self::FramedAgent(FramedAgentDataPlane::new(agent))
+    }
+
+    pub(crate) fn quic_native(bridge: QuicNativeBridge) -> Self {
+        Self::QuicNative(QuicNativeDataPlane::new(bridge))
     }
 }
 
@@ -131,42 +135,6 @@ fn data_plane_runtime_snapshot_from_agent(
         active_streams: snapshot.active_streams,
         max_lane_load: snapshot.max_lane_load,
         max_quarantine_ms: snapshot.max_quarantine_ms,
-    }
-}
-
-impl BridgeRuntime {
-    pub(crate) fn admission_limits(&self) -> BridgeAdmissionLimits {
-        match self {
-            Self::DirectTcpip(_) => BridgeAdmissionLimits::direct_tcpip(),
-            Self::Agent(_) | Self::QuicNative(_) => BridgeAdmissionLimits::agent(),
-        }
-    }
-
-    pub(crate) fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge {
-        let flow = id.key;
-        match self {
-            Self::DirectTcpip(ssh) => spawn_direct_tcpip_bridge(id, event_tx, ssh.clone()),
-            Self::Agent(agent) => {
-                let agent = agent.clone();
-                eprintln!(
-                    "agent: opening stream {}:{} for local {}:{} generation={}",
-                    flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
-                );
-                spawn_agent_tcp_bridge(id, event_tx, agent)
-            }
-            Self::QuicNative(bridge) => {
-                let bridge = bridge.clone();
-                eprintln!(
-                    "quic-native: opening stream {}:{} for local {}:{} generation={}",
-                    flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
-                );
-                spawn_quic_native_tcp_bridge(id, event_tx, bridge)
-            }
-        }
     }
 }
 
@@ -499,7 +467,7 @@ mod tests {
                 ),
             ],
         );
-        let runtime = RuntimeDataPlane::from_bridge_runtime(BridgeRuntime::Agent(bridge.clone()));
+        let runtime = RuntimeDataPlane::framed_agent(bridge.clone());
 
         (runtime, bridge, agent_task)
     }
@@ -522,8 +490,7 @@ mod tests {
             .await
             .expect("connect native QUIC bridge");
         let bridge = QuicNativeBridge::detached(client);
-        let runtime =
-            RuntimeDataPlane::from_bridge_runtime(BridgeRuntime::QuicNative(bridge.clone()));
+        let runtime = RuntimeDataPlane::quic_native(bridge.clone());
 
         (runtime, bridge, bridge_task)
     }

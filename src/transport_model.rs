@@ -16,7 +16,7 @@ pub(crate) enum BridgeTransportKind {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct BridgeRuntimeOptions {
+pub(crate) struct TunnelRuntimeOptions {
     pub(crate) ssh_sessions: usize,
     pub(crate) agent_sessions: usize,
     pub(crate) fast_start_auto_agent_lanes: bool,

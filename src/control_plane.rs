@@ -8,12 +8,12 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport, ReconnectingAgentBridge,
 };
-use crate::bridge_runtime::{BridgeRuntime, DnsTransport};
+use crate::data_plane::{DataPlane, RuntimeDataPlane};
 use crate::remote_helper::{HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, Client, PreparedSshConnection,
 };
-use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destination};
+use crate::transport_model::{BridgeTransportKind, Destination, TunnelRuntimeOptions};
 use crate::{agent_proto, agent_transport, SshArgs};
 
 mod agent_startup;
@@ -29,6 +29,22 @@ use helper_startup::connect_prepared_helper_with_upload_fallback;
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) struct TunnelRuntime {
+    data_plane: Arc<dyn DataPlane>,
+}
+
+impl TunnelRuntime {
+    fn new(data_plane: RuntimeDataPlane) -> Self {
+        Self {
+            data_plane: Arc::new(data_plane),
+        }
+    }
+
+    pub(crate) fn data_plane(&self) -> Arc<dyn DataPlane> {
+        Arc::clone(&self.data_plane)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct SshAgentBridgeConnector {
@@ -129,21 +145,18 @@ async fn connect_agent_bridge_transport_on_handle(
     Ok(AgentBridgeTransport::ssh(handle, transport, agent_command))
 }
 
-pub(crate) async fn connect_bridge_runtime(
+pub(crate) async fn connect_tunnel_runtime(
     ssh: &SshArgs,
     requested: BridgeTransportKind,
     helper_plan: HelperCommandPlan,
     mtu: u16,
     dns_remote: Option<&Destination>,
-    options: BridgeRuntimeOptions,
-) -> Result<(BridgeRuntime, DnsTransport)> {
+    options: TunnelRuntimeOptions,
+) -> Result<TunnelRuntime> {
     match requested {
         BridgeTransportKind::DirectTcpip => {
             let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-            Ok((
-                BridgeRuntime::DirectTcpip(ssh.clone()),
-                DnsTransport::DirectTcpip(ssh),
-            ))
+            Ok(TunnelRuntime::new(RuntimeDataPlane::direct_tcpip(ssh)))
         }
         BridgeTransportKind::Agent => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
@@ -178,8 +191,7 @@ pub(crate) async fn connect_bridge_runtime(
                     desired_agent_sessions,
                 )
             };
-            let dns_transport = DnsTransport::Agent(agent.clone());
-            Ok((BridgeRuntime::Agent(agent), dns_transport))
+            Ok(TunnelRuntime::new(RuntimeDataPlane::framed_agent(agent)))
         }
         BridgeTransportKind::QuicAgent => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
@@ -193,15 +205,11 @@ pub(crate) async fn connect_bridge_runtime(
                 agent,
                 desired_agent_sessions,
             );
-            let dns_transport = DnsTransport::Agent(agent.clone());
-            Ok((BridgeRuntime::Agent(agent), dns_transport))
+            Ok(TunnelRuntime::new(RuntimeDataPlane::framed_agent(agent)))
         }
         BridgeTransportKind::QuicNative => {
             let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
-            Ok((
-                BridgeRuntime::QuicNative(bridge.clone()),
-                DnsTransport::QuicNative(bridge),
-            ))
+            Ok(TunnelRuntime::new(RuntimeDataPlane::quic_native(bridge)))
         }
         BridgeTransportKind::Auto => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
@@ -228,10 +236,7 @@ pub(crate) async fn connect_bridge_runtime(
                             "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
                         );
                         let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                        return Ok((
-                            BridgeRuntime::DirectTcpip(ssh.clone()),
-                            DnsTransport::DirectTcpip(ssh),
-                        ));
+                        return Ok(TunnelRuntime::new(RuntimeDataPlane::direct_tcpip(ssh)));
                     }
                     eprintln!("transport: auto selected agent");
                     let agent = if fast_start_agent_lanes {
@@ -248,18 +253,14 @@ pub(crate) async fn connect_bridge_runtime(
                             desired_agent_sessions,
                         )
                     };
-                    let dns_transport = DnsTransport::Agent(agent.clone());
-                    Ok((BridgeRuntime::Agent(agent), dns_transport))
+                    Ok(TunnelRuntime::new(RuntimeDataPlane::framed_agent(agent)))
                 }
                 Err(err) => {
                     eprintln!(
                         "transport: auto could not start agent ({err:#}); falling back to direct-tcpip"
                     );
                     let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                    Ok((
-                        BridgeRuntime::DirectTcpip(ssh.clone()),
-                        DnsTransport::DirectTcpip(ssh),
-                    ))
+                    Ok(TunnelRuntime::new(RuntimeDataPlane::direct_tcpip(ssh)))
                 }
             }
         }
