@@ -11,7 +11,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Bytes, BytesMut};
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use ipnet::Ipv4Net;
 use ring::{digest, hmac};
 use russh::client::{self, AuthResult, Config, Handle, Handler};
@@ -34,12 +34,18 @@ mod agent_proto;
 mod agent_runtime;
 mod agent_transport;
 mod agent_window;
+mod data_plane;
 mod dns;
 mod platform;
 mod quic_agent;
 mod ssh_bridge;
 #[allow(dead_code)]
 mod tcp_core;
+
+use data_plane::{
+    bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
+    BridgeRuntimeOptions, BridgeTransportKind,
+};
 
 const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 const DEFAULT_TUN_PREFIX: u8 = 24;
@@ -66,10 +72,6 @@ const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
 const UDP_CLOSE_EVENT_CHANNEL_DEPTH: usize = MAX_ACTIVE_UDP_ASSOCIATIONS;
 const _: () = assert!(DNS_EVENT_CHANNEL_DEPTH >= MAX_IN_FLIGHT_DNS_QUERIES);
 const _: () = assert!(UDP_CLOSE_EVENT_CHANNEL_DEPTH >= MAX_ACTIVE_UDP_ASSOCIATIONS);
-const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
-const MAX_DIRECT_OPENING_CHANNELS: usize = 32;
-const MAX_AGENT_ACTIVE_STREAMS: usize = tcp_core::DEFAULT_MAX_ACTIVE_FLOWS;
-const MAX_AGENT_OPENING_STREAMS: usize = 128;
 const DEFAULT_SSH_SESSIONS: usize = 4;
 const MAX_SSH_SESSIONS: usize = 16;
 const AUTO_AGENT_SESSIONS: usize = 0;
@@ -447,22 +449,6 @@ struct BridgeLabArgs {
     /// Number of Rustle agent exec transports to open for flow hashing.
     #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
     agent_sessions: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum BridgeTransportKind {
-    Auto,
-    DirectTcpip,
-    Agent,
-    QuicAgent,
-    QuicNative,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct BridgeRuntimeOptions {
-    ssh_sessions: usize,
-    agent_sessions: usize,
-    fast_start_auto_agent_lanes: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -5048,49 +5034,6 @@ impl QuicNativeBridge {
         open: agent_proto::AgentOpenHost,
     ) -> Result<quic_agent::QuicBridgeStream> {
         self.client.open_tcp_host(open).await
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct BridgeAdmissionLimits {
-    active: usize,
-    opening: usize,
-}
-
-impl BridgeAdmissionLimits {
-    const fn direct_tcpip() -> Self {
-        Self {
-            active: MAX_DIRECT_ACTIVE_CHANNELS,
-            opening: MAX_DIRECT_OPENING_CHANNELS,
-        }
-    }
-
-    const fn agent() -> Self {
-        Self {
-            active: MAX_AGENT_ACTIVE_STREAMS,
-            opening: MAX_AGENT_OPENING_STREAMS,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BridgeAdmissionDecision {
-    Admit,
-    DeferActive,
-    DeferOpening,
-}
-
-fn bridge_admission_decision(
-    active: usize,
-    opening: usize,
-    limits: BridgeAdmissionLimits,
-) -> BridgeAdmissionDecision {
-    if active >= limits.active {
-        BridgeAdmissionDecision::DeferActive
-    } else if opening >= limits.opening {
-        BridgeAdmissionDecision::DeferOpening
-    } else {
-        BridgeAdmissionDecision::Admit
     }
 }
 
@@ -13151,6 +13094,8 @@ mod tests {
 
     #[test]
     fn agent_bridge_admission_budget_exceeds_direct_tcpip_channel_budget() {
+        use data_plane::{MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS};
+
         let direct = BridgeAdmissionLimits::direct_tcpip();
         let agent = BridgeAdmissionLimits::agent();
 
@@ -13163,6 +13108,10 @@ mod tests {
 
     #[test]
     fn bridge_admission_decision_uses_transport_specific_opening_budget() {
+        use data_plane::{
+            MAX_AGENT_ACTIVE_STREAMS, MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_OPENING_CHANNELS,
+        };
+
         let direct = BridgeAdmissionLimits::direct_tcpip();
         let agent = BridgeAdmissionLimits::agent();
 
