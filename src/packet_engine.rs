@@ -16,14 +16,24 @@ use crate::data_plane::{
     UDP_DATAGRAMS_PER_ASSOCIATION,
 };
 use crate::{
-    agent_proto, dns, quic_agent, shutdown_signal, smol_now, ssh_bridge, tcp_core,
-    AGENT_PRE_OPEN_RETRY_LIMIT, DEFAULT_TUN_IP, DNS_EVENT_CHANNEL_DEPTH,
-    MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, REMOTE_BACKLOG_BYTES_PER_FLOW,
-    REMOTE_BACKLOG_BYTES_TOTAL, REMOTE_CLOSE_DEFER_FLUSHES, STATS_LOG_INTERVAL,
-    UDP_CLOSE_EVENT_CHANNEL_DEPTH, UDP_RESPONSE_EVENT_CHANNEL_DEPTH,
+    agent_proto, dns, quic_agent, shutdown_signal, smol_now, ssh_bridge, tcp_core, DEFAULT_TUN_IP,
 };
 
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;
+pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
+pub(crate) const REMOTE_BACKLOG_BYTES_PER_FLOW: usize =
+    tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW;
+pub(crate) const REMOTE_BACKLOG_BYTES_TOTAL: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_IN_FLIGHT_DNS_QUERIES: usize = 128;
+pub(crate) const MAX_ACTIVE_UDP_ASSOCIATIONS: usize = 512;
+const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
+const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
+const UDP_CLOSE_EVENT_CHANNEL_DEPTH: usize = MAX_ACTIVE_UDP_ASSOCIATIONS;
+const _: () = assert!(DNS_EVENT_CHANNEL_DEPTH >= MAX_IN_FLIGHT_DNS_QUERIES);
+const _: () = assert!(UDP_CLOSE_EVENT_CHANNEL_DEPTH >= MAX_ACTIVE_UDP_ASSOCIATIONS);
+const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
+const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
 const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
