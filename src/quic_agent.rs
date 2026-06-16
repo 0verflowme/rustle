@@ -15,8 +15,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::agent_proto::{AgentOpenHost, AgentOpenIpv4};
-use crate::agent_runtime::{self, AgentRuntimeConfig};
-use crate::agent_transport::AgentTransport;
 
 pub const QUIC_AGENT_SERVER_NAME: &str = "rustle-agent";
 pub const QUIC_AGENT_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_AGENT_V1";
@@ -183,7 +181,9 @@ impl QuicAgentServer {
         &self.bootstrap
     }
 
-    pub async fn run_one(self, config: AgentRuntimeConfig) -> Result<()> {
+    pub async fn accept_agent_stream(
+        self,
+    ) -> Result<(quinn::RecvStream, quinn::SendStream, QuicAgentSession)> {
         let incoming =
             self.endpoint.accept().await.ok_or_else(|| {
                 anyhow!("QUIC agent endpoint closed before accepting a connection")
@@ -191,7 +191,18 @@ impl QuicAgentServer {
         let connection = incoming
             .await
             .context("failed to accept QUIC agent connection")?;
-        run_agent_on_connection(connection, config).await
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .context("failed to accept QUIC agent stream")?;
+        Ok((
+            recv,
+            send,
+            QuicAgentSession {
+                _endpoint: self.endpoint,
+                connection,
+            },
+        ))
     }
 }
 
@@ -218,19 +229,14 @@ impl QuicBridgeServer {
     }
 }
 
-pub struct QuicAgentClient {
-    session: QuicAgentSession,
-    pub transport: AgentTransport,
-}
-
 pub struct QuicAgentSession {
     _endpoint: Endpoint,
-    _connection: Connection,
+    connection: Connection,
 }
 
-impl QuicAgentClient {
-    pub fn into_transport_and_session(self) -> (AgentTransport, QuicAgentSession) {
-        (self.transport, self.session)
+impl QuicAgentSession {
+    pub(crate) fn close(&self, code: u32, reason: &[u8]) {
+        self.connection.close(code.into(), reason);
     }
 }
 
@@ -296,11 +302,10 @@ pub fn start_quic_bridge_server(bind: SocketAddr) -> Result<QuicBridgeServer> {
     })
 }
 
-pub async fn connect_quic_agent(
+pub async fn connect_quic_agent_stream(
     remote: SocketAddr,
     bootstrap: &QuicAgentBootstrap,
-    mtu: u16,
-) -> Result<QuicAgentClient> {
+) -> Result<(quinn::RecvStream, quinn::SendStream, QuicAgentSession)> {
     let mut endpoint = quic_client_endpoint(remote).context("failed to bind QUIC client")?;
     endpoint.set_default_client_config(quic_client_config(bootstrap)?);
     let connection = endpoint
@@ -312,16 +317,14 @@ pub async fn connect_quic_agent(
         .open_bi()
         .await
         .context("failed to open QUIC agent stream")?;
-    let transport = AgentTransport::connect(recv, send, mtu)
-        .await
-        .context("failed to negotiate Rustle agent protocol over QUIC")?;
-    Ok(QuicAgentClient {
-        session: QuicAgentSession {
+    Ok((
+        recv,
+        send,
+        QuicAgentSession {
             _endpoint: endpoint,
-            _connection: connection,
+            connection,
         },
-        transport,
-    })
+    ))
 }
 
 pub async fn connect_quic_bridge(
@@ -503,16 +506,6 @@ impl QuicBridgeStream {
         self.wait_opened().await?;
         read_quic_bridge_datagram(&mut self.recv).await
     }
-}
-
-async fn run_agent_on_connection(connection: Connection, config: AgentRuntimeConfig) -> Result<()> {
-    let (send, recv) = connection
-        .accept_bi()
-        .await
-        .context("failed to accept QUIC agent stream")?;
-    let result = agent_runtime::run(recv, send, config).await;
-    connection.close(0_u32.into(), b"rustle agent complete");
-    result.context("QUIC agent runtime failed")
 }
 
 async fn run_bridge_on_connection(connection: Connection) -> Result<()> {
@@ -1096,82 +1089,6 @@ mod tests {
         header[0] = b'X';
 
         assert!(decode_quic_bridge_open_header(&header).is_err());
-    }
-
-    #[tokio::test]
-    async fn quic_agent_transport_round_trips_tcp_stream() {
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind TCP echo listener");
-        let destination = listener.local_addr().expect("listener address");
-        let server_task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
-            let mut request = [0_u8; 4];
-            tokio::io::AsyncReadExt::read_exact(&mut socket, &mut request)
-                .await
-                .expect("read request");
-            tokio::io::AsyncWriteExt::write_all(&mut socket, b"quic:")
-                .await
-                .expect("write prefix");
-            tokio::io::AsyncWriteExt::write_all(&mut socket, &request)
-                .await
-                .expect("write response");
-        });
-
-        let quic_server =
-            start_quic_agent_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
-                .expect("start QUIC agent");
-        let quic_addr = quic_server.local_addr().expect("QUIC local address");
-        let bootstrap = quic_server.bootstrap().clone();
-        let agent_task = tokio::spawn(async move {
-            quic_server
-                .run_one(AgentRuntimeConfig::new(1300))
-                .await
-                .expect("run QUIC agent")
-        });
-
-        let client = connect_quic_agent(quic_addr, &bootstrap, 1300)
-            .await
-            .expect("connect QUIC agent");
-        let SocketAddr::V4(destination) = destination else {
-            panic!("test destination should be IPv4");
-        };
-        let mut stream = client
-            .transport
-            .open_tcp_ipv4(AgentOpenIpv4 {
-                destination_ip: *destination.ip(),
-                destination_port: destination.port(),
-                originator_ip: Ipv4Addr::new(10, 255, 255, 1),
-                originator_port: 49152,
-            })
-            .await
-            .expect("open remote TCP stream");
-        stream
-            .send_data(bytes::Bytes::from_static(b"ping"))
-            .await
-            .expect("send request");
-        stream.send_eof().await.expect("send EOF");
-
-        let mut response = Vec::new();
-        while let Some(frame) = stream.recv().await {
-            match frame.kind {
-                crate::agent_proto::AgentFrameKind::Data => {
-                    response.extend_from_slice(frame.payload.as_ref());
-                }
-                crate::agent_proto::AgentFrameKind::Eof
-                | crate::agent_proto::AgentFrameKind::Close => break,
-                crate::agent_proto::AgentFrameKind::Reset => {
-                    panic!("stream reset: {}", String::from_utf8_lossy(&frame.payload));
-                }
-                _ => {}
-            }
-        }
-
-        assert_eq!(response, b"quic:ping");
-        stream.close().await.expect("close stream");
-        drop(client);
-        agent_task.await.expect("agent task");
-        server_task.await.expect("TCP server task");
     }
 
     #[tokio::test]

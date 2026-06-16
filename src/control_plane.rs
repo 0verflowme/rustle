@@ -16,7 +16,7 @@ use crate::ssh_control::{
     resolve_agent_session_count, resolve_ssh_target, Client, PreparedSshConnection,
 };
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destination};
-use crate::{agent_proto, agent_transport, quic_agent, SshArgs};
+use crate::{agent_proto, agent_transport, quic_agent, quic_agent_runtime, SshArgs};
 
 mod agent_startup;
 
@@ -279,7 +279,7 @@ async fn connect_quic_agent_bridge_transport_on_handle(
     );
 
     let drain_task = tokio::spawn(drain_quic_agent_ssh_output(reader));
-    let client = quic_agent::connect_quic_agent(remote_addr, &bootstrap, mtu).await?;
+    let client = quic_agent_runtime::connect_quic_agent(remote_addr, &bootstrap, mtu).await?;
     let (transport, session) = client.into_transport_and_session();
 
     Ok(AgentBridgeTransport::quic(

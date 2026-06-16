@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::cli::{AgentArgs, QuicAgentArgs, QuicBridgeAgentArgs};
-use crate::{agent_runtime, quic_agent};
+use crate::{agent_runtime, quic_agent, quic_agent_runtime};
 
 pub(crate) async fn run_agent(args: AgentArgs) -> Result<()> {
     agent_runtime::run_stdio(agent_runtime::AgentRuntimeConfig::new(args.mtu)).await
@@ -20,9 +20,7 @@ pub(crate) async fn run_quic_agent(args: QuicAgentArgs) -> Result<()> {
             .context("failed to flush QUIC agent bootstrap line")?;
     }
     eprintln!("quic-agent: listening on {}", server.local_addr()?);
-    server
-        .run_one(agent_runtime::AgentRuntimeConfig::new(args.mtu))
-        .await
+    quic_agent_runtime::run_one(server, agent_runtime::AgentRuntimeConfig::new(args.mtu)).await
 }
 
 pub(crate) async fn run_quic_bridge_agent(args: QuicBridgeAgentArgs) -> Result<()> {

@@ -40,6 +40,7 @@ mod lab_support;
 mod packet_engine;
 mod platform;
 mod quic_agent;
+mod quic_agent_runtime;
 mod remote_helper;
 mod routing;
 mod ssh_bridge;
