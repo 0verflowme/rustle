@@ -6,6 +6,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::control_plane::connect_bridge_runtime;
 use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane, RuntimeDataPlane};
+use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
     TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
@@ -26,7 +27,7 @@ use crate::tunnel_lifecycle::{
     open_tun, open_tunnel_host, shutdown_signal, ShutdownSignalFuture, TunConfig, TunnelCleanup,
     TunnelHostConfig,
 };
-use crate::{platform, tcp_core, TunCaptureArgs, TunnelArgs, DEFAULT_TUN_IP};
+use crate::{platform, tcp_core, TunCaptureArgs, TunnelArgs};
 
 const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
 const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
@@ -553,8 +554,8 @@ mod tests {
 
     use super::*;
     use crate::cli::{Cli, CommandKind};
+    use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
     use crate::transport_model::BridgeTransportKind;
-    use crate::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
 
     #[test]
     fn parse_ipv4_metadata_accepts_minimal_header() {

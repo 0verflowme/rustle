@@ -7,7 +7,8 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport, QuicNativeBridge, ReconnectingAgentBridge,
 };
-use crate::{agent_runtime, agent_transport, quic_agent, DEFAULT_MTU};
+use crate::defaults::DEFAULT_MTU;
+use crate::{agent_runtime, agent_transport, quic_agent};
 
 pub(crate) async fn test_agent_transport() -> (
     agent_transport::AgentTransport,

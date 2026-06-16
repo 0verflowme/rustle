@@ -10,7 +10,8 @@ use super::{
     AgentBridgeTransport, AgentReconnectSnapshot, ReconnectingAgentBridge,
 };
 use crate::control_plane::connect_agent_bridge_transports_from_connector;
-use crate::{agent_proto, agent_runtime, agent_transport, DEFAULT_MTU};
+use crate::defaults::DEFAULT_MTU;
+use crate::{agent_proto, agent_runtime, agent_transport};
 
 pub(crate) async fn agent_transport_pair() -> (
     agent_transport::AgentTransport,

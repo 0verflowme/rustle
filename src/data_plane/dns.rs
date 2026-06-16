@@ -439,9 +439,9 @@ async fn query_dns_over_agent_udp_stream(mut stream: AgentIoStream, query: &[u8]
 mod tests {
     use super::super::test_support::{test_agent_transport, test_quic_native_bridge};
     use super::*;
+    use crate::defaults::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
     use crate::dns as dns_proto;
     use crate::supervisor::virtual_dns_ip;
-    use crate::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]

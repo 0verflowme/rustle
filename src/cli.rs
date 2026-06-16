@@ -4,13 +4,13 @@ use std::path::PathBuf;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use ipnet::Ipv4Net;
 
-use crate::routing::parse_target_cidr;
-use crate::ssh_control::DEFAULT_SSH_CONNECT_TIMEOUT_SECS;
-use crate::transport_model::{BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION};
-use crate::{
+use crate::defaults::{
     DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX,
     DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
 };
+use crate::routing::parse_target_cidr;
+use crate::ssh_control::DEFAULT_SSH_CONNECT_TIMEOUT_SECS;
+use crate::transport_model::{BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION};
 
 #[derive(Debug, Parser)]
 #[command(name = "rustle", about = "User-space SSH network pivot")]
@@ -504,9 +504,9 @@ mod tests {
     use ipnet::Ipv4Net;
 
     use super::{Cli, CommandKind};
+    use crate::defaults::{DEFAULT_AGENT_SESSIONS, DEFAULT_SSH_SESSIONS};
     use crate::remote_helper::{effective_agent_command, effective_bridge_agent_command};
     use crate::transport_model::BridgeTransportKind;
-    use crate::{DEFAULT_AGENT_SESSIONS, DEFAULT_SSH_SESSIONS};
 
     #[test]
     fn compact_cli_accepts_multiple_targets_like_sshuttle() {

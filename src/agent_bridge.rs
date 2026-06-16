@@ -1065,3 +1065,6 @@ impl ReconnectingAgentBridge {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

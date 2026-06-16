@@ -153,6 +153,11 @@ async fn connect_additional_agent_bridge_transport_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::agent_bridge::{
+        test_support::{agent_transport_pair, wait_for_reconnect_snapshot, QueuedAgentConnector},
+        AgentReconnectSnapshot, ReconnectingAgentBridge,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct PanicConnector {
@@ -235,5 +240,230 @@ mod tests {
 
         assert!(results.is_empty());
         assert_eq!(connector.connect_command_count(), 0);
+    }
+    #[tokio::test]
+    async fn agent_initial_startup_reuses_first_effective_command_for_extra_lanes() {
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let connector = QueuedAgentConnector::new(
+            "rustle agent",
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
+            vec![
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+            ],
+        );
+
+        let transports = connector
+            .connect_initial(3)
+            .await
+            .expect("connect initial lanes");
+        assert_eq!(transports.len(), 3);
+        assert_eq!(
+            transports
+                .iter()
+                .map(|transport| transport.agent_command())
+                .collect::<Vec<_>>(),
+            vec![
+                "/tmp/rustle-uploaded agent",
+                "/tmp/rustle-uploaded agent",
+                "/tmp/rustle-uploaded agent",
+            ]
+        );
+        assert_eq!(
+            connector.command_requests(),
+            vec![
+                "/tmp/rustle-uploaded agent".to_owned(),
+                "/tmp/rustle-uploaded agent".to_owned(),
+            ]
+        );
+
+        drop(transports);
+        for agent in [first_agent, second_agent, third_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_agent_startup_returns_after_primary_and_warms_extra_lanes() {
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let connector = QueuedAgentConnector::new(
+            "rustle agent",
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
+            vec![
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+            ],
+        );
+
+        let transports = connect_auto_agent_bridge_transports_from_connector(connector.as_ref(), 3)
+            .await
+            .expect("auto startup connects primary lane");
+        assert_eq!(transports.len(), 1);
+        assert!(
+            connector.command_requests().is_empty(),
+            "auto startup must not wait for extra lane commands before returning"
+        );
+
+        let bridge =
+            ReconnectingAgentBridge::new_with_desired_lanes(connector.clone(), transports, 3);
+        wait_for_reconnect_snapshot(
+            &bridge,
+            AgentReconnectSnapshot {
+                attempts: 2,
+                successes: 2,
+                failures: 0,
+            },
+        )
+        .await;
+        assert_eq!(
+            connector.command_requests(),
+            vec![
+                "/tmp/rustle-uploaded agent".to_owned(),
+                "/tmp/rustle-uploaded agent".to_owned(),
+            ]
+        );
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(snapshot.lanes_total, 3);
+        assert_eq!(snapshot.lanes_desired, 3);
+        assert_eq!(snapshot.lanes_available, 3);
+        assert_eq!(snapshot.lanes_missing, 0);
+        assert_eq!(snapshot.lanes_repairing, 0);
+
+        drop(bridge);
+        for agent in [first_agent, second_agent, third_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_initial_startup_keeps_successful_extra_lanes_after_extra_failure() {
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let connector = QueuedAgentConnector::new_with_failures(
+            "rustle agent",
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
+            vec![
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let transports = connector
+            .connect_initial(4)
+            .await
+            .expect("connect initial lanes despite one extra-lane failure");
+        assert_eq!(transports.len(), 3);
+        let command_requests = connector.command_requests();
+        assert_eq!(command_requests.len(), 4);
+        assert!(command_requests
+            .iter()
+            .all(|command| command == "/tmp/rustle-uploaded agent"));
+
+        let bridge = ReconnectingAgentBridge::new_with_desired_lanes(connector, transports, 4);
+        let snapshot = bridge.snapshot().await;
+        assert_eq!(snapshot.lanes_total, 4);
+        assert_eq!(snapshot.lanes_desired, 4);
+
+        drop(bridge);
+        for agent in [first_agent, second_agent, third_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_initial_startup_retries_missing_extra_lanes_after_transient_failure() {
+        let (first_transport, first_agent) = agent_transport_pair().await;
+        let (second_transport, second_agent) = agent_transport_pair().await;
+        let (third_transport, third_agent) = agent_transport_pair().await;
+        let (fourth_transport, fourth_agent) = agent_transport_pair().await;
+        let connector = QueuedAgentConnector::new_with_failures(
+            "rustle agent",
+            vec![AgentBridgeTransport::detached_for_test(
+                first_transport,
+                "/tmp/rustle-uploaded agent".to_owned(),
+            )],
+            vec![
+                AgentBridgeTransport::detached_for_test(
+                    second_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    third_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+                AgentBridgeTransport::detached_for_test(
+                    fourth_transport,
+                    "/tmp/rustle-uploaded agent".to_owned(),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let transports = connector
+            .connect_initial(4)
+            .await
+            .expect("retry missing startup lane after transient failure");
+        assert_eq!(transports.len(), 4);
+        let command_requests = connector.command_requests();
+        assert_eq!(command_requests.len(), 4);
+        assert!(command_requests
+            .iter()
+            .all(|command| command == "/tmp/rustle-uploaded agent"));
+
+        drop(transports);
+        for agent in [first_agent, second_agent, third_agent, fourth_agent] {
+            tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+                .await
+                .expect("agent exits")
+                .expect("agent join")
+                .expect("agent run");
+        }
     }
 }

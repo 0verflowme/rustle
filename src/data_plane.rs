@@ -479,14 +479,14 @@ mod tests {
         let agent_task = tokio::spawn(crate::agent_runtime::run(
             agent_reader,
             agent_writer,
-            crate::agent_runtime::AgentRuntimeConfig::new(crate::DEFAULT_MTU),
+            crate::agent_runtime::AgentRuntimeConfig::new(crate::defaults::DEFAULT_MTU),
         ));
 
         let (client_reader, client_writer) = tokio::io::split(client_io);
         let transport = agent_transport::AgentTransport::connect(
             client_reader,
             client_writer,
-            crate::DEFAULT_MTU,
+            crate::defaults::DEFAULT_MTU,
         )
         .await
         .expect("connect agent transport");

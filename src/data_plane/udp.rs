@@ -231,10 +231,10 @@ mod tests {
         detached_reconnecting_agent_bridge, test_agent_transport, test_quic_native_bridge,
     };
     use super::*;
+    use crate::defaults::DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS;
     use crate::dns as dns_proto;
     use crate::packet_engine::DnsInflight;
     use crate::transport_model::{UdpAssociation, UDP_DATAGRAMS_PER_ASSOCIATION};
-    use crate::DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS;
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
 

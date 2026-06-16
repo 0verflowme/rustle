@@ -1273,7 +1273,8 @@ mod tests {
 
     use super::*;
     use crate::cli::Cli;
-    use crate::{tcp_core, SshArgs, DEFAULT_SSH_SESSIONS};
+    use crate::defaults::DEFAULT_SSH_SESSIONS;
+    use crate::{tcp_core, SshArgs};
 
     const TEST_ED25519_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/XFSqti";

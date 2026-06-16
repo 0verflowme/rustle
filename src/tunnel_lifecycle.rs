@@ -11,13 +11,14 @@ use tokio::sync::Semaphore;
 use tun_rs::DeviceBuilder;
 
 use crate::data_plane::DataPlane;
+use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::MAX_IN_FLIGHT_DNS_QUERIES;
 use crate::routing::{
     add_ssh_control_route, add_target_routes, prefix_to_mask, target_route_parts,
     ControlRouteGuard, RouteGuard,
 };
 use crate::transport_model::Destination;
-use crate::{dns, platform, tcp_core, DEFAULT_TUN_IP};
+use crate::{dns, platform, tcp_core};
 
 pub(crate) type ShutdownSignalFuture = Pin<Box<dyn Future<Output = Result<&'static str>> + Send>>;
 

@@ -42,9 +42,11 @@ MOD_TEST_RE = re.compile(r"^\s*mod\s+tests\s*\{")
 MOD_RE = re.compile(r"^\s*(?:pub\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;")
 CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:::<[^>]+>)?\s*\(")
 PATH_CALL_RE = re.compile(
-    r"\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*(?:::<[^>]+>)?\s*\("
+    r"(?=\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\s*(?:::<[^>]+>)?\s*\()"
 )
-PATH_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\b")
+PATH_REF_RE = re.compile(
+    r"(?=\b([A-Za-z_][A-Za-z0-9_]*)::([A-Za-z_][A-Za-z0-9_]*)\b)"
+)
 METHOD_CALL_RE = re.compile(r"\.([A-Za-z_][A-Za-z0-9_]*)\s*(?:::<[^>]+>)?\s*\(")
 TOKEN_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 SCRIPT_REF_RE = re.compile(r"(?:scripts/)?([A-Za-z0-9_.-]+\.(?:sh|py|ps1))")

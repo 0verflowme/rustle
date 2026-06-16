@@ -579,3 +579,149 @@ async fn report_agent_stream_opened(
         .unwrap_or(u64::MAX);
     ssh_bridge::send_bridge_event(event_tx, ssh_bridge::BridgeEvent::Opened { id, open_ms }).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_bridge::{
+        test_support::{detached_bridge_transport, QueuedAgentConnector},
+        ReconnectingAgentBridge,
+    };
+    use crate::defaults::DEFAULT_MTU;
+    use crate::{agent_proto, agent_transport, ssh_bridge, tcp_core};
+    use bytes::{Bytes, BytesMut};
+    use std::net::Ipv4Addr;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn agent_tcp_bridge_sends_local_data_before_agent_opened() {
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+        async fn read_test_agent_frame<R: AsyncRead + Unpin>(
+            reader: &mut R,
+            inbound: &mut BytesMut,
+        ) -> agent_proto::AgentFrame {
+            loop {
+                if let Some(frame) =
+                    agent_proto::try_decode_frame(inbound).expect("decode test agent frame")
+                {
+                    return frame;
+                }
+
+                let mut buf = [0_u8; 8192];
+                let read = reader.read(&mut buf).await.expect("read test agent frame");
+                assert_ne!(read, 0, "test agent stream closed before next frame");
+                inbound.extend_from_slice(&buf[..read]);
+            }
+        }
+
+        async fn write_test_agent_frame<W: AsyncWrite + Unpin>(
+            writer: &mut W,
+            frame: agent_proto::AgentFrame,
+        ) {
+            let encoded = agent_proto::encode_frame(&frame).expect("encode test agent frame");
+            writer
+                .write_all(&encoded)
+                .await
+                .expect("write test agent frame");
+            writer.flush().await.expect("flush test agent frame");
+        }
+
+        let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
+        let (data_seen_tx, data_seen_rx) = tokio::sync::oneshot::channel();
+        let (send_opened_tx, send_opened_rx) = tokio::sync::oneshot::channel();
+        let fake_agent = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(agent_io);
+            let mut inbound = BytesMut::new();
+
+            let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Hello,
+                    0,
+                    agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
+                )
+                .expect("test hello frame"),
+            )
+            .await;
+
+            let open = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(open.kind, agent_proto::AgentFrameKind::OpenTcp);
+
+            let window = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(window.kind, agent_proto::AgentFrameKind::Window);
+            assert_eq!(window.stream_id, open.stream_id);
+
+            let data = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(data.kind, agent_proto::AgentFrameKind::Data);
+            assert_eq!(data.stream_id, open.stream_id);
+            assert_eq!(&data.payload[..], b"hello");
+            data_seen_tx.send(()).expect("report optimistic data");
+
+            send_opened_rx.await.expect("release opened frame");
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Opened,
+                    open.stream_id,
+                    Bytes::new(),
+                )
+                .expect("opened frame")
+                .with_credit((1024 * 1024) as u32),
+            )
+            .await;
+        });
+
+        let (client_reader, client_writer) = tokio::io::split(client_io);
+        let transport =
+            agent_transport::AgentTransport::connect(client_reader, client_writer, DEFAULT_MTU)
+                .await
+                .expect("connect fake agent transport");
+        let agent = ReconnectingAgentBridge::new(
+            QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+            vec![detached_bridge_transport(transport)],
+        );
+        let id = tcp_core::FlowId::new(
+            tcp_core::FlowKey::tcp(
+                Ipv4Addr::new(10, 255, 255, 1),
+                49152,
+                Ipv4Addr::new(192, 0, 2, 10),
+                443,
+            ),
+            1,
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let bridge = spawn_agent_tcp_bridge(id, event_tx, agent);
+
+        assert!(
+            bridge
+                .try_send_local_data(Bytes::from_static(b"hello"))
+                .expect("queue local data"),
+            "bridge should accept first local payload"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), data_seen_rx)
+            .await
+            .expect("agent sees data before opened")
+            .expect("data seen notification");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+                .await
+                .is_err(),
+            "bridge must not report opened before the agent sends Opened"
+        );
+
+        send_opened_tx.send(()).expect("release fake opened");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("opened event")
+            .expect("bridge event");
+        assert!(
+            matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
+        );
+
+        drop(bridge);
+        fake_agent.await.expect("fake agent join");
+    }
+}

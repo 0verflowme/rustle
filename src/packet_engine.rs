@@ -1397,18 +1397,21 @@ mod tests {
     use smoltcp::socket::tcp;
 
     use super::*;
+    use crate::agent_window;
     use crate::bridge_lab::{
         drain_lab_client_to_manager, pump_lab_manager_to_clients, route_lab_packets_to_clients,
         synthetic_lab_client, BridgeLabClient,
+    };
+    use crate::defaults::{
+        DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX, DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS,
     };
     use crate::transport_model::{
         DataPlaneReconnectSnapshot, MAX_AGENT_ACTIVE_STREAMS, MAX_AGENT_OPENING_STREAMS,
         MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
     };
-    use crate::{agent_window, DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
 
     const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
-        Duration::from_millis(crate::DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
+        Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
 
     #[test]
     fn dns_inflight_caps_queries_and_tracks_releases() {

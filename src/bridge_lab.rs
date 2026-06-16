@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::cli::BridgeLabArgs;
 use crate::control_plane::connect_bridge_runtime;
+use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_PREFIX};
 use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
     drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
@@ -20,7 +21,7 @@ use crate::packet_engine::{
 };
 use crate::remote_helper::bridge_agent_command_plan;
 use crate::transport_model::BridgeRuntimeOptions;
-use crate::{ssh_bridge, tcp_core, DEFAULT_MTU, DEFAULT_TUN_PREFIX};
+use crate::{ssh_bridge, tcp_core};
 
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
 
@@ -666,7 +667,7 @@ pub(crate) fn route_lab_packets_to_clients(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
+    use crate::defaults::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
 
     #[test]
     fn bridge_lab_response_completion_uses_http_content_length() {
