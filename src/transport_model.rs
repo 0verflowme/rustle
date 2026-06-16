@@ -138,6 +138,8 @@ pub(crate) struct UdpAssociation {
     pub(crate) to_remote: mpsc::Sender<Bytes>,
 }
 
+pub(crate) const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
+
 #[derive(Clone)]
 pub(crate) struct UdpAssociationEvents {
     pub(crate) response_tx: mpsc::Sender<UdpResponseEvent>,

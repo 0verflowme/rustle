@@ -61,22 +61,22 @@ use control_plane::{
     format_agent_fast_start_message, should_fast_start_agent_lanes,
 };
 use control_plane::{connect_bridge_runtime, SshAgentBridgeConnector};
+use data_plane::query_dns_over_transport;
 #[cfg(test)]
 use data_plane::{
     query_dns_over_agent, query_dns_over_agent_udp, query_udp_over_agent, run_udp_association,
     run_udp_association_transport, send_dns_response_event, spawn_agent_tcp_bridge,
     spawn_udp_association_with_idle_timeout, UdpAssociationTransport,
 };
-use data_plane::{query_dns_over_transport, UDP_DATAGRAMS_PER_ASSOCIATION};
 #[cfg(test)]
 use packet_engine::{
-    admit_udp_datagram, drain_local_bytes_to_bridges, drop_unsupported_direct_udp,
-    execute_udp_ingress_action, format_bytes, format_duration, handle_bridge_event,
-    handle_bridge_event_into, plan_udp_datagram_actions, should_log_stale_bridge_event,
-    BridgeAdmissionStats, BridgeEventStats, DnsInflight, LocalDrainStats, RemoteBacklogPush,
-    RemoteBacklogs, TunWriteStats, TunnelStats, UdpAssociationTransportPlan, UdpDropReason,
-    UdpIngressAction, MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW,
-    REMOTE_BACKLOG_BYTES_TOTAL, REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
+    drain_local_bytes_to_bridges, drop_unsupported_direct_udp, execute_udp_ingress_action,
+    format_bytes, format_duration, handle_bridge_event, handle_bridge_event_into,
+    plan_udp_datagram_actions, should_log_stale_bridge_event, BridgeAdmissionStats,
+    BridgeEventStats, DnsInflight, LocalDrainStats, RemoteBacklogPush, RemoteBacklogs,
+    TunWriteStats, TunnelStats, UdpAssociationTransportPlan, UdpDropReason, UdpIngressAction,
+    MAX_ACTIVE_UDP_ASSOCIATIONS, REMOTE_BACKLOG_BYTES_PER_FLOW, REMOTE_BACKLOG_BYTES_TOTAL,
+    REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
 use remote_helper::{agent_command_plan, bridge_agent_command_plan};
 #[cfg(test)]
@@ -110,7 +110,9 @@ use transport_model::{
     UdpAssociation, UdpAssociationEvents, UdpFlowKey, MAX_AGENT_ACTIVE_STREAMS,
     MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
 };
-use transport_model::{parse_destination, BridgeRuntimeOptions, BridgeTransportKind};
+use transport_model::{
+    parse_destination, BridgeRuntimeOptions, BridgeTransportKind, UDP_DATAGRAMS_PER_ASSOCIATION,
+};
 
 pub(crate) const DEFAULT_TUN_IP: Ipv4Addr = Ipv4Addr::new(10, 255, 255, 1);
 pub(crate) const DEFAULT_TUN_PREFIX: u8 = 24;
@@ -122,6 +124,44 @@ const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
 const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;
 pub(crate) const DEFAULT_SSH_SESSIONS: usize = 4;
 pub(crate) const DEFAULT_AGENT_SESSIONS: usize = 1;
+
+#[cfg(test)]
+fn admit_udp_datagram(
+    transport: UdpAssociationTransport,
+    request: dns::UdpPacket,
+    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
+    association_limit: &mut DnsInflight,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+    stats: &mut TunnelStats,
+) {
+    let mut actions = Vec::new();
+    let transport = UdpAssociationTransportPlan::new(transport.label(), transport);
+    plan_udp_datagram_actions(
+        Some(transport),
+        request,
+        associations,
+        association_limit,
+        events,
+        idle_timeout,
+        &mut actions,
+    );
+    packet_engine::execute_udp_ingress_actions(
+        &mut actions,
+        associations,
+        association_limit,
+        stats,
+        &mut |transport, key, from_local, events, idle_timeout| {
+            spawn_udp_association_with_idle_timeout(
+                transport,
+                key,
+                from_local,
+                events,
+                idle_timeout,
+            );
+        },
+    );
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "rustle", about = "User-space SSH network pivot")]

@@ -1,20 +1,17 @@
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
-use std::future::Future;
-use std::pin::Pin;
 use std::time::{Duration, Instant as StdInstant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use bytes::Bytes;
 use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc;
 
-use crate::data_plane::{spawn_dns_query, DnsTransport, UDP_DATAGRAMS_PER_ASSOCIATION};
 use crate::transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
-    DataPlaneRuntimeSnapshot, Destination, DnsResponseEvent, UdpAssociation, UdpAssociationEvents,
-    UdpFlowKey,
+    DataPlaneRuntimeSnapshot, UdpAssociation, UdpAssociationEvents, UdpFlowKey,
+    UDP_DATAGRAMS_PER_ASSOCIATION,
 };
-use crate::{dns, ssh_bridge, tcp_core, DEFAULT_TUN_IP};
+use crate::{dns, ssh_bridge, tcp_core};
 
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;
 pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
@@ -23,17 +20,7 @@ pub(crate) const REMOTE_BACKLOG_BYTES_PER_FLOW: usize =
 pub(crate) const REMOTE_BACKLOG_BYTES_TOTAL: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_IN_FLIGHT_DNS_QUERIES: usize = 128;
 pub(crate) const MAX_ACTIVE_UDP_ASSOCIATIONS: usize = 512;
-const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
-const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;
-const UDP_CLOSE_EVENT_CHANNEL_DEPTH: usize = MAX_ACTIVE_UDP_ASSOCIATIONS;
-const _: () = assert!(DNS_EVENT_CHANNEL_DEPTH >= MAX_IN_FLIGHT_DNS_QUERIES);
-const _: () = assert!(UDP_CLOSE_EVENT_CHANNEL_DEPTH >= MAX_ACTIVE_UDP_ASSOCIATIONS);
-const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
-
-const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
-
-pub(crate) type ShutdownSignalFuture = Pin<Box<dyn Future<Output = Result<&'static str>> + Send>>;
 
 pub(crate) fn smol_now(started_at: StdInstant) -> SmolInstant {
     let millis = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -165,339 +152,6 @@ impl DnsInflight {
         if self.current > 0 {
             self.current -= 1;
             self.completed = self.completed.saturating_add(1);
-        }
-    }
-}
-
-pub(crate) async fn run_tunnel_loop(
-    dev: tun_rs::AsyncDevice,
-    mut flow_manager: tcp_core::FlowManager,
-    bridge_runtime: crate::data_plane::BridgeRuntime,
-    dns_transport: DnsTransport,
-    dns_remote: Destination,
-    udp_association_idle_timeout: Duration,
-    mut shutdown: ShutdownSignalFuture,
-) -> Result<()> {
-    let mut buf = vec![0_u8; PACKET_BUF_SIZE];
-    let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
-    let mut ready_flow_ids = Vec::new();
-    let mut flow_keys = Vec::new();
-    let mut backlog_flow_ids = Vec::new();
-    let mut backlog_closed_flows = Vec::new();
-    let mut bridge_event_closed_flows = Vec::new();
-    let mut expired_flows = Vec::new();
-    let mut removable_flows = Vec::new();
-    let mut udp_actions = Vec::new();
-    let started_at = StdInstant::now();
-    let (event_tx, mut event_rx) = mpsc::channel(1024);
-    let (dns_tx, mut dns_rx) = mpsc::channel(DNS_EVENT_CHANNEL_DEPTH);
-    let (udp_response_tx, mut udp_response_rx) = mpsc::channel(UDP_RESPONSE_EVENT_CHANNEL_DEPTH);
-    let (udp_close_tx, mut udp_close_rx) = mpsc::channel(UDP_CLOSE_EVENT_CHANNEL_DEPTH);
-    let udp_events = UdpAssociationEvents {
-        response_tx: udp_response_tx,
-        close_tx: udp_close_tx,
-    };
-    let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
-    let mut udp_associations = HashMap::<UdpFlowKey, UdpAssociation>::new();
-    let mut remote_backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
-    let mut dns_inflight = DnsInflight::new(MAX_IN_FLIGHT_DNS_QUERIES);
-    let mut udp_inflight = DnsInflight::new(MAX_ACTIVE_UDP_ASSOCIATIONS);
-    let mut stats = TunnelStats::new();
-    let mut tick = tokio::time::interval(Duration::from_millis(10));
-    let mut stats_tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + STATS_LOG_INTERVAL,
-        STATS_LOG_INTERVAL,
-    );
-    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        tokio::select! {
-            signal = &mut shutdown => {
-                eprintln!("signal: {} received", signal?);
-                eprintln!(
-                    "stats: final {}",
-                    stats.status_line(
-                        flow_manager.active_flow_count(),
-                        bridges.len(),
-                        &remote_backlogs,
-                        &dns_inflight,
-                        &udp_inflight,
-                        bridge_runtime.snapshot().await,
-                    )
-                );
-                return Ok(());
-            }
-            result = dev.recv(&mut buf) => {
-                let len = result.context("failed to read packet from TUN device")?;
-                stats.record_tun_rx(len);
-                let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
-                    continue;
-                };
-                if let Some(request) = parse_dns_request_for_tunnel(packet) {
-                    stats.dns_forwarded = stats.dns_forwarded.saturating_add(1);
-                    eprintln!(
-                        "dns: forwarding UDP query {}:{} -> {}:{} over {} to {}:{}",
-                        request.src_ip,
-                        request.src_port,
-                        request.dst_ip,
-                        request.dst_port,
-                        dns_transport.label(),
-                        dns_remote.host,
-                        dns_remote.port
-                    );
-                    if dns_inflight.try_admit() {
-                        spawn_dns_query(
-                            dns_transport.clone(),
-                            dns_remote.clone(),
-                            request,
-                            dns_tx.clone(),
-                            DEFAULT_TUN_IP,
-                        );
-                    } else {
-                        eprintln!(
-                            "dns: dropping query because {} DNS queries are already in flight",
-                            dns_inflight.max()
-                        );
-                        stats.dns_dropped = stats.dns_dropped.saturating_add(1);
-                        stats.record_dns_response(false);
-                        let tun_write = write_dns_event_to_tun(
-                            &dev,
-                            DnsResponseEvent {
-                                request,
-                                result: Err("DNS in-flight limit reached".to_owned()),
-                            },
-                        )
-                        .await?;
-                        stats.record_tun_write(tun_write);
-                    }
-                    continue;
-                }
-                if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
-                    let udp_transport = dns_transport
-                        .udp_transport()
-                        .map(|transport| UdpAssociationTransportPlan::new(transport.label(), transport));
-                    plan_udp_datagram_actions(
-                        udp_transport,
-                        request,
-                        &mut udp_associations,
-                        &mut udp_inflight,
-                        udp_events.clone(),
-                        udp_association_idle_timeout,
-                        &mut udp_actions,
-                    );
-                    execute_udp_ingress_actions(
-                        &mut udp_actions,
-                        &mut udp_associations,
-                        &mut udp_inflight,
-                        &mut stats,
-                        &mut |transport, key, from_local, events, idle_timeout| {
-                            crate::data_plane::spawn_udp_association_with_idle_timeout(
-                                transport,
-                                key,
-                                from_local,
-                                events,
-                                idle_timeout,
-                            );
-                        },
-                    );
-                    continue;
-                }
-
-                let now = smol_now(started_at);
-                flow_manager
-                    .ingest_packet_into(now, packet, &mut outbound_packets)
-                    .context("failed to feed packet into userspace TCP engine")?;
-                let tun_write = write_packets_to_tun(&dev, &mut outbound_packets).await?;
-                stats.record_tun_write(tun_write);
-                let admission_stats = ensure_bridges(
-                    &mut flow_manager,
-                    &mut bridges,
-                    bridge_runtime.admission_limits(),
-                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
-                    event_tx.clone(),
-                    &mut ready_flow_ids,
-                    now,
-                )?;
-                stats.record_bridge_admission(admission_stats);
-                let drain_stats =
-                    drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
-                stats.record_local_drain(drain_stats);
-                flush_remote_backlogs_to_tun(
-                    &dev,
-                    &mut flow_manager,
-                    &mut bridges,
-                    &mut remote_backlogs,
-                    smol_now(started_at),
-                    RemoteFlushScratch {
-                        backlog_flow_ids: &mut backlog_flow_ids,
-                        closed_flows: &mut backlog_closed_flows,
-                        packets: &mut outbound_packets,
-                    },
-                    &mut stats,
-                ).await?;
-                stats.expired_flows = stats.expired_flows.saturating_add(expire_stale_flows(
-                    &mut flow_manager,
-                    &mut bridges,
-                    &mut remote_backlogs,
-                    smol_now(started_at),
-                    &mut expired_flows,
-                ) as u64);
-                stats.pruned_flows = stats.pruned_flows.saturating_add(
-                    prune_closed_flows(
-                        &mut flow_manager,
-                        &mut bridges,
-                        &mut remote_backlogs,
-                        &mut removable_flows,
-                    )? as u64
-                );
-            }
-            event = dns_rx.recv() => {
-                if let Some(event) = event {
-                    dns_inflight.complete();
-                    let remote_ok = event.result.is_ok();
-                    let tun_write = write_dns_event_to_tun(&dev, event).await?;
-                    stats.record_dns_delivery(remote_ok, tun_write);
-                }
-            }
-            event = udp_response_rx.recv() => {
-                if let Some(event) = event {
-                    let tun_write = write_udp_response_to_tun(&dev, event.key, event.payload).await?;
-                    stats.record_udp_delivery(tun_write);
-                }
-            }
-            event = udp_close_rx.recv() => {
-                if let Some(event) = event {
-                    udp_associations.remove(&event.key);
-                    udp_inflight.complete();
-                    if let Some(error) = event.error {
-                        eprintln!(
-                            "udp: association {}:{} -> {}:{} closed with error: {error}",
-                            event.key.src_ip,
-                            event.key.src_port,
-                            event.key.dst_ip,
-                            event.key.dst_port,
-                        );
-                        stats.record_udp_response(false);
-                    }
-                }
-            }
-            event = event_rx.recv(), if !remote_backlogs.should_pause_bridge_events() => {
-                let Some(event) = event else {
-                    bail!("SSH bridge event channel closed");
-                };
-                stats.record_bridge_event(&event);
-                let now = smol_now(started_at);
-                let outcome = handle_bridge_event_into(
-                    event,
-                    &mut flow_manager,
-                    &mut remote_backlogs,
-                    now,
-                    &mut bridge_event_closed_flows,
-                )?;
-                stats.remote_backlog_overflows = stats
-                    .remote_backlog_overflows
-                    .saturating_add(outcome.remote_backlog_overflows);
-                stats.stale_bridge_events = stats
-                    .stale_bridge_events
-                    .saturating_add(outcome.stale_bridge_events);
-                for flow in bridge_event_closed_flows.drain(..) {
-                    bridges.remove(&flow);
-                }
-                flow_manager.poll_into(now, &mut outbound_packets);
-                let tun_write = write_packets_to_tun(&dev, &mut outbound_packets).await?;
-                stats.record_tun_write(tun_write);
-                flush_remote_backlogs_to_tun(
-                    &dev,
-                    &mut flow_manager,
-                    &mut bridges,
-                    &mut remote_backlogs,
-                    now,
-                    RemoteFlushScratch {
-                        backlog_flow_ids: &mut backlog_flow_ids,
-                        closed_flows: &mut backlog_closed_flows,
-                        packets: &mut outbound_packets,
-                    },
-                    &mut stats,
-                ).await?;
-                stats.expired_flows = stats.expired_flows.saturating_add(
-                    expire_stale_flows(
-                        &mut flow_manager,
-                        &mut bridges,
-                        &mut remote_backlogs,
-                        now,
-                        &mut expired_flows,
-                    ) as u64
-                );
-                stats.pruned_flows = stats.pruned_flows.saturating_add(
-                    prune_closed_flows(
-                        &mut flow_manager,
-                        &mut bridges,
-                        &mut remote_backlogs,
-                        &mut removable_flows,
-                    )? as u64
-                );
-            }
-            _ = stats_tick.tick() => {
-                eprintln!(
-                    "stats: {}",
-                    stats.status_line(
-                        flow_manager.active_flow_count(),
-                        bridges.len(),
-                        &remote_backlogs,
-                        &dns_inflight,
-                        &udp_inflight,
-                        bridge_runtime.snapshot().await,
-                    )
-                );
-            }
-            _ = tick.tick() => {
-                let now = smol_now(started_at);
-                flow_manager.poll_into(now, &mut outbound_packets);
-                let tun_write = write_packets_to_tun(&dev, &mut outbound_packets).await?;
-                stats.record_tun_write(tun_write);
-                flush_remote_backlogs_to_tun(
-                    &dev,
-                    &mut flow_manager,
-                    &mut bridges,
-                    &mut remote_backlogs,
-                    now,
-                    RemoteFlushScratch {
-                        backlog_flow_ids: &mut backlog_flow_ids,
-                        closed_flows: &mut backlog_closed_flows,
-                        packets: &mut outbound_packets,
-                    },
-                    &mut stats,
-                ).await?;
-                let admission_stats = ensure_bridges(
-                    &mut flow_manager,
-                    &mut bridges,
-                    bridge_runtime.admission_limits(),
-                    |id, event_tx| bridge_runtime.spawn_tcp_bridge(id, event_tx),
-                    event_tx.clone(),
-                    &mut ready_flow_ids,
-                    now,
-                )?;
-                stats.record_bridge_admission(admission_stats);
-                let drain_stats =
-                    drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
-                stats.record_local_drain(drain_stats);
-                stats.expired_flows = stats.expired_flows.saturating_add(
-                    expire_stale_flows(
-                        &mut flow_manager,
-                        &mut bridges,
-                        &mut remote_backlogs,
-                        now,
-                        &mut expired_flows,
-                    ) as u64
-                );
-                stats.pruned_flows = stats.pruned_flows.saturating_add(
-                    prune_closed_flows(
-                        &mut flow_manager,
-                        &mut bridges,
-                        &mut remote_backlogs,
-                        &mut removable_flows,
-                    )? as u64
-                );
-            }
         }
     }
 }
@@ -823,44 +477,6 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn admit_udp_datagram(
-    transport: crate::data_plane::UdpAssociationTransport,
-    request: dns::UdpPacket,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    events: UdpAssociationEvents,
-    idle_timeout: Duration,
-    stats: &mut TunnelStats,
-) {
-    let mut actions = Vec::new();
-    let transport = UdpAssociationTransportPlan::new(transport.label(), transport);
-    plan_udp_datagram_actions(
-        Some(transport),
-        request,
-        associations,
-        association_limit,
-        events,
-        idle_timeout,
-        &mut actions,
-    );
-    execute_udp_ingress_actions(
-        &mut actions,
-        associations,
-        association_limit,
-        stats,
-        &mut |transport, key, from_local, events, idle_timeout| {
-            crate::data_plane::spawn_udp_association_with_idle_timeout(
-                transport,
-                key,
-                from_local,
-                events,
-                idle_timeout,
-            );
-        },
-    );
-}
-
 pub(crate) fn plan_udp_datagram_actions<T>(
     transport: Option<UdpAssociationTransportPlan<T>>,
     request: dns::UdpPacket,
@@ -1040,38 +656,6 @@ fn drop_udp_datagram(
     }
     stats.udp_dropped = stats.udp_dropped.saturating_add(1);
     stats.record_udp_response(false);
-}
-
-pub(crate) async fn write_dns_event_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    event: DnsResponseEvent,
-) -> Result<TunWriteStats> {
-    let payload = match event.result {
-        Ok(payload) => payload,
-        Err(err) => {
-            eprintln!("dns: remote query failed: {err}");
-            let Some(payload) = dns::build_dns_servfail_response(event.request.payload.as_ref())
-            else {
-                return Ok(TunWriteStats::default());
-            };
-            Bytes::from(payload)
-        }
-    };
-
-    let packet = dns::build_udp_dns_response(&event.request, &payload)
-        .context("failed to synthesize DNS UDP response packet")?;
-    write_packet_to_tun(dev, &packet, "DNS response").await
-}
-
-pub(crate) async fn write_udp_response_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    key: UdpFlowKey,
-    payload: Bytes,
-) -> Result<TunWriteStats> {
-    let request = key.response_template();
-    let packet = dns::build_udp_response(&request, &payload)
-        .context("failed to synthesize UDP response packet")?;
-    write_packet_to_tun(dev, &packet, "UDP response").await
 }
 
 pub(crate) fn ensure_bridges<F>(
@@ -1329,36 +913,6 @@ pub(crate) fn bridge_event_name(event: &ssh_bridge::BridgeEvent) -> &'static str
     }
 }
 
-struct RemoteFlushScratch<'a> {
-    backlog_flow_ids: &'a mut Vec<tcp_core::FlowId>,
-    closed_flows: &'a mut Vec<tcp_core::FlowKey>,
-    packets: &'a mut Vec<tcp_core::PacketBuf>,
-}
-
-async fn flush_remote_backlogs_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
-    remote_backlogs: &mut RemoteBacklogs,
-    now: SmolInstant,
-    scratch: RemoteFlushScratch<'_>,
-    stats: &mut TunnelStats,
-) -> Result<()> {
-    remote_backlogs.flush_all_into(
-        flow_manager,
-        now,
-        scratch.backlog_flow_ids,
-        scratch.closed_flows,
-    )?;
-    for closed_flow in scratch.closed_flows.drain(..) {
-        bridges.remove(&closed_flow);
-    }
-    flow_manager.poll_into(now, scratch.packets);
-    let tun_write = write_packets_to_tun(dev, scratch.packets).await?;
-    stats.record_tun_write(tun_write);
-    Ok(())
-}
-
 #[derive(Debug)]
 pub(crate) struct RemoteBacklogs {
     max_bytes_per_flow: usize,
@@ -1588,41 +1142,4 @@ pub(crate) fn prune_closed_flows(
         flow_manager.remove_flow(flow)?;
     }
     Ok(count)
-}
-
-pub(crate) async fn write_packets_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    packets: &mut Vec<tcp_core::PacketBuf>,
-) -> Result<TunWriteStats> {
-    let mut stats = TunWriteStats::default();
-    for packet in packets.drain(..) {
-        stats.combine(write_packet_to_tun(dev, packet.as_ref(), "userspace TCP packet").await?);
-    }
-    Ok(stats)
-}
-
-pub(crate) async fn write_packet_to_tun(
-    dev: &tun_rs::AsyncDevice,
-    packet: &[u8],
-    description: &'static str,
-) -> Result<TunWriteStats> {
-    let len = packet.len();
-    let mut stats = TunWriteStats::default();
-    match tokio::time::timeout(TUN_WRITE_TIMEOUT, dev.send(packet)).await {
-        Ok(Ok(_)) => {
-            stats.record_written(len);
-        }
-        Ok(Err(err)) => {
-            return Err(err)
-                .with_context(|| format!("failed to write {description} to TUN device"));
-        }
-        Err(_) => {
-            eprintln!(
-                "tun: dropping {len}-byte {description} after {}ms waiting for TUN write",
-                TUN_WRITE_TIMEOUT.as_millis()
-            );
-            stats.record_dropped(len);
-        }
-    }
-    Ok(stats)
 }

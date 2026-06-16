@@ -21,7 +21,6 @@ use crate::{agent_proto, dns, quic_agent, ssh_bridge, tcp_core};
 pub(crate) const DNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
-pub(crate) const UDP_DATAGRAMS_PER_ASSOCIATION: usize = 128;
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
 fn data_plane_runtime_snapshot_from_agent(
