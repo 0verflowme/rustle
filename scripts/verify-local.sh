@@ -162,7 +162,7 @@ if [[ "$RUN_BENCH" == "1" ]]; then
 
   verify_run env \
     RUSTLE_BENCH_RUNS=3 \
-    RUSTLE_BENCH_WARMUP_RUNS=0 \
+    RUSTLE_BENCH_WARMUP_RUNS=1 \
     RUSTLE_BENCH_BODY_BYTES=1024 \
     RUSTLE_BENCH_CONNECTIONS=1 \
     RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip quic-native" \

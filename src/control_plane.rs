@@ -9,7 +9,7 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport, QuicNativeBridge, ReconnectingAgentBridge,
 };
-use crate::data_plane::{BridgeRuntime, DnsTransport};
+use crate::bridge_runtime::{BridgeRuntime, DnsTransport};
 use crate::remote_helper::{stage_uploaded_helper_command, HelperCommandPlan, HelperKind};
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,

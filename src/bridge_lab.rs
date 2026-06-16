@@ -4,7 +4,6 @@ use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
-use clap::Parser;
 use smoltcp::iface::{Config as SmolConfig, Interface, Route, SocketSet};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant as SmolInstant;
@@ -12,6 +11,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Cidr};
 use tokio::io::{self, AsyncWriteExt};
 use tokio::sync::mpsc;
 
+use crate::cli::BridgeLabArgs;
 use crate::control_plane::connect_bridge_runtime;
 use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
@@ -19,76 +19,10 @@ use crate::packet_engine::{
     prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
 use crate::remote_helper::bridge_agent_command_plan;
-use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind};
-use crate::{
-    ssh_bridge, tcp_core, SshArgs, DEFAULT_AGENT_SESSIONS, DEFAULT_MTU, DEFAULT_SSH_SESSIONS,
-    DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX,
-};
+use crate::transport_model::BridgeRuntimeOptions;
+use crate::{ssh_bridge, tcp_core, DEFAULT_MTU, DEFAULT_TUN_PREFIX};
 
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
-
-#[derive(Debug, Parser)]
-pub(crate) struct BridgeLabArgs {
-    #[command(flatten)]
-    pub(crate) ssh: SshArgs,
-
-    /// IPv4 TCP target to open from the remote SSH server, in ip:port form.
-    #[arg(short = 'd', long = "destination")]
-    pub(crate) destination: String,
-
-    /// Raw request payload to send through the synthetic local TCP flow.
-    #[arg(long = "request")]
-    pub(crate) request: Option<String>,
-
-    /// Synthetic client IPv4 address.
-    #[arg(long = "client-ip", default_value_t = Ipv4Addr::new(10, 255, 255, 2))]
-    pub(crate) client_ip: Ipv4Addr,
-
-    /// Synthetic gateway/TUN IPv4 address.
-    #[arg(long = "tun-ip", default_value_t = DEFAULT_TUN_IP)]
-    pub(crate) tun_ip: Ipv4Addr,
-
-    /// Number of synthetic TCP flows to multiplex through one SSH connection.
-    #[arg(long = "connections", default_value_t = 1)]
-    pub(crate) connections: usize,
-
-    /// Hidden lab tolerance for chaos tests that intentionally fail some flows.
-    #[arg(long = "min-completed", hide = true)]
-    pub(crate) min_completed: Option<usize>,
-
-    /// Hidden lab deadline override in milliseconds.
-    #[arg(long = "deadline-ms", hide = true)]
-    pub(crate) deadline_ms: Option<u64>,
-
-    /// Hidden lab switch for comparing direct-tcpip with the framed agent transport.
-    #[arg(
-        long = "bridge-transport",
-        value_enum,
-        default_value = "agent",
-        hide = true
-    )]
-    pub(crate) bridge_transport: BridgeTransportKind,
-
-    /// Raw remote shell command that starts the Rustle agent on stdin/stdout.
-    #[arg(long = "agent-command", hide = true, conflicts_with = "agent_path")]
-    pub(crate) agent_command: Option<String>,
-
-    /// Remote executable path to quote before appending the `agent` subcommand.
-    #[arg(long = "agent-path", hide = true, conflicts_with = "agent_command")]
-    pub(crate) agent_path: Option<String>,
-
-    /// Print a compact benchmark summary instead of response bodies.
-    #[arg(long = "summary", hide = true)]
-    pub(crate) summary: bool,
-
-    /// Number of SSH transports to open for flow hashing.
-    #[arg(long = "ssh-sessions", default_value_t = DEFAULT_SSH_SESSIONS, hide = true)]
-    pub(crate) ssh_sessions: usize,
-
-    /// Number of Rustle agent exec transports to open for flow hashing.
-    #[arg(long = "agent-sessions", default_value_t = DEFAULT_AGENT_SESSIONS, hide = true)]
-    pub(crate) agent_sessions: usize,
-}
 
 pub(crate) struct BridgeLabClient {
     pub(crate) flow: tcp_core::FlowKey,

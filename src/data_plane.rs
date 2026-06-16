@@ -14,6 +14,7 @@ use crate::agent_bridge::{
 };
 #[cfg(test)]
 use crate::agent_transport;
+use crate::bridge_runtime::{BridgeRuntime, DnsTransport, UdpAssociationTransport};
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneCaps, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot,
@@ -126,13 +127,6 @@ fn data_plane_runtime_snapshot_from_agent(
         max_lane_load: snapshot.max_lane_load,
         max_quarantine_ms: snapshot.max_quarantine_ms,
     }
-}
-
-#[derive(Clone)]
-pub(crate) enum BridgeRuntime {
-    DirectTcpip(SshSessionPool),
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
 }
 
 impl BridgeRuntime {
@@ -1011,29 +1005,6 @@ async fn report_agent_stream_opened(
         .try_into()
         .unwrap_or(u64::MAX);
     ssh_bridge::send_bridge_event(event_tx, ssh_bridge::BridgeEvent::Opened { id, open_ms }).await
-}
-
-#[derive(Clone)]
-pub(crate) enum DnsTransport {
-    DirectTcpip(SshSessionPool),
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
-}
-
-#[derive(Clone)]
-pub(crate) enum UdpAssociationTransport {
-    Agent(ReconnectingAgentBridge),
-    QuicNative(QuicNativeBridge),
-}
-
-impl UdpAssociationTransport {
-    #[cfg(test)]
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Agent(_) => "agent",
-            Self::QuicNative(_) => "quic-native",
-        }
-    }
 }
 
 enum AgentIoStream {

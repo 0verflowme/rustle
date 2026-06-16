@@ -379,8 +379,9 @@ Required before tagging a release:
   a live target is available.
 - `scripts/verify-local.sh` includes release-mode 1-flow bridge benchmarks:
   a tiny-response gate with `RUSTLE_BENCH_MAX_ELAPSED_MS=2000` and
-  `RUSTLE_BENCH_MAX_P50_US=25000` across `agent`, `direct-tcpip`, and
-  `quic-native`. It also runs a 1 MiB gate with
+  median measured `RUSTLE_BENCH_MAX_P50_US=25000` across `agent`,
+  `direct-tcpip`, and `quic-native` after one warmup run. It also runs a 1 MiB
+  gate with
   `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, and a hard
   100 MiB single-flow `agent` throughput gate. The 100 MiB local gate includes
   `quic-native` with `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` so the native

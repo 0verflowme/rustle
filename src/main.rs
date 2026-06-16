@@ -30,6 +30,7 @@ mod agent_runtime;
 mod agent_transport;
 mod agent_window;
 mod bridge_lab;
+mod bridge_runtime;
 mod cli;
 mod control_plane;
 mod data_plane;
@@ -63,6 +64,8 @@ use bridge_lab::{
     bridge_lab_response_complete, drain_lab_client_to_manager, pump_lab_manager_to_clients,
     route_lab_packets_to_clients, synthetic_lab_client, BridgeLabClient, BridgeLabLatencySummary,
 };
+#[cfg(test)]
+use bridge_runtime::UdpAssociationTransport;
 use cli::{Cli, CommandKind, CompactTunnelArgs, DirectTcpipArgs};
 pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 #[cfg(test)]
@@ -74,7 +77,7 @@ use control_plane::{
 use data_plane::{
     query_dns_over_agent, query_dns_over_agent_udp, query_dns_over_transport, query_udp_over_agent,
     run_udp_association, run_udp_association_transport, send_dns_response_event,
-    spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout, UdpAssociationTransport,
+    spawn_agent_tcp_bridge, spawn_udp_association_with_idle_timeout,
 };
 use helper_runtime::{run_agent, run_quic_agent, run_quic_bridge_agent};
 use lab_support::default_http_request;
@@ -280,7 +283,7 @@ mod tests {
     use super::*;
     use crate::agent_bridge::AgentBridgeConnector;
     use crate::packet_engine::MAX_IN_FLIGHT_DNS_QUERIES;
-    use crate::{data_plane::DnsTransport, packet_engine::tun_ipv4_packet};
+    use crate::{bridge_runtime::DnsTransport, packet_engine::tun_ipv4_packet};
     use anyhow::anyhow;
     use clap::CommandFactory;
     use ring::hmac;

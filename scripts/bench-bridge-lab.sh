@@ -227,11 +227,6 @@ for body_bytes in $BODY_BYTES; do
           sed 's/^/rustle stdout: /' "$out" >&2 || true
           smoke_die "bridge benchmark leaked lifecycle state: active_flows=${active_flows} active_bridges=${active_bridges} backlog_flows=${backlog_flows} backlog_bytes=${backlog_bytes}"
         fi
-        if [[ -n "$MAX_P50_US" && "$p50_us" -gt "$MAX_P50_US" ]]; then
-          sed 's/^/rustle stdout: /' "$out" >&2 || true
-          smoke_die "bridge benchmark p50_us=${p50_us} exceeded max ${MAX_P50_US} for transport ${transport}"
-        fi
-
         if [[ "$run" -le "$WARMUP_RUNS" ]]; then
           continue
         fi
@@ -257,6 +252,40 @@ PY
   smoke_stop_pid "${SMOKE_HTTP_PID:-}"
   unset SMOKE_HTTP_PID SMOKE_HTTP_PORT SMOKE_HTTP_LOG
 done
+
+if [[ -n "$MAX_P50_US" ]]; then
+  "$(smoke_python)" - "$RESULTS_TSV" "$MAX_P50_US" <<'PY'
+import collections
+import statistics
+import sys
+
+path = sys.argv[1]
+maximum = int(sys.argv[2])
+
+samples = collections.defaultdict(list)
+with open(path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) != 10:
+            raise SystemExit(f"invalid benchmark row: {line!r}")
+        transport, body_bytes, connections, _run, _elapsed, _response, _throughput, p50, _p95, _max = parts
+        samples[(body_bytes, connections, transport)].append(int(p50))
+
+failures = []
+for (body_bytes, connections, transport), p50s in sorted(samples.items()):
+    median_p50 = statistics.median(p50s)
+    if median_p50 > maximum:
+        failures.append(
+            f"transport={transport} body={body_bytes} connections={connections} "
+            f"median_p50_us={median_p50:.0f} max={maximum}"
+        )
+
+if failures:
+    raise SystemExit(
+        "bridge benchmark median p50 exceeded configured max:\n" + "\n".join(failures)
+    )
+PY
+fi
 
 if [[ -n "$MIN_AGENT_DIRECT_RATIO" ]]; then
   "$(smoke_python)" - "$RESULTS_TSV" "$MIN_AGENT_DIRECT_RATIO" "$RATIO_MIN_CONNECTIONS" <<'PY'

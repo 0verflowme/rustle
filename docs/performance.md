@@ -79,16 +79,17 @@ scripts/bench-bridge-lab.sh
 ```
 
 Use `RUSTLE_BENCH_MAX_ELAPSED_MS` for a low-concurrency elapsed-time ceiling,
-`RUSTLE_BENCH_MAX_P50_US` for a tiny-response p50 request-latency ceiling, and
+`RUSTLE_BENCH_MAX_P50_US` for a median measured p50 request-latency ceiling, and
 `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S` for a release-mode throughput floor. Set
 `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` to require native QUIC throughput to
 stay above a fraction of the primary `agent` path on the same body/connection
 matrix, and `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO` to bound native QUIC
 tiny-response p50 against `agent`.
 `scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
-with both elapsed and absolute `p50_us` ceilings across `agent`, `direct-tcpip`,
-and `quic-native`, runs a 1 MiB / 1-flow gate, and runs a 100 MiB single-flow throughput gate
-through both the primary `agent` transport and `quic-native`
+with both elapsed and median measured `p50_us` ceilings across `agent`,
+`direct-tcpip`, and `quic-native`, runs a 1 MiB / 1-flow gate, and runs a
+100 MiB single-flow throughput gate through both the primary `agent` transport
+and `quic-native`
 (`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
 proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
 release-mode code. Together these guard against a debug binary, multi-second
