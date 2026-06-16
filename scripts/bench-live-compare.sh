@@ -695,7 +695,7 @@ start_sshuttle() {
   if [[ "${RUSTLE_BENCH_CURL_INSECURE:-${RUSTLE_LIVE_CURL_INSECURE:-1}}" == "1" ]]; then
     probe_args+=(-k)
   fi
-  local ready_method="${RUSTLE_BENCH_READY_METHOD:-GET}"
+  local ready_method="${RUSTLE_BENCH_READY_METHOD:-HEAD}"
   case "$ready_method" in
     GET) ;;
     HEAD) probe_args+=(--head) ;;

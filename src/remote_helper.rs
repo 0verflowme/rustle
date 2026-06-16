@@ -475,12 +475,30 @@ pub(crate) fn local_agent_binary_for_platform(
     current_exe: &Path,
     platform: RemotePlatform,
 ) -> Result<PathBuf> {
+    local_agent_binary_for_platform_with_explicit_dirs(
+        current_exe,
+        platform,
+        &explicit_agent_search_dirs(),
+    )
+}
+
+fn local_agent_binary_for_platform_with_explicit_dirs(
+    current_exe: &Path,
+    platform: RemotePlatform,
+    explicit_dirs: &[PathBuf],
+) -> Result<PathBuf> {
     let local = RemotePlatform::local()?;
     if platform == local {
+        if let Some(candidate) =
+            explicit_portable_linux_agent_binary_for_platform(platform, explicit_dirs)
+        {
+            return Ok(candidate.clone());
+        }
         return Ok(current_exe.to_path_buf());
     }
 
-    let candidates = local_agent_binary_candidates(current_exe, platform);
+    let candidates =
+        local_agent_binary_candidates_with_explicit_dirs(current_exe, platform, explicit_dirs);
     if let Some(candidate) = candidates.iter().find(|path| path.is_file()) {
         return Ok(candidate.clone());
     }
@@ -496,18 +514,46 @@ pub(crate) fn local_agent_binary_for_platform(
     )
 }
 
-fn local_agent_binary_candidates(current_exe: &Path, platform: RemotePlatform) -> Vec<PathBuf> {
+fn explicit_portable_linux_agent_binary_for_platform(
+    platform: RemotePlatform,
+    explicit_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if platform.os != "linux" {
+        return None;
+    }
+    portable_linux_agent_binary_candidates_in_dirs(platform, explicit_dirs)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn local_agent_binary_candidates_with_explicit_dirs(
+    current_exe: &Path,
+    platform: RemotePlatform,
+    explicit_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
     dedupe_paths(agent_binary_candidates_in_dirs(
         platform,
-        &local_agent_search_dirs(current_exe),
+        &local_agent_search_dirs_with_explicit_dirs(current_exe, explicit_dirs),
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn local_agent_search_dirs(current_exe: &Path) -> Vec<PathBuf> {
+    local_agent_search_dirs_with_explicit_dirs(current_exe, &explicit_agent_search_dirs())
+}
+
+fn explicit_agent_search_dirs() -> Vec<PathBuf> {
+    env::var_os(RUSTLE_AGENT_DIR_ENV)
+        .map(|paths| env::split_paths(&paths).collect())
+        .unwrap_or_default()
+}
+
+fn local_agent_search_dirs_with_explicit_dirs(
+    current_exe: &Path,
+    explicit_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(paths) = env::var_os(RUSTLE_AGENT_DIR_ENV) {
-        dirs.extend(env::split_paths(&paths));
-    }
+    dirs.extend(explicit_dirs.iter().cloned());
     if let Some(parent) = current_exe.parent() {
         dirs.push(parent.to_path_buf());
         if let Some(package_parent) = parent.parent() {
@@ -543,6 +589,28 @@ pub(crate) fn agent_binary_candidates_in_dirs(
                 dir.join(format!("rustle-{triple}"))
                     .join(format!("rustle-agent{suffix}")),
             );
+        }
+    }
+
+    dedupe_paths(candidates)
+}
+
+fn portable_linux_agent_binary_candidates_in_dirs(
+    platform: RemotePlatform,
+    dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for dir in dirs {
+        for triple in remote_platform_target_triples(platform)
+            .iter()
+            .copied()
+            .filter(|triple| triple.ends_with("-unknown-linux-musl"))
+        {
+            candidates.push(dir.join(format!("rustle-agent-{triple}")));
+            candidates.push(dir.join(format!("rustle-{triple}")));
+            candidates.push(dir.join(format!("rustle-{triple}")).join("rustle"));
+            candidates.push(dir.join(format!("rustle-{triple}")).join("rustle-agent"));
         }
     }
 
@@ -1494,6 +1562,81 @@ mod tests {
                 .expect("current binary works for matching platform"),
             current_exe
         );
+    }
+
+    #[test]
+    fn linux_local_agent_selection_prefers_explicit_packaged_sidecar_when_present() {
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let local = RemotePlatform::local().expect("local platform is supported");
+        if local.os != "linux" {
+            return;
+        }
+
+        let root = env::temp_dir().join(format!(
+            "rustle-linux-local-sidecar-test-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        let temp = TempTree { path: root };
+        let bin_dir = temp.path.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
+
+        let current_exe = bin_dir.join("rustle");
+        std::fs::write(&current_exe, "current gnu controller").expect("write fake current binary");
+
+        let triple = remote_platform_target_triples(local)
+            .first()
+            .expect("local Linux platform has a release target");
+        let package_dir = bin_dir.join(format!("rustle-{triple}"));
+        std::fs::create_dir(&package_dir).expect("create sidecar package dir");
+        let sidecar = package_dir.join("rustle");
+        std::fs::write(&sidecar, "portable sidecar").expect("write fake sidecar");
+
+        assert_eq!(
+            local_agent_binary_for_platform_with_explicit_dirs(
+                &current_exe,
+                local,
+                std::slice::from_ref(&bin_dir),
+            )
+            .expect("select local Linux helper"),
+            sidecar
+        );
+    }
+
+    #[test]
+    fn explicit_portable_sidecar_selection_is_limited_to_linux_musl() {
+        let dir = PathBuf::from("/opt/rustle");
+        let linux_x64 = RemotePlatform {
+            os: "linux",
+            arch: "x86_64",
+        };
+        let macos_x64 = RemotePlatform {
+            os: "macos",
+            arch: "x86_64",
+        };
+        let linux_candidates =
+            portable_linux_agent_binary_candidates_in_dirs(linux_x64, std::slice::from_ref(&dir));
+
+        assert!(
+            linux_candidates.contains(&dir.join("rustle-x86_64-unknown-linux-musl").join("rustle"))
+        );
+        assert!(!linux_candidates
+            .iter()
+            .any(|candidate| candidate.display().to_string().contains("linux-gnu")));
+        assert!(portable_linux_agent_binary_candidates_in_dirs(
+            macos_x64,
+            std::slice::from_ref(&dir),
+        )
+        .is_empty());
     }
 
     #[test]
