@@ -17,15 +17,19 @@ use crate::remote_helper::{
 };
 use crate::ssh_control::{
     connect_prepared_ssh, connect_ssh, connect_ssh_pool, prepare_ssh_connection,
-    resolve_agent_session_count, resolve_ssh_target, validate_agent_session_count, Client,
-    PreparedSshConnection, AUTO_AGENT_SESSIONS,
+    resolve_agent_session_count, resolve_ssh_target, Client, PreparedSshConnection,
 };
 use crate::transport_model::{BridgeRuntimeOptions, BridgeTransportKind, Destination};
 use crate::{agent_proto, agent_transport, quic_agent, SshArgs};
 
+mod agent_startup;
+
+pub(crate) use agent_startup::{
+    connect_agent_bridge_transports_from_connector,
+    connect_auto_agent_bridge_transports_from_connector, should_fast_start_agent_lanes,
+};
+
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
-const AGENT_INITIAL_CONNECT_BATCH: usize = 4;
-const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 #[derive(Clone)]
@@ -191,148 +195,6 @@ impl AgentBridgeConnector for SshQuicAgentBridgeConnector {
             )
             .await
         })
-    }
-}
-
-pub(crate) async fn connect_agent_bridge_transports_from_connector(
-    connector: &dyn AgentBridgeConnector,
-    desired_sessions: usize,
-) -> Result<Vec<AgentBridgeTransport>> {
-    let desired_sessions = resolve_agent_session_count(desired_sessions);
-    validate_agent_session_count(desired_sessions)?;
-    let mut transports = Vec::with_capacity(desired_sessions);
-
-    let first = connector.connect_primary().await?;
-    let additional_agent_command = first.agent_command().to_owned();
-    transports.push(first);
-
-    let mut index = 1;
-    while index < desired_sessions {
-        let batch = (desired_sessions - index).min(AGENT_INITIAL_CONNECT_BATCH);
-        for (offset, result) in connect_additional_agent_bridge_transport_batch(
-            connector,
-            &additional_agent_command,
-            batch,
-        )
-        .await
-        .into_iter()
-        .enumerate()
-        {
-            match result {
-                Ok(transport) => transports.push(transport),
-                Err(err) => {
-                    eprintln!(
-                        "agent: additional exec transport {}/{} failed: {err:#}; continuing with {} transport(s)",
-                        index + offset + 1,
-                        desired_sessions,
-                        transports.len()
-                    );
-                }
-            }
-        }
-        index += batch;
-    }
-
-    for retry_round in 1..=AGENT_INITIAL_CONNECT_RETRY_ROUNDS {
-        let missing = desired_sessions.saturating_sub(transports.len());
-        if missing == 0 {
-            break;
-        }
-        eprintln!(
-            "agent: retrying {missing} missing exec transport(s) after partial startup (round {retry_round}/{AGENT_INITIAL_CONNECT_RETRY_ROUNDS})"
-        );
-        for result in connect_additional_agent_bridge_transport_batch(
-            connector,
-            &additional_agent_command,
-            missing.min(AGENT_INITIAL_CONNECT_BATCH),
-        )
-        .await
-        {
-            match result {
-                Ok(transport) => transports.push(transport),
-                Err(err) => {
-                    eprintln!(
-                        "agent: retry for missing exec transport failed: {err:#}; continuing with {} transport(s)",
-                        transports.len()
-                    );
-                }
-            }
-        }
-    }
-
-    eprintln!(
-        "{}",
-        format_agent_established_message(transports.len(), desired_sessions)
-    );
-    Ok(transports)
-}
-
-pub(crate) async fn connect_auto_agent_bridge_transports_from_connector(
-    connector: &dyn AgentBridgeConnector,
-    desired_sessions: usize,
-) -> Result<Vec<AgentBridgeTransport>> {
-    let desired_sessions = resolve_agent_session_count(desired_sessions);
-    validate_agent_session_count(desired_sessions)?;
-
-    let first = connector.connect_primary().await?;
-    eprintln!("{}", format_agent_fast_start_message(1, desired_sessions));
-    Ok(vec![first])
-}
-
-pub(crate) fn format_agent_established_message(established: usize, desired: usize) -> String {
-    format!("agent: established {established}/{desired} exec transport(s)")
-}
-
-pub(crate) fn format_agent_fast_start_message(established: usize, desired: usize) -> String {
-    let message = format_agent_established_message(established, desired);
-    let warming = desired.saturating_sub(established);
-    if warming == 0 {
-        message
-    } else {
-        format!("{message}; warming {warming} remaining exec transport(s) in background")
-    }
-}
-
-pub(crate) fn should_fast_start_agent_lanes(
-    fast_start_auto_lanes: bool,
-    requested_sessions: usize,
-    desired_sessions: usize,
-) -> bool {
-    fast_start_auto_lanes && requested_sessions == AUTO_AGENT_SESSIONS && desired_sessions > 1
-}
-
-async fn connect_additional_agent_bridge_transport_batch(
-    connector: &dyn AgentBridgeConnector,
-    agent_command: &str,
-    batch: usize,
-) -> Vec<Result<AgentBridgeTransport>> {
-    match batch {
-        0 => Vec::new(),
-        1 => vec![connector.connect_command(agent_command).await],
-        2 => {
-            let (first, second) = tokio::join!(
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-            );
-            vec![first, second]
-        }
-        3 => {
-            let (first, second, third) = tokio::join!(
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-            );
-            vec![first, second, third]
-        }
-        _ => {
-            let (first, second, third, fourth) = tokio::join!(
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-                connector.connect_command(agent_command),
-            );
-            vec![first, second, third, fourth]
-        }
     }
 }
 

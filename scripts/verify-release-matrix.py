@@ -45,7 +45,7 @@ AGENT_SIDECAR_SMOKE = REPO / "scripts" / "smoke-agent-sidecars.sh"
 def rust_source_text() -> str:
     return "\n".join(
         path.read_text(encoding="utf-8")
-        for path in sorted((REPO / "src").glob("*.rs"))
+        for path in sorted((REPO / "src").rglob("*.rs"))
     )
 
 EXPECTED = [
