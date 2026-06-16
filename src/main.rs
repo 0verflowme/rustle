@@ -67,8 +67,9 @@ use data_plane::BridgeAdmissionLimits;
 use data_plane::{
     bridge_admission_decision, query_dns_over_transport, spawn_dns_query,
     spawn_udp_association_with_idle_timeout, BridgeAdmissionDecision, BridgeRuntime,
-    BridgeRuntimeOptions, BridgeTransportKind, DnsResponseEvent, DnsTransport, UdpAssociation,
-    UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey, UDP_DATAGRAMS_PER_ASSOCIATION,
+    BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsResponseEvent, DnsTransport,
+    UdpAssociation, UdpAssociationEvents, UdpAssociationTransport, UdpFlowKey,
+    UDP_DATAGRAMS_PER_ASSOCIATION,
 };
 #[cfg(test)]
 use data_plane::{
@@ -5808,12 +5809,6 @@ fn default_username() -> Option<String> {
                 .ok()
                 .filter(|value| !value.is_empty())
         })
-}
-
-#[derive(Clone, Debug)]
-struct Destination {
-    host: String,
-    port: u16,
 }
 
 #[derive(Debug)]

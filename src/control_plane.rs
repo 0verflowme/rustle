@@ -10,7 +10,9 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport, QuicNativeBridge, ReconnectingAgentBridge,
 };
-use crate::data_plane::{BridgeRuntime, BridgeRuntimeOptions, BridgeTransportKind, DnsTransport};
+use crate::data_plane::{
+    BridgeRuntime, BridgeRuntimeOptions, BridgeTransportKind, Destination, DnsTransport,
+};
 use crate::remote_helper::{
     local_agent_binary_for_platform, probe_remote_platform, upload_agent_binary,
     uploaded_agent_command, uploaded_helper_command,
@@ -18,7 +20,7 @@ use crate::remote_helper::{
 use crate::{
     agent_proto, agent_transport, connect_prepared_ssh, connect_ssh, connect_ssh_pool,
     prepare_ssh_connection, quic_agent, resolve_agent_session_count, resolve_ssh_target,
-    validate_agent_session_count, Client, Destination, PreparedSshConnection, SshArgs,
+    validate_agent_session_count, Client, PreparedSshConnection, SshArgs,
     AGENT_FAST_START_WARMUP_DELAY, AGENT_INITIAL_CONNECT_BATCH, AGENT_INITIAL_CONNECT_RETRY_ROUNDS,
     AUTO_AGENT_SESSIONS, QUIC_AGENT_BOOTSTRAP_TIMEOUT,
 };

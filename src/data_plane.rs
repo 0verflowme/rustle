@@ -11,7 +11,7 @@ use crate::agent_bridge::{
 };
 #[cfg(test)]
 use crate::agent_transport;
-use crate::{agent_proto, dns, quic_agent, ssh_bridge, Destination, SshSessionPool};
+use crate::{agent_proto, dns, quic_agent, ssh_bridge, SshSessionPool};
 
 pub(crate) const MAX_DIRECT_ACTIVE_CHANNELS: usize = 512;
 pub(crate) const MAX_DIRECT_OPENING_CHANNELS: usize = 32;
@@ -36,6 +36,12 @@ pub(crate) struct BridgeRuntimeOptions {
     pub(crate) ssh_sessions: usize,
     pub(crate) agent_sessions: usize,
     pub(crate) fast_start_auto_agent_lanes: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Destination {
+    pub(crate) host: String,
+    pub(crate) port: u16,
 }
 
 pub(crate) enum BridgeRuntime {
