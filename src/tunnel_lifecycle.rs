@@ -353,3 +353,35 @@ pub(crate) fn virtual_dns_ip(tun_ip: Ipv4Addr, tun_prefix: u8) -> Result<Ipv4Add
 
     bail!("no usable virtual DNS IP in TUN subnet")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_dns_ip_uses_stable_host_inside_tun_subnet() {
+        assert_eq!(
+            virtual_dns_ip(Ipv4Addr::new(10, 255, 255, 1), 24).unwrap(),
+            Ipv4Addr::new(10, 255, 255, 53)
+        );
+        assert_eq!(
+            virtual_dns_ip(Ipv4Addr::new(10, 0, 0, 1), 30).unwrap(),
+            Ipv4Addr::new(10, 0, 0, 2)
+        );
+        assert!(virtual_dns_ip(Ipv4Addr::new(10, 0, 0, 1), 31).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_shutdown_signals_include_hangup_and_terminate() {
+        let signals: Vec<_> = unix_shutdown_signals()
+            .into_iter()
+            .map(|signal| (signal.label(), signal.os_name()))
+            .collect();
+
+        assert_eq!(
+            signals,
+            vec![("terminate", "SIGTERM"), ("hangup", "SIGHUP")]
+        );
+    }
+}

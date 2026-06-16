@@ -21,8 +21,6 @@ use crate::transport_model::{
     UdpAssociationEvents,
 };
 use crate::tun_io::TunWriter;
-#[cfg(all(unix, test))]
-pub(crate) use crate::tunnel_lifecycle::unix_shutdown_signals;
 pub(crate) use crate::tunnel_lifecycle::virtual_dns_ip;
 use crate::tunnel_lifecycle::{
     open_tun, open_tunnel_host, shutdown_signal, ShutdownSignalFuture, TunConfig, TunnelCleanup,
@@ -545,4 +543,165 @@ pub(crate) fn parse_ipv4_metadata(packet: &[u8]) -> Result<Ipv4PacketMetadata> {
         src: Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]),
         dst: Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use clap::Parser;
+
+    use super::*;
+    use crate::cli::{Cli, CommandKind};
+    use crate::transport_model::BridgeTransportKind;
+    use crate::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
+
+    #[test]
+    fn parse_ipv4_metadata_accepts_minimal_header() {
+        let packet = [
+            0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, 6, 0x00, 0x00, 192, 168, 1, 10, 10,
+            0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+
+        let metadata = parse_ipv4_metadata(&packet).expect("valid packet");
+        assert_eq!(metadata.total_len, 40);
+        assert_eq!(metadata.protocol, 6);
+        assert_eq!(metadata.src, Ipv4Addr::new(192, 168, 1, 10));
+        assert_eq!(metadata.dst, Ipv4Addr::new(10, 0, 0, 5));
+    }
+
+    #[test]
+    fn parse_ipv4_metadata_rejects_non_ipv4() {
+        let mut packet = [0_u8; 20];
+        packet[0] = 0x60;
+        let err = parse_ipv4_metadata(&packet).expect_err("IPv6 must not parse as IPv4");
+        assert!(err.to_string().contains("not IPv4"));
+    }
+
+    #[test]
+    fn validate_tun_args_accepts_full_tunnel_route() {
+        let args = TunCaptureArgs {
+            targets: vec!["0.0.0.0/0".parse().unwrap()],
+            tun_ip: DEFAULT_TUN_IP,
+            tun_prefix: DEFAULT_TUN_PREFIX,
+            mtu: DEFAULT_MTU,
+            name: None,
+            exit_after_packets: None,
+        };
+
+        validate_tun_args(&args).expect("full tunnel should expand to split routes");
+    }
+
+    #[test]
+    fn tunnel_subcommand_rejects_zero_udp_idle_timeout() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--udp-idle-timeout-ms",
+            "0",
+        ])
+        .expect("tunnel CLI with zero UDP idle timeout");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        let err = validate_tunnel_args(&args).expect_err("zero UDP timeout must be rejected");
+        assert!(err.to_string().contains("udp-idle-timeout-ms"));
+    }
+
+    #[test]
+    fn agent_tunnel_accepts_hostname_dns_remote_by_default() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--dns-remote",
+            "localhost:53",
+        ])
+        .expect("tunnel CLI with hostname DNS remote");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::Agent);
+        validate_tunnel_args(&args).expect("agent can use hostname DNS");
+    }
+
+    #[test]
+    fn explicit_auto_tunnel_validates_direct_fallback_session_count() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--bridge-transport",
+            "auto",
+            "--ssh-sessions",
+            "0",
+        ])
+        .expect("tunnel CLI with zero SSH sessions");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::Auto);
+        let err = validate_tunnel_args(&args)
+            .expect_err("explicit auto fallback needs valid ssh sessions");
+        assert!(err.to_string().contains("--ssh-sessions"));
+    }
+
+    #[test]
+    fn agent_tunnel_accepts_hostname_dns_remote() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--bridge-transport",
+            "agent",
+            "--dns-remote",
+            "localhost:53",
+        ])
+        .expect("tunnel CLI with hostname DNS remote");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        validate_tunnel_args(&args)
+            .expect("agent supports hostname DNS remote through OpenTcpHost");
+    }
+
+    #[test]
+    fn quic_native_tunnel_accepts_hostname_dns_remote() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "tunnel",
+            "-r",
+            "alice@example.com",
+            "--target",
+            "10.0.0.0/8",
+            "--bridge-transport",
+            "quic-native",
+            "--dns-remote",
+            "localhost:53",
+        ])
+        .expect("tunnel CLI with native QUIC hostname DNS remote");
+
+        let Some(CommandKind::Tunnel(args)) = cli.command else {
+            panic!("expected tunnel subcommand");
+        };
+        validate_tunnel_args(&args)
+            .expect("native QUIC supports hostname DNS remote through TCP host open");
+    }
 }
