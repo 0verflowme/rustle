@@ -186,10 +186,11 @@ pub(crate) fn parse_ssh_config_for_host(contents: &str, host: &str) -> Result<Ss
             "identityfile" => {
                 matched.identity_files.push(value.clone());
             }
-            "userknownhostsfile" if matched.user_known_hosts_file.is_none() => {
-                if !value.eq_ignore_ascii_case("none") {
-                    matched.user_known_hosts_file = Some(value.clone());
-                }
+            "userknownhostsfile"
+                if matched.user_known_hosts_file.is_none()
+                    && !value.eq_ignore_ascii_case("none") =>
+            {
+                matched.user_known_hosts_file = Some(value.clone());
             }
             _ => {}
         }

@@ -327,11 +327,10 @@ impl TunnelStats {
         udp_inflight: &DnsInflight,
         agent: DataPlaneRuntimeSnapshot,
     ) -> String {
-        let avg_open_ms = if self.ssh_opened == 0 {
-            0
-        } else {
-            self.ssh_open_latency_total_ms / self.ssh_opened
-        };
+        let avg_open_ms = self
+            .ssh_open_latency_total_ms
+            .checked_div(self.ssh_opened)
+            .unwrap_or(0);
 
         format!(
             "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} backlog_overflow:{} stale_bridge:{}",
@@ -1301,11 +1300,20 @@ impl RemoteBacklogs {
 
     pub(crate) fn should_pause_bridge_events(&self) -> bool {
         self.total_bytes >= self.bridge_event_pause_threshold()
+            || self
+                .flows
+                .values()
+                .any(|backlog| backlog.bytes >= self.bridge_event_per_flow_pause_threshold())
     }
 
     pub(crate) fn bridge_event_pause_threshold(&self) -> usize {
         self.max_total_bytes
             .saturating_sub(self.max_total_bytes / 4)
+    }
+
+    pub(crate) fn bridge_event_per_flow_pause_threshold(&self) -> usize {
+        self.max_bytes_per_flow
+            .saturating_sub(self.max_bytes_per_flow / 4)
     }
 
     pub(crate) fn push(
@@ -2191,6 +2199,33 @@ mod tests {
 
         backlogs.remove_flow(first);
         assert!(!backlogs.should_pause_bridge_events());
+    }
+
+    #[test]
+    fn remote_backlog_pauses_bridge_events_at_per_flow_high_watermark() {
+        let flow = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+        );
+        let id = tcp_core::FlowId::new(flow, 1);
+        let mut backlogs = RemoteBacklogs::with_limits(8, 128);
+
+        assert_eq!(backlogs.bridge_event_per_flow_pause_threshold(), 6);
+        assert!(!backlogs.should_pause_bridge_events());
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"hello")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(backlogs.total_bytes(), 5);
+        assert!(!backlogs.should_pause_bridge_events());
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"!")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(backlogs.total_bytes(), 6);
+        assert!(backlogs.should_pause_bridge_events());
     }
 
     #[test]

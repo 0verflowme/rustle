@@ -57,10 +57,8 @@ pub(crate) async fn run_direct_tcpip(args: DirectTcpipArgs) -> Result<()> {
                     .context("failed to write channel extended data to stdout")?;
             }
             russh::ChannelMsg::Eof => break,
-            russh::ChannelMsg::ExitStatus { exit_status } => {
-                if exit_status != 0 {
-                    bail!("remote channel returned non-zero exit status {exit_status}");
-                }
+            russh::ChannelMsg::ExitStatus { exit_status } if exit_status != 0 => {
+                bail!("remote channel returned non-zero exit status {exit_status}");
             }
             _ => {}
         }
