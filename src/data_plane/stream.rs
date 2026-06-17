@@ -7,6 +7,23 @@ use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream};
 #[cfg(test)]
 use crate::agent_transport;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct StreamSendMetrics {
+    pub(crate) agent_credit_wait_us: u128,
+    pub(crate) agent_outbound_wait_us: u128,
+    pub(crate) agent_outbound_frames: u64,
+}
+
+impl From<crate::agent_transport::AgentStreamSendMetrics> for StreamSendMetrics {
+    fn from(metrics: crate::agent_transport::AgentStreamSendMetrics) -> Self {
+        Self {
+            agent_credit_wait_us: metrics.credit_wait_us,
+            agent_outbound_wait_us: metrics.outbound_wait_us,
+            agent_outbound_frames: metrics.frames,
+        }
+    }
+}
+
 pub(crate) enum AgentIoStream {
     Bridge(AgentBridgeStream),
     QuicNativeTcp(QuicNativeBridgeStream),
@@ -17,12 +34,25 @@ pub(crate) enum AgentIoStream {
 
 impl AgentIoStream {
     pub(crate) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
+        self.send_data_with_metrics(bytes).await.map(|_| ())
+    }
+
+    pub(crate) async fn send_data_with_metrics(
+        &mut self,
+        bytes: impl Into<Bytes>,
+    ) -> Result<StreamSendMetrics> {
         match self {
-            Self::Bridge(stream) => stream.send_data(bytes).await,
-            Self::QuicNativeTcp(stream) => stream.send_data(bytes.into()).await,
-            Self::QuicNativeUdp(stream) => stream.send_datagram(bytes.into()).await,
+            Self::Bridge(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
+            Self::QuicNativeTcp(stream) => {
+                stream.send_data(bytes.into()).await?;
+                Ok(StreamSendMetrics::default())
+            }
+            Self::QuicNativeUdp(stream) => {
+                stream.send_datagram(bytes.into()).await?;
+                Ok(StreamSendMetrics::default())
+            }
             #[cfg(test)]
-            Self::Raw(stream) => stream.send_data(bytes).await,
+            Self::Raw(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
         }
     }
 

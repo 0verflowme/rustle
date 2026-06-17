@@ -22,6 +22,9 @@ TIMING_FIELDS = (
 OPTIONAL_COUNTER_FIELDS = (
     "local_send_wait_us",
     "local_send_waits",
+    "agent_send_credit_wait_us",
+    "agent_send_outbound_wait_us",
+    "agent_send_frames",
     "remote_event_wait_us",
     "remote_event_waits",
 )
@@ -159,6 +162,16 @@ def summarize(text: str) -> list[dict[str, object]]:
             for row in rows
             if "local_send_wait_us" in row
         ]
+        agent_send_credit_wait_values = [
+            parse_counter(row["agent_send_credit_wait_us"], "agent_send_credit_wait_us")
+            for row in rows
+            if "agent_send_credit_wait_us" in row
+        ]
+        agent_send_outbound_wait_values = [
+            parse_counter(row["agent_send_outbound_wait_us"], "agent_send_outbound_wait_us")
+            for row in rows
+            if "agent_send_outbound_wait_us" in row
+        ]
         remote_event_wait_values = [
             parse_counter(row["remote_event_wait_us"], "remote_event_wait_us")
             for row in rows
@@ -166,6 +179,8 @@ def summarize(text: str) -> list[dict[str, object]]:
         ]
         wait_p50 = {
             "local_send_wait_us": percentile(local_send_wait_values, 50),
+            "agent_send_credit_wait_us": percentile(agent_send_credit_wait_values, 50),
+            "agent_send_outbound_wait_us": percentile(agent_send_outbound_wait_values, 50),
             "remote_event_wait_us": percentile(remote_event_wait_values, 50),
         }
         likely_bottleneck = max(
@@ -184,6 +199,13 @@ def summarize(text: str) -> list[dict[str, object]]:
             if "local_send_waits" in row
         )
         local_send_wait_total = sum(local_send_wait_values)
+        agent_send_credit_wait_total = sum(agent_send_credit_wait_values)
+        agent_send_outbound_wait_total = sum(agent_send_outbound_wait_values)
+        agent_send_frames = sum(
+            parse_counter(row["agent_send_frames"], "agent_send_frames")
+            for row in rows
+            if "agent_send_frames" in row
+        )
         remote_event_waits = sum(
             parse_counter(row["remote_event_waits"], "remote_event_waits")
             for row in rows
@@ -221,6 +243,15 @@ def summarize(text: str) -> list[dict[str, object]]:
                 "local_send_wait_p50_ms": format_ms(wait_p50["local_send_wait_us"]),
                 "local_send_wait_total_ms": format_ms(local_send_wait_total),
                 "local_send_waits": local_send_waits,
+                "agent_send_credit_wait_p50_ms": format_ms(
+                    wait_p50["agent_send_credit_wait_us"]
+                ),
+                "agent_send_credit_wait_total_ms": format_ms(agent_send_credit_wait_total),
+                "agent_send_outbound_wait_p50_ms": format_ms(
+                    wait_p50["agent_send_outbound_wait_us"]
+                ),
+                "agent_send_outbound_wait_total_ms": format_ms(agent_send_outbound_wait_total),
+                "agent_send_frames": agent_send_frames,
                 "remote_event_wait_p50_ms": format_ms(wait_p50["remote_event_wait_us"]),
                 "remote_event_wait_total_ms": format_ms(remote_event_wait_total),
                 "remote_event_waits": remote_event_waits,
@@ -257,6 +288,11 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "local_send_wait_p50_ms",
         "local_send_wait_total_ms",
         "local_send_waits",
+        "agent_send_credit_wait_p50_ms",
+        "agent_send_credit_wait_total_ms",
+        "agent_send_outbound_wait_p50_ms",
+        "agent_send_outbound_wait_total_ms",
+        "agent_send_frames",
         "remote_event_wait_p50_ms",
         "remote_event_wait_total_ms",
         "remote_event_waits",
@@ -290,8 +326,8 @@ def self_test() -> None:
     sample = "\n".join(
         [
             "unrelated log line",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\tlocal_send_wait_us=7000\tlocal_send_waits=2\tremote_event_wait_us=5000\tremote_event_waits=1\toutcome=remote_eof",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\tlocal_send_wait_us=11000\tlocal_send_waits=3\tremote_event_wait_us=9000\tremote_event_waits=2\toutcome=closed",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\tlocal_send_wait_us=7000\tlocal_send_waits=2\tagent_send_credit_wait_us=6000\tagent_send_outbound_wait_us=1000\tagent_send_frames=2\tremote_event_wait_us=5000\tremote_event_waits=1\toutcome=remote_eof",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\tlocal_send_wait_us=11000\tlocal_send_waits=3\tagent_send_credit_wait_us=2000\tagent_send_outbound_wait_us=9000\tagent_send_frames=3\tremote_event_wait_us=9000\tremote_event_waits=2\toutcome=closed",
             "rustle_hotpath_tcp\ttransport=quic-native\tflow=10.0.0.3:49154->198.18.77.77:80\tgeneration=1\tstream_ready_us=500\topened_us=1500\tfirst_local_us=-\tfirst_local_sent_us=-\tfirst_remote_us=-\tduration_us=2500\tlocal_bytes=0\tremote_bytes=0\toutcome=open_timeout",
         ]
     )
@@ -311,6 +347,11 @@ def self_test() -> None:
     assert agent["local_send_wait_p50_ms"] == "7.000"
     assert agent["local_send_wait_total_ms"] == "18.000"
     assert agent["local_send_waits"] == 5
+    assert agent["agent_send_credit_wait_p50_ms"] == "2.000"
+    assert agent["agent_send_credit_wait_total_ms"] == "8.000"
+    assert agent["agent_send_outbound_wait_p50_ms"] == "1.000"
+    assert agent["agent_send_outbound_wait_total_ms"] == "10.000"
+    assert agent["agent_send_frames"] == 5
     assert agent["remote_event_wait_p50_ms"] == "5.000"
     assert agent["remote_event_wait_total_ms"] == "14.000"
     assert agent["remote_event_waits"] == 3

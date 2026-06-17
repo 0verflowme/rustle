@@ -124,12 +124,17 @@ where
                             let send_started_at = StdInstant::now();
                             let send_result = tokio::time::timeout(
                                 ssh_bridge::BRIDGE_WRITE_TIMEOUT,
-                                stream.send_data(bytes.clone()),
+                                stream.send_data_with_metrics(bytes.clone()),
                             )
                             .await;
                             trace.local_send_wait(send_started_at);
                             match send_result {
-                                Ok(Ok(())) => {
+                                Ok(Ok(metrics)) => {
+                                    trace.agent_send_waits(
+                                        metrics.credit_wait_us,
+                                        metrics.outbound_wait_us,
+                                        metrics.frames,
+                                    );
                                     trace.local_sent();
                                 }
                                 Ok(Err(err)) => {

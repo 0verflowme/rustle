@@ -33,6 +33,28 @@ type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
 type FailureState = Arc<Mutex<Option<String>>>;
 type HeartbeatState = Arc<Mutex<AgentHeartbeat>>;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AgentStreamSendMetrics {
+    pub(crate) credit_wait_us: u128,
+    pub(crate) outbound_wait_us: u128,
+    pub(crate) frames: u64,
+}
+
+impl AgentStreamSendMetrics {
+    fn record_credit_wait(&mut self, started_at: Instant) {
+        self.credit_wait_us = self
+            .credit_wait_us
+            .saturating_add(started_at.elapsed().as_micros());
+    }
+
+    fn record_outbound_wait(&mut self, started_at: Instant) {
+        self.outbound_wait_us = self
+            .outbound_wait_us
+            .saturating_add(started_at.elapsed().as_micros());
+        self.frames = self.frames.saturating_add(1);
+    }
+}
+
 #[derive(Clone, Debug)]
 struct StreamEntry {
     inbound: mpsc::Sender<AgentFrame>,
@@ -418,9 +440,18 @@ impl AgentStream {
     }
 
     pub async fn send_data(&self, bytes: impl Into<Bytes>) -> Result<()> {
+        self.send_data_with_metrics(bytes).await.map(|_| ())
+    }
+
+    pub(crate) async fn send_data_with_metrics(
+        &self,
+        bytes: impl Into<Bytes>,
+    ) -> Result<AgentStreamSendMetrics> {
+        let mut metrics = AgentStreamSendMetrics::default();
         let bytes = bytes.into();
         if bytes.is_empty() {
-            return self.send_data_frame(bytes).await;
+            self.send_data_frame(bytes, &mut metrics).await?;
+            return Ok(metrics);
         }
 
         let mut offset = 0;
@@ -428,15 +459,21 @@ impl AgentStream {
             let end = offset
                 .saturating_add(self.max_frame_payload)
                 .min(bytes.len());
-            self.send_data_frame(bytes.slice(offset..end)).await?;
+            self.send_data_frame(bytes.slice(offset..end), &mut metrics)
+                .await?;
             offset = end;
         }
-        Ok(())
+        Ok(metrics)
     }
 
-    async fn send_data_frame(&self, bytes: Bytes) -> Result<()> {
+    async fn send_data_frame(
+        &self,
+        bytes: Bytes,
+        metrics: &mut AgentStreamSendMetrics,
+    ) -> Result<()> {
         ensure_agent_ready(&self.failure).await?;
         let frame = AgentFrame::new(AgentFrameKind::Data, self.stream_id, bytes)?;
+        let credit_started_at = Instant::now();
         let permits = if frame.payload.is_empty() {
             None
         } else {
@@ -448,7 +485,10 @@ impl AgentStream {
                     .context("agent stream send window is closed")?,
             )
         };
-        self.send_frame(frame).await?;
+        if permits.is_some() {
+            metrics.record_credit_wait(credit_started_at);
+        }
+        self.send_frame_with_metrics(frame, metrics).await?;
         if let Some(permits) = permits {
             permits.forget();
         }
@@ -527,6 +567,23 @@ impl AgentStream {
         .await
     }
 
+    async fn send_frame_with_metrics(
+        &self,
+        frame: AgentFrame,
+        metrics: &mut AgentStreamSendMetrics,
+    ) -> Result<()> {
+        send_agent_transport_frame_with_metrics(
+            &self.outbound,
+            &self.streams,
+            &self.failure,
+            frame,
+            AGENT_FRAME_SEND_TIMEOUT,
+            "agent stream frame",
+            metrics,
+        )
+        .await
+    }
+
     async fn record_received_data_credit(&mut self, bytes: usize) -> Result<()> {
         if let Some(credit) = self.receive_window.record_consumed(bytes) {
             self.grant_receive_credit(credit).await?;
@@ -560,15 +617,43 @@ async fn send_agent_transport_frame(
     timeout: Duration,
     context: &str,
 ) -> Result<()> {
+    let mut metrics = AgentStreamSendMetrics::default();
+    send_agent_transport_frame_with_metrics(
+        outbound,
+        streams,
+        failure,
+        frame,
+        timeout,
+        context,
+        &mut metrics,
+    )
+    .await
+}
+
+async fn send_agent_transport_frame_with_metrics(
+    outbound: &mpsc::Sender<AgentFrame>,
+    streams: &StreamMap,
+    failure: &FailureState,
+    frame: AgentFrame,
+    timeout: Duration,
+    context: &str,
+    metrics: &mut AgentStreamSendMetrics,
+) -> Result<()> {
     ensure_agent_ready(failure).await?;
+    let outbound_started_at = Instant::now();
     match tokio::time::timeout(timeout, outbound.send(frame)).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(())) => {
+            metrics.record_outbound_wait(outbound_started_at);
+            Ok(())
+        }
         Ok(Err(_)) => {
+            metrics.record_outbound_wait(outbound_started_at);
             let message = "agent writer task is closed".to_owned();
             mark_agent_failed(failure, streams, message.clone()).await;
             Err(anyhow!(message))
         }
         Err(_) => {
+            metrics.record_outbound_wait(outbound_started_at);
             let message = format!(
                 "timed out after {}ms enqueueing {context}",
                 timeout.as_millis()

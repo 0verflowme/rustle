@@ -143,6 +143,22 @@ impl AgentBridgeStream {
         result
     }
 
+    pub(crate) async fn send_data_with_metrics(
+        &self,
+        bytes: impl Into<Bytes>,
+    ) -> Result<agent_transport::AgentStreamSendMetrics> {
+        let result = self
+            .inner
+            .as_ref()
+            .context("agent bridge stream is already closed")?
+            .send_data_with_metrics(bytes)
+            .await;
+        if result.is_err() {
+            self.schedule_repair_if_transport_failed().await;
+        }
+        result
+    }
+
     pub(crate) async fn send_eof(&self) -> Result<()> {
         let result = self
             .inner

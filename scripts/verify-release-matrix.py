@@ -1148,6 +1148,8 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "first_byte_wait_p50_ms",
     "body_drain_p50_ms",
     "local_send_wait_p50_ms",
+    "agent_send_credit_wait_p50_ms",
+    "agent_send_outbound_wait_p50_ms",
     "remote_event_wait_p50_ms",
     "likely_bottleneck",
     "first_remote_p95_ms",
