@@ -1256,6 +1256,7 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "rustle_hotpath_tcp",
     "paths",
     "remote_open_wait_p50_ms",
+    "ready_wait_p50_ms",
     "payload_queue_wait_p50_ms",
     "first_byte_wait_p50_ms",
     "body_drain_p50_ms",

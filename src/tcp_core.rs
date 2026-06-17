@@ -512,6 +512,13 @@ impl FlowManager {
         Ok(entry.state)
     }
 
+    pub fn flow_state_elapsed_ms(&self, flow: FlowKey, now: Instant) -> Result<u64> {
+        let Some(entry) = self.flows.get(&flow) else {
+            bail!("flow {flow:?} does not exist");
+        };
+        Ok((now - entry.state_since).total_millis())
+    }
+
     pub fn mark_flow_state(&mut self, flow: FlowKey, state: FlowState) -> Result<()> {
         let Some(entry) = self.flows.get_mut(&flow) else {
             bail!("flow {flow:?} does not exist");
@@ -1178,6 +1185,41 @@ mod tests {
 
         assert_eq!(ids, vec![id]);
         assert_eq!(ids.capacity(), capacity);
+    }
+
+    #[test]
+    fn flow_manager_reports_current_state_age() {
+        let packet = ipv4_tcp_packet(0x02, 0);
+        let flow = parse_ipv4_tcp_segment(&packet)
+            .expect("valid packet")
+            .expect("TCP segment")
+            .flow;
+        let mut manager = FlowManager::new(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+        )
+        .expect("flow manager");
+        manager
+            .ingest_packet(Instant::from_millis(5), &packet)
+            .expect("SYN");
+
+        assert_eq!(
+            manager
+                .flow_state_elapsed_ms(flow, Instant::from_millis(9))
+                .expect("handshake age"),
+            4
+        );
+        manager
+            .mark_flow_state_at(flow, FlowState::TcpEstablished, Instant::from_millis(20))
+            .expect("mark established");
+        assert_eq!(
+            manager
+                .flow_state_elapsed_ms(flow, Instant::from_millis(27))
+                .expect("ready age"),
+            7
+        );
     }
 
     #[test]

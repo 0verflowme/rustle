@@ -18,6 +18,7 @@ const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
 pub(super) fn spawn_direct_tcpip_bridge(
     id: tcp_core::FlowId,
+    _ready_wait_ms: u64,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ssh: SshSessionPool,
 ) -> ssh_bridge::FlowBridge {
@@ -42,6 +43,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
     spawn_agent_tcp_bridge_with_open(
         id,
         event_tx,
+        0,
         agent.clone(),
         open_agent_tcp_stream(agent, open),
     )
@@ -50,6 +52,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
 pub(super) fn spawn_agent_tcp_bridge_with_open<Fut>(
     id: tcp_core::FlowId,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    ready_wait_ms: u64,
     agent: ReconnectingAgentBridge,
     open_stream: Fut,
 ) -> ssh_bridge::FlowBridge
@@ -57,7 +60,7 @@ where
     Fut: Future<Output = Result<AgentIoStream>> + Send + 'static,
 {
     ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
-        let mut trace = TcpFlowTrace::new("agent", id);
+        let mut trace = TcpFlowTrace::new("agent", id, ready_wait_ms);
         let open_started_at = StdInstant::now();
         let open = tcp_open_request(id);
         let mut stream = match open_stream.await {
@@ -445,11 +448,12 @@ async fn open_agent_tcp_stream(
 
 pub(super) fn spawn_quic_native_tcp_bridge(
     id: tcp_core::FlowId,
+    ready_wait_ms: u64,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     bridge: QuicNativeBridge,
 ) -> ssh_bridge::FlowBridge {
     ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
-        let mut trace = TcpFlowTrace::new("quic-native", id);
+        let mut trace = TcpFlowTrace::new("quic-native", id, ready_wait_ms);
         let open_started_at = StdInstant::now();
         let open = agent_proto::AgentOpenIpv4 {
             destination_ip: id.key.dst_ip,

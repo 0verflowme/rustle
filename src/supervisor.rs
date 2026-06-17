@@ -416,7 +416,7 @@ fn execute_tcp_bridge_starts(
     event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
 ) -> Result<()> {
     for start in starts.drain(..) {
-        let bridge = data_plane.spawn_tcp_bridge(start.id, event_tx.clone());
+        let bridge = data_plane.spawn_tcp_bridge(start.id, start.ready_wait_ms, event_tx.clone());
         engine.register_tcp_bridge(start, bridge)?;
     }
     Ok(())

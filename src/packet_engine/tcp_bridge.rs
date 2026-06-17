@@ -20,6 +20,7 @@ pub(crate) struct BridgeAdmissionStats {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct TcpBridgeStart {
     pub(crate) id: tcp_core::FlowId,
+    pub(crate) ready_wait_ms: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
@@ -53,7 +54,7 @@ pub(crate) fn ensure_bridges<F>(
     now: SmolInstant,
 ) -> Result<BridgeAdmissionStats>
 where
-    F: FnMut(tcp_core::FlowId, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
+    F: FnMut(TcpBridgeStart, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
 {
     let mut starts = Vec::new();
     let mut opening_flow_keys = Vec::new();
@@ -67,7 +68,7 @@ where
         &mut starts,
     )?;
     for start in starts.drain(..) {
-        let bridge = spawn_bridge(start.id, event_tx.clone());
+        let bridge = spawn_bridge(start, event_tx.clone());
         register_tcp_bridge(flow_manager, bridges, start, bridge)?;
     }
     Ok(stats)
@@ -104,8 +105,9 @@ pub(crate) fn plan_bridge_starts(
             }
         }
 
+        let ready_wait_ms = flow_manager.flow_state_elapsed_ms(flow, now)?;
         flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::SshOpening, now)?;
-        starts.push(TcpBridgeStart { id });
+        starts.push(TcpBridgeStart { id, ready_wait_ms });
         active_channels += 1;
         opening_channels += 1;
     }

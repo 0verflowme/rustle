@@ -1651,12 +1651,96 @@ mod tests {
         .expect("plan bridge starts");
 
         assert_eq!(stats, BridgeAdmissionStats::default());
-        assert_eq!(starts, vec![TcpBridgeStart { id }]);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].id, id);
+        assert!(starts[0].ready_wait_ms <= 10);
         assert_eq!(
             manager.flow_state(flow).expect("flow state"),
             tcp_core::FlowState::SshOpening
         );
         assert!(bridges.is_empty());
+    }
+
+    #[test]
+    fn planned_bridge_start_records_ready_wait_after_deferred_admission() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let deferred = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 0,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("defer bridge starts");
+
+        assert_eq!(
+            deferred,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert!(starts.is_empty());
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::TcpEstablished
+        );
+
+        let plan_now = SmolInstant::from_millis(25);
+        let expected_ready_wait_ms = manager
+            .flow_state_elapsed_ms(flow, plan_now)
+            .expect("flow ready age");
+        let admitted = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            plan_now,
+            &mut starts,
+        )
+        .expect("admit bridge starts");
+
+        assert_eq!(admitted, BridgeAdmissionStats::default());
+        assert_eq!(
+            starts,
+            vec![TcpBridgeStart {
+                id,
+                ready_wait_ms: expected_ready_wait_ms,
+            }]
+        );
+        assert!(starts[0].ready_wait_ms >= 15);
     }
 
     #[tokio::test]

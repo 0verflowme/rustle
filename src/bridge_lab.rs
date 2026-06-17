@@ -262,7 +262,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             &mut flow_manager,
             &mut bridges,
             data_plane.admission_limits(),
-            |id, event_tx| data_plane.spawn_tcp_bridge(id, event_tx),
+            |start, event_tx| data_plane.spawn_tcp_bridge(start.id, start.ready_wait_ms, event_tx),
             event_tx.clone(),
             &mut ready_flow_ids,
             now,

@@ -18,6 +18,7 @@ HOTPATH_COLUMNS = {
     "transport",
     "flows",
     "failed_flows",
+    "ready_wait_p50_ms",
     "local_queue_wait_p50_ms",
     "likely_bottleneck",
 }
@@ -204,6 +205,7 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "stream_ready_p50_ms\topened_p50_ms\tfirst_local_p50_ms\t"
                     "first_local_sent_p50_ms\tfirst_remote_p50_ms\t"
                     "first_remote_p95_ms\tremote_open_wait_p50_ms\t"
+                    "ready_wait_p50_ms\tready_wait_total_ms\t"
                     "payload_queue_wait_p50_ms\tfirst_byte_wait_p50_ms\t"
                     "body_drain_p50_ms\tlocal_send_wait_p50_ms\t"
                     "local_send_wait_total_ms\tlocal_send_waits\t"
@@ -218,7 +220,8 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                 ),
                 (
                     "agent\t2\t2\t0\t512\t4096\t0.100\t0.200\t0.300\t"
-                    "0.400\t0.500\t0.700\t0.100\t0.100\t0.100\t0.200\t"
+                    "0.400\t0.500\t0.700\t0.100\t0.050\t0.100\t0.100\t"
+                    "0.100\t0.200\t"
                     "0.000\t0.000\t0\t0.000\t0.000\t0\t0.000\t0.000\t"
                     "0.000\t0.000\t4\t0.000\t0.000\t0\t1.000\t2.000\t"
                     "1.95\tbody_drain"

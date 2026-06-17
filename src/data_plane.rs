@@ -49,6 +49,7 @@ pub(crate) trait DataPlane: Send + Sync {
     fn spawn_tcp_bridge(
         &self,
         id: tcp_core::FlowId,
+        ready_wait_ms: u64,
         event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ) -> ssh_bridge::FlowBridge;
     fn query_dns(
@@ -171,9 +172,10 @@ impl DataPlane for DirectTcpipDataPlane {
     fn spawn_tcp_bridge(
         &self,
         id: tcp_core::FlowId,
+        ready_wait_ms: u64,
         event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ) -> ssh_bridge::FlowBridge {
-        spawn_direct_tcpip_bridge(id, event_tx, self.ssh.clone())
+        spawn_direct_tcpip_bridge(id, ready_wait_ms, event_tx, self.ssh.clone())
     }
 
     fn query_dns(
@@ -233,6 +235,7 @@ impl DataPlane for FramedAgentDataPlane {
     fn spawn_tcp_bridge(
         &self,
         id: tcp_core::FlowId,
+        ready_wait_ms: u64,
         event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ) -> ssh_bridge::FlowBridge {
         let flow = id.key;
@@ -249,6 +252,7 @@ impl DataPlane for FramedAgentDataPlane {
         spawn_agent_tcp_bridge_with_open(
             id,
             event_tx,
+            ready_wait_ms,
             self.agent.clone(),
             self.open_tcp_ipv4_optimistic(open),
         )
@@ -305,6 +309,7 @@ impl DataPlane for QuicNativeDataPlane {
     fn spawn_tcp_bridge(
         &self,
         id: tcp_core::FlowId,
+        ready_wait_ms: u64,
         event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ) -> ssh_bridge::FlowBridge {
         let flow = id.key;
@@ -312,7 +317,7 @@ impl DataPlane for QuicNativeDataPlane {
             "quic-native: opening stream {}:{} for local {}:{} generation={}",
             flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
         );
-        spawn_quic_native_tcp_bridge(id, event_tx, self.bridge.clone())
+        spawn_quic_native_tcp_bridge(id, ready_wait_ms, event_tx, self.bridge.clone())
     }
 
     fn query_dns(
