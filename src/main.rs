@@ -37,6 +37,7 @@ mod supervisor;
 #[allow(dead_code)]
 mod tcp_core;
 mod transport_model;
+mod tun_capture;
 mod tun_io;
 mod tunnel_lifecycle;
 
@@ -46,7 +47,8 @@ use cli::{Cli, CommandKind};
 pub(crate) use cli::{SshArgs, TunCaptureArgs, TunnelArgs};
 use command_runtime::{run_compact_tunnel, run_direct_tcpip};
 use helper_runtime::{run_agent, run_quic_agent, run_quic_bridge_agent};
-use supervisor::{run_tun_capture, run_tunnel};
+use supervisor::run_tunnel;
+use tun_capture::run_tun_capture;
 
 #[tokio::main]
 async fn main() -> Result<()> {
