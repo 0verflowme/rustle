@@ -1,3 +1,4 @@
+mod agent_lane_batch;
 mod agent_policy;
 mod agent_startup;
 mod quic_bootstrap;
