@@ -1060,6 +1060,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
         '"${SCRIPT_DIR}/stress-bridge-lab.sh"',
     ),
     (
+        VERIFY_LOCAL,
+        'RUSTLE_BENCH_ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR}/live-compare"',
+    ),
+    (
         VERIFY_RELEASE_CANDIDATE,
         "require_env RUSTLE_LIVE_REMOTE",
     ),
@@ -1107,6 +1111,26 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
         VERIFY_RELEASE_CANDIDATE,
         "RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO",
     ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "EVIDENCE_DIR=",
+    ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "target/live-evidence/release-candidate-",
+    ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "HOTPATH_TRACE=",
+    ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "RUSTLE_HOTPATH_TRACE",
+    ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "RUSTLE_BENCH_ARTIFACT_DIR",
+    ),
 ]
 
 REQUIRED_LIVE_FIXTURE_SNIPPETS = [
@@ -1140,6 +1164,10 @@ REQUIRED_LIVE_FIXTURE_SNIPPETS = [
     "sock.close()",
     "RUSTLE_BENCH_EXPECT=rustle-live-fixture",
     "RUSTLE_BENCH_EXPECT_BYTES",
+    "ARTIFACT_DIR",
+    "fixture_artifact_dir",
+    "fixture-%s-bytes",
+    "fixture-results.tsv",
     "bench-live-compare.sh",
 ]
 

@@ -40,6 +40,9 @@ DEFAULT_BENCH_RUSTLE_TRANSPORTS="agent direct-tcpip"
 if [[ -n "${RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO:-}" || -n "${RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO:-}" ]]; then
   DEFAULT_BENCH_RUSTLE_TRANSPORTS="agent direct-tcpip quic-native"
 fi
+EVIDENCE_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-${PWD}/target/live-evidence/release-candidate-$(date -u +%Y%m%dT%H%M%SZ)}"
+HOTPATH_TRACE="${RUSTLE_HOTPATH_TRACE:-1}"
+mkdir -p "$EVIDENCE_DIR"
 
 verify_info() {
   smoke_info "release-candidate: $*"
@@ -47,6 +50,7 @@ verify_info() {
 
 verify_info "running full local verifier with privileged, DNS takeover, live TCP, live fixture, and live UDP gates required"
 verify_info "live target: ${RUSTLE_LIVE_REMOTE} ${RUSTLE_LIVE_TARGET_CIDR} ${RUSTLE_LIVE_URL}"
+verify_info "live evidence artifacts: ${EVIDENCE_DIR}"
 
 env \
   RUSTLE_VERIFY_PRIVILEGED=1 \
@@ -62,6 +66,8 @@ env \
   RUSTLE_BENCH_CONCURRENCY="${RUSTLE_BENCH_CONCURRENCY:-4}" \
   RUSTLE_BENCH_RUNS="${RUSTLE_BENCH_RUNS:-3}" \
   RUSTLE_BENCH_WARMUP_RUNS="${RUSTLE_BENCH_WARMUP_RUNS:-1}" \
+  RUSTLE_HOTPATH_TRACE="${HOTPATH_TRACE}" \
+  RUSTLE_BENCH_ARTIFACT_DIR="${EVIDENCE_DIR}" \
   RUSTLE_BENCH_TOOLS="rustle sshuttle" \
   RUSTLE_BENCH_RUSTLE_TRANSPORTS="${RUSTLE_BENCH_RUSTLE_TRANSPORTS:-$DEFAULT_BENCH_RUSTLE_TRANSPORTS}" \
   RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO="${MAX_AGENT_SSHUTTLE_P50_RATIO}" \

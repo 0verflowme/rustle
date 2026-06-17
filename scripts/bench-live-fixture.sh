@@ -20,6 +20,7 @@ FIXTURE_PYTHON="${RUSTLE_FIXTURE_PYTHON:-python3}"
 FIXTURE_LISTEN_BACKLOG="${RUSTLE_FIXTURE_LISTEN_BACKLOG:-256}"
 FIXTURE_TTL_SECONDS="${RUSTLE_FIXTURE_TTL_SECONDS:-3600}"
 TARGET_CIDR="${RUSTLE_FIXTURE_TARGET_CIDR:-${RUSTLE_BENCH_TARGET_CIDR:-}}"
+ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_FIXTURE_REMOTE or RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$FIXTURE_HOST" ]] || smoke_die "set RUSTLE_FIXTURE_HOST to the remote IP reachable through Rustle, for example 192.168.190.45"
@@ -46,6 +47,9 @@ TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-fixture.XXXXXX")"
 FIXTURE_PID=""
 FIXTURE_REMOTE_PID=""
 FIXTURE_PASSWORD_FILE=""
+if [[ -n "$ARTIFACT_DIR" ]]; then
+  mkdir -p "$ARTIFACT_DIR"
+fi
 
 cleanup() {
   stop_fixture
@@ -277,6 +281,12 @@ verify_fixture_benchmark_rows() {
   fi
 }
 
+fixture_artifact_dir() {
+  local body_bytes="$1"
+  [[ -n "$ARTIFACT_DIR" ]] || return 0
+  printf '%s/fixture-%s-bytes\n' "$ARTIFACT_DIR" "$body_bytes"
+}
+
 for body_bytes in $FIXTURE_BODY_BYTES; do
   case "$body_bytes" in
     '' | *[!0-9]*) smoke_die "RUSTLE_FIXTURE_BODY_BYTES entries must be positive integers" ;;
@@ -292,11 +302,15 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
   FIXTURE_REMOTE_PID="$(awk '/^READY / { print $3 }' "$fixture_out" | tail -n 1)"
   fixture_url="http://${FIXTURE_HOST}:${actual_port}/"
   fixture_results="${TMPDIR}/fixture-${body_bytes}-bench.tsv"
+  bench_artifact_dir="$(fixture_artifact_dir "$body_bytes")"
   smoke_info "benchmarking live fixture body_bytes=${body_bytes} url=${fixture_url}"
 
   bench_cmd=(env)
   if [[ "${#BENCH_ENV[@]}" -gt 0 ]]; then
     bench_cmd+=("${BENCH_ENV[@]}")
+  fi
+  if [[ -n "$bench_artifact_dir" ]]; then
+    bench_cmd+=(RUSTLE_BENCH_ARTIFACT_DIR="$bench_artifact_dir")
   fi
   "${bench_cmd[@]}" \
     RUSTLE_BENCH_REMOTE="$REMOTE" \
@@ -307,6 +321,11 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
     RUSTLE_BENCH_EXPECT_BYTES="$body_bytes" \
     RUSTLE_BENCH_READY_METHOD=HEAD \
     "${SCRIPT_DIR}/bench-live-compare.sh" | tee "$fixture_results"
+  if [[ -n "$bench_artifact_dir" ]]; then
+    mkdir -p "$bench_artifact_dir"
+    cp "$fixture_results" "${bench_artifact_dir}/fixture-results.tsv"
+    smoke_info "wrote live fixture artifact ${bench_artifact_dir}/fixture-results.tsv"
+  fi
   verify_fixture_benchmark_rows "$fixture_results" "$body_bytes"
   stop_fixture
 done

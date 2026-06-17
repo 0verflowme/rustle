@@ -155,6 +155,12 @@ TUN and DNS takeover gates pass. It also requires `sshuttle`, forces
 `RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO=1.00`, proving the primary
 `rustle-agent` live benchmark matches or beats sshuttle average p50 latency on
 the same SSH server, target URL, request count, and concurrency. The live
+benchmark evidence defaults to `RUSTLE_HOTPATH_TRACE=1` and writes compact TSV
+artifacts under `target/live-evidence/release-candidate-<timestamp>` unless
+`RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison writes under
+`live-compare`, and each controlled fixture body writes under its own
+`fixture-<bytes>-bytes` directory so evidence from different body sizes is not
+overwritten. The live
 verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
 intentionally narrowing that matrix for diagnostics. Skips are useful

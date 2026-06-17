@@ -561,6 +561,12 @@ include payload bytes.
 `scripts/bench-live-compare.sh` prints the summary to stderr during cleanup when
 traced flow lines exist; set `RUSTLE_BENCH_KEEP_LOGS=1` when you also want to
 keep the raw per-run `rustle.log` files.
+`scripts/verify-release-candidate.sh` enables `RUSTLE_HOTPATH_TRACE=1` by
+default and writes compact live benchmark artifacts under
+`target/live-evidence/release-candidate-<timestamp>` unless
+`RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison uses a
+`live-compare` subdirectory, and controlled fixture runs use one
+`fixture-<bytes>-bytes` subdirectory per body size.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is

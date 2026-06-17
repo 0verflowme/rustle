@@ -286,7 +286,11 @@ if [[ "$RUN_LIVE" == "1" ]]; then
     esac
     verify_run env RUSTLE_LIVE_BRIDGE_TRANSPORT="$transport" "${SCRIPT_DIR}/smoke-live-tunnel.sh"
   done
-  verify_run "${SCRIPT_DIR}/bench-live-compare.sh"
+  LIVE_BENCH_ENV=()
+  if [[ -n "${RUSTLE_BENCH_ARTIFACT_DIR:-}" ]]; then
+    LIVE_BENCH_ENV+=(RUSTLE_BENCH_ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR}/live-compare")
+  fi
+  verify_run env "${LIVE_BENCH_ENV[@]}" "${SCRIPT_DIR}/bench-live-compare.sh"
   if [[ "$RUN_LIVE_FIXTURE" == "1" ]]; then
     verify_run "${SCRIPT_DIR}/bench-live-fixture.sh"
   fi
