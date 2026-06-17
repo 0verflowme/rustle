@@ -139,12 +139,9 @@ impl PreparedTunnel {
         })
     }
 
-    async fn run(self) -> Result<()> {
-        let Self {
-            supervisor,
-            cleanup,
-        } = self;
-        let result = supervisor.run().await;
+    async fn run(mut self) -> Result<()> {
+        let result = self.supervisor.run().await;
+        let Self { cleanup, .. } = self;
         drop(cleanup);
         result
     }
@@ -152,7 +149,7 @@ impl PreparedTunnel {
 
 pub(crate) struct TunnelSupervisor {
     dev: tun_rs::AsyncDevice,
-    flow_manager: tcp_core::FlowManager,
+    engine: TunnelEngine,
     data_plane: Arc<dyn DataPlane>,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
@@ -170,7 +167,7 @@ impl TunnelSupervisor {
     ) -> Self {
         Self {
             dev,
-            flow_manager,
+            engine: TunnelEngine::new(flow_manager),
             data_plane,
             dns_remote,
             udp_association_idle_timeout,
@@ -180,17 +177,20 @@ impl TunnelSupervisor {
 }
 
 impl TunnelSupervisor {
-    pub(crate) async fn run(self) -> Result<()> {
+    pub(crate) async fn run(&mut self) -> Result<()> {
         let Self {
             dev,
-            flow_manager,
+            engine,
             data_plane,
             dns_remote,
             udp_association_idle_timeout,
-            mut shutdown,
+            shutdown,
         } = self;
 
         let tun = TunWriter::new(dev);
+        let data_plane = Arc::clone(data_plane);
+        let dns_remote = dns_remote.clone();
+        let udp_association_idle_timeout = *udp_association_idle_timeout;
         let mut buf = vec![0_u8; PACKET_BUF_SIZE];
         let mut tcp_bridge_starts = Vec::new();
         let mut udp_actions = Vec::new();
@@ -204,7 +204,6 @@ impl TunnelSupervisor {
             response_tx: udp_response_tx,
             close_tx: udp_close_tx,
         };
-        let mut engine = TunnelEngine::new(flow_manager);
         let mut tick = tokio::time::interval(Duration::from_millis(10));
         let mut stats_tick = tokio::time::interval_at(
             tokio::time::Instant::now() + STATS_LOG_INTERVAL,
@@ -213,7 +212,7 @@ impl TunnelSupervisor {
         stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                signal = &mut shutdown => {
+                signal = &mut *shutdown => {
                     eprintln!("signal: {} received", signal?);
                     eprintln!(
                         "stats: final {}",
@@ -277,27 +276,27 @@ impl TunnelSupervisor {
                             udp_association_idle_timeout,
                             &mut udp_actions,
                         );
-                        execute_udp_ingress_actions(&mut engine, &mut udp_actions);
+                        execute_udp_ingress_actions(engine, &mut udp_actions);
                         continue;
                     }
 
                     engine
                         .ingest_tcp_packet(packet)
                         .context("failed to feed packet into userspace TCP engine")?;
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.plan_bridge_starts(
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,
                     )?;
                     execute_tcp_bridge_starts(
-                        &mut engine,
+                        engine,
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.expire_and_prune()?;
                 }
                 event = dns_rx.recv() => {
@@ -335,9 +334,9 @@ impl TunnelSupervisor {
                     };
                     engine.handle_bridge_event(event)?;
                     engine.poll_tcp();
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.expire_and_prune()?;
                 }
                 _ = stats_tick.tick() => {
@@ -348,15 +347,15 @@ impl TunnelSupervisor {
                 }
                 _ = tick.tick() => {
                     engine.poll_tcp();
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(&mut engine).await?;
+                    tun.write_engine_packets(engine).await?;
                     engine.plan_bridge_starts(
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,
                     )?;
                     execute_tcp_bridge_starts(
-                        &mut engine,
+                        engine,
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
@@ -407,7 +406,7 @@ pub(crate) async fn capture_packets(
     mut flow_manager: tcp_core::FlowManager,
     exit_after_packets: Option<u64>,
 ) -> Result<()> {
-    let tun = TunWriter::new(dev);
+    let tun = TunWriter::new(&dev);
     let mut buf = vec![0_u8; PACKET_BUF_SIZE];
     let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
     let started_at = StdInstant::now();

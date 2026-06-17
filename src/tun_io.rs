@@ -9,12 +9,12 @@ use crate::{dns, tcp_core};
 
 const TUN_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) struct TunWriter {
-    dev: tun_rs::AsyncDevice,
+pub(crate) struct TunWriter<'a> {
+    dev: &'a tun_rs::AsyncDevice,
 }
 
-impl TunWriter {
-    pub(crate) fn new(dev: tun_rs::AsyncDevice) -> Self {
+impl<'a> TunWriter<'a> {
+    pub(crate) fn new(dev: &'a tun_rs::AsyncDevice) -> Self {
         Self { dev }
     }
 
