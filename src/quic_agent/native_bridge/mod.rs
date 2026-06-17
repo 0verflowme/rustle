@@ -53,10 +53,39 @@ pub struct QuicBridgeStream {
     open_status: QuicBridgeOpenStatus,
 }
 
+struct QuicBridgeConnectDiagnostics<'a> {
+    remote: SocketAddr,
+    cert_sha256: &'a str,
+    cert_der_len: usize,
+    token_sha256_prefix: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuicBridgeOpenStatus {
     Pending,
     Opened,
+}
+
+impl<'a> QuicBridgeConnectDiagnostics<'a> {
+    fn new(remote: SocketAddr, bootstrap: &'a QuicAgentBootstrap) -> Self {
+        let token_hash = sha256_hex(&bootstrap.auth_token);
+        Self {
+            remote,
+            cert_sha256: &bootstrap.cert_sha256,
+            cert_der_len: bootstrap.cert_der.len(),
+            token_sha256_prefix: token_hash.chars().take(12).collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for QuicBridgeConnectDiagnostics<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native QUIC bridge remote={} cert_sha256={} cert_der_len={} auth_token_sha256_prefix={}",
+            self.remote, self.cert_sha256, self.cert_der_len, self.token_sha256_prefix
+        )
+    }
 }
 
 impl QuicBridgeServer {
@@ -122,16 +151,21 @@ pub async fn connect_quic_bridge(
     remote: SocketAddr,
     bootstrap: &QuicAgentBootstrap,
 ) -> Result<QuicBridgeClient> {
-    let mut endpoint = quic_client_endpoint(remote).context("failed to bind QUIC client")?;
-    endpoint.set_default_client_config(quic_client_config(bootstrap)?);
+    let diagnostics = QuicBridgeConnectDiagnostics::new(remote, bootstrap);
+    let mut endpoint =
+        quic_client_endpoint(remote).with_context(|| format!("{diagnostics} stage=client_bind"))?;
+    endpoint.set_default_client_config(
+        quic_client_config(bootstrap)
+            .with_context(|| format!("{diagnostics} stage=client_config"))?,
+    );
     let connection = endpoint
         .connect(remote, QUIC_AGENT_SERVER_NAME)
-        .context("failed to start QUIC bridge connection")?
+        .with_context(|| format!("{diagnostics} stage=connect_start"))?
         .await
-        .context("failed to establish QUIC bridge connection")?;
+        .with_context(|| format!("{diagnostics} stage=connect_establish"))?;
     authenticate_quic_bridge_connection_on_client(&connection, &bootstrap.auth_token)
         .await
-        .context("failed to authenticate native QUIC bridge connection")?;
+        .with_context(|| format!("{diagnostics} stage=authenticate"))?;
     Ok(QuicBridgeClient {
         inner: Arc::new(QuicBridgeClientInner {
             _endpoint: endpoint,
@@ -545,6 +579,31 @@ mod tests {
         tampered
     }
 
+    #[test]
+    fn quic_bridge_connect_diagnostics_include_fingerprint_without_raw_token() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        let cert_der = vec![1_u8, 2, 3, 4];
+        let auth_token = vec![0xab; super::super::auth::QUIC_AUTH_TOKEN_BYTES];
+        let token_hash = sha256_hex(&auth_token);
+        let bootstrap = QuicAgentBootstrap {
+            port: remote.port(),
+            cert_sha256: sha256_hex(&cert_der),
+            cert_der,
+            auth_token,
+        };
+
+        let diagnostics = QuicBridgeConnectDiagnostics::new(remote, &bootstrap).to_string();
+
+        assert!(diagnostics.contains("native QUIC bridge remote=127.0.0.1:4433"));
+        assert!(diagnostics.contains(&bootstrap.cert_sha256));
+        assert!(diagnostics.contains("cert_der_len=4"));
+        assert!(diagnostics.contains(&format!("auth_token_sha256_prefix={}", &token_hash[..12])));
+        assert!(
+            !diagnostics.contains("abababababab"),
+            "diagnostics must not expose raw auth token bytes"
+        );
+    }
+
     #[tokio::test]
     async fn quic_bridge_auth_rejects_bad_token_and_accepts_next_connection() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -574,8 +633,20 @@ mod tests {
             tokio::spawn(async move { quic_server.run().await.expect("run native QUIC bridge") });
 
         let bad_bootstrap = tampered_bootstrap_token(&bootstrap);
+        let bad_token_hash = sha256_hex(&bad_bootstrap.auth_token);
         let bad = connect_quic_bridge(quic_addr, &bad_bootstrap).await;
-        assert!(bad.is_err(), "bad token unexpectedly authenticated");
+        let bad_err = match bad {
+            Ok(_) => panic!("bad token unexpectedly authenticated"),
+            Err(err) => err,
+        };
+        let bad_detail = format!("{bad_err:#}");
+        assert!(bad_detail.contains("stage=authenticate"));
+        assert!(bad_detail.contains(&format!("remote={quic_addr}")));
+        assert!(bad_detail.contains(&format!(
+            "auth_token_sha256_prefix={}",
+            &bad_token_hash[..12]
+        )));
+        assert!(bad_detail.contains("native QUIC bridge auth stage="));
 
         let client = connect_quic_bridge(quic_addr, &bootstrap)
             .await

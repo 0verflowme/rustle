@@ -118,13 +118,18 @@ pub(super) async fn authenticate_quic_bridge_connection_on_client(
         QUIC_AUTH_TIMEOUT,
         "native QUIC bridge auth stream",
     )
-    .await?;
-    write_quic_auth_token(&mut send, auth_token).await?;
+    .await
+    .context("native QUIC bridge auth stage=open_stream")?;
+    write_quic_auth_token(&mut send, auth_token)
+        .await
+        .context("native QUIC bridge auth stage=write_token")?;
     tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown())
         .await
-        .context("timed out finishing native QUIC bridge auth stream")?
-        .context("failed to finish native QUIC bridge auth stream")?;
-    read_quic_auth_ok(&mut recv).await
+        .context("native QUIC bridge auth stage=finish_send timed out")?
+        .context("native QUIC bridge auth stage=finish_send failed")?;
+    read_quic_auth_ok(&mut recv)
+        .await
+        .context("native QUIC bridge auth stage=read_ack")
 }
 
 pub(super) async fn authenticate_quic_bridge_connection_on_server(
