@@ -20,6 +20,8 @@ mod dns;
 mod stream;
 mod tcp;
 #[cfg(test)]
+mod tcp_tests;
+#[cfg(test)]
 mod test_support;
 mod udp;
 
