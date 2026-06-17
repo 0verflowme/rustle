@@ -1,20 +1,23 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant as StdInstant};
+use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use bytes::Bytes;
-use tokio::sync::Mutex;
 
 use crate::{agent_proto, agent_transport};
 
 mod affinity;
 mod carrier;
+mod lane;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+#[cfg(test)]
+pub(crate) use affinity::agent_lane_backoff_duration;
+pub(crate) use affinity::agent_lane_bit;
 use affinity::{
     agent_host_lane_hash, agent_ipv4_lane_hash, agent_lane_candidates, TCP_PROTOCOL_NUMBER,
     UDP_PROTOCOL_NUMBER,
@@ -23,12 +26,13 @@ use affinity::{
 pub(crate) use affinity::{
     agent_host_lane_index, agent_lane_index, AGENT_LANE_BACKOFF_BASE, AGENT_LANE_BACKOFF_MAX,
 };
-pub(crate) use affinity::{agent_lane_backoff_duration, agent_lane_bit};
 #[cfg(test)]
 pub(crate) use carrier::AgentBridgeCarrier;
 pub(crate) use carrier::{
     AgentBridgeTransport, QuicNativeBridge, QuicNativeBridgeSnapshot, QuicNativeBridgeStream,
 };
+use lane::{AgentBridgeLane, AgentLaneSelectionStatus, AgentReconnectCounters};
+pub(crate) use lane::{AgentBridgeSnapshot, AgentReconnectSnapshot};
 
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
 
@@ -42,50 +46,6 @@ pub(crate) trait AgentBridgeConnector: Send + Sync {
     fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_>;
     fn connect_primary(&self) -> AgentBridgeConnectFuture<'_>;
     fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a>;
-}
-
-struct AgentBridgeLane {
-    index: usize,
-    agent_command: Mutex<String>,
-    inner: Mutex<Option<AgentBridgeTransport>>,
-    health: Mutex<AgentLaneHealth>,
-    load: Arc<AtomicUsize>,
-}
-
-#[derive(Debug, Default)]
-struct AgentLaneHealth {
-    consecutive_reconnect_failures: u32,
-    quarantine_until: Option<StdInstant>,
-    background_repair_in_progress: bool,
-}
-
-#[derive(Debug, Default)]
-struct AgentReconnectCounters {
-    attempts: AtomicU64,
-    successes: AtomicU64,
-    failures: AtomicU64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentReconnectSnapshot {
-    pub(crate) attempts: u64,
-    pub(crate) successes: u64,
-    pub(crate) failures: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentBridgeSnapshot {
-    pub(crate) reconnects: AgentReconnectSnapshot,
-    pub(crate) lanes_total: usize,
-    pub(crate) lanes_desired: usize,
-    pub(crate) lanes_available: usize,
-    pub(crate) lanes_failed: usize,
-    pub(crate) lanes_missing: usize,
-    pub(crate) lanes_quarantined: usize,
-    pub(crate) lanes_repairing: usize,
-    pub(crate) max_quarantine_ms: u64,
-    pub(crate) active_streams: usize,
-    pub(crate) max_lane_load: usize,
 }
 
 struct AgentLaneLease {
@@ -213,15 +173,6 @@ impl Drop for AgentBridgeStream {
             load.fetch_sub(1, Ordering::AcqRel);
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum AgentLaneSelectionStatus {
-    Available { load: usize },
-    Failed { failure: String },
-    Missing,
-    Repairing,
-    Quarantined,
 }
 
 #[derive(Clone)]
@@ -381,23 +332,15 @@ impl ReconnectingAgentBridge {
             .enumerate()
             .map(|(index, transport)| {
                 let agent_command = transport.agent_command.clone();
-                AgentBridgeLane {
-                    index,
-                    agent_command: Mutex::new(agent_command),
-                    inner: Mutex::new(Some(transport)),
-                    health: Mutex::new(AgentLaneHealth::default()),
-                    load: Arc::new(AtomicUsize::new(0)),
-                }
+                AgentBridgeLane::new(index, agent_command, Some(transport))
             })
             .collect::<Vec<_>>();
         for index in initial_len..desired_lanes {
-            lanes.push(AgentBridgeLane {
+            lanes.push(AgentBridgeLane::new(
                 index,
-                agent_command: Mutex::new(first_effective_command.clone()),
-                inner: Mutex::new(None),
-                health: Mutex::new(AgentLaneHealth::default()),
-                load: Arc::new(AtomicUsize::new(0)),
-            });
+                first_effective_command.clone(),
+                None,
+            ));
         }
         let bridge = Self {
             connector,
@@ -455,13 +398,13 @@ impl ReconnectingAgentBridge {
         let (primary, secondary) = agent_lane_candidates(request.lane_hash(), self.lanes.len());
         let lane_index = self.choose_lane_index(primary, secondary).await;
         let lane = &self.lanes[lane_index];
-        if let Some(err) = self.quarantined_lane_error(lane).await {
+        if let Some(err) = lane.quarantined_error().await {
             return self
                 .open_request_on_alternate_lane(request, lane_index, err)
                 .await;
         }
         let lease = self.reserve_lane(lane);
-        let transport = match self.current_transport(lane).await {
+        let transport = match lane.current_transport().await {
             Some(transport) => transport,
             None => match self
                 .reconnect_failed_lane(lane, "missing startup exec transport".to_owned())
@@ -478,7 +421,7 @@ impl ReconnectingAgentBridge {
         };
         match request.open(&transport).await {
             Ok(stream) => {
-                self.mark_lane_open_success(lane).await;
+                lane.mark_open_success().await;
                 Ok(lease.into_stream(stream))
             }
             Err(err) => {
@@ -496,7 +439,7 @@ impl ReconnectingAgentBridge {
                 };
                 match request.open(&replacement).await {
                     Ok(stream) => {
-                        self.mark_lane_open_success(lane).await;
+                        lane.mark_open_success().await;
                         Ok(lease.into_stream(stream))
                     }
                     Err(err) => {
@@ -534,7 +477,7 @@ impl ReconnectingAgentBridge {
             let lease = self.reserve_lane(lane);
             match request.open(&transport).await {
                 Ok(stream) => {
-                    self.mark_lane_open_success(lane).await;
+                    lane.mark_open_success().await;
                     request.log_alternate_opened(lane.index, skipped_index, false);
                     return Ok(lease.into_stream(stream));
                 }
@@ -554,7 +497,7 @@ impl ReconnectingAgentBridge {
                     let lease = self.reserve_lane(lane);
                     match request.open(&repaired).await {
                         Ok(stream) => {
-                            self.mark_lane_open_success(lane).await;
+                            lane.mark_open_success().await;
                             request.log_alternate_opened(lane.index, skipped_index, true);
                             return Ok(lease.into_stream(stream));
                         }
@@ -585,7 +528,7 @@ impl ReconnectingAgentBridge {
             if lane.index == skipped_index || tried_lanes & agent_lane_bit(lane.index) != 0 {
                 continue;
             }
-            let candidate = (lane.load.load(Ordering::Acquire), lane.index);
+            let candidate = (lane.load(), lane.index);
             if best.is_none_or(|current| candidate < current) {
                 best = Some(candidate);
             }
@@ -597,11 +540,11 @@ impl ReconnectingAgentBridge {
         &self,
         lane: &AgentBridgeLane,
     ) -> Result<Option<agent_transport::AgentTransport>> {
-        if self.lane_quarantine_remaining(lane).await.is_some() {
+        if lane.quarantine_remaining().await.is_some() {
             return Ok(None);
         }
 
-        let Some(transport) = self.current_transport(lane).await else {
+        let Some(transport) = lane.current_transport().await else {
             return self
                 .reconnect_failed_lane(lane, "missing startup exec transport".to_owned())
                 .await
@@ -614,19 +557,8 @@ impl ReconnectingAgentBridge {
         }
     }
 
-    async fn current_transport(
-        &self,
-        lane: &AgentBridgeLane,
-    ) -> Option<agent_transport::AgentTransport> {
-        lane.inner
-            .lock()
-            .await
-            .as_ref()
-            .map(|inner| inner.transport.clone())
-    }
-
     fn reserve_lane(&self, lane: &AgentBridgeLane) -> AgentLaneLease {
-        AgentLaneLease::new(self.clone(), lane.index, Arc::clone(&lane.load))
+        AgentLaneLease::new(self.clone(), lane.index, lane.load_handle())
     }
 
     async fn choose_lane_index(&self, primary: usize, secondary: usize) -> usize {
@@ -635,10 +567,10 @@ impl ReconnectingAgentBridge {
         }
 
         let primary_lane = &self.lanes[primary];
-        let primary_status = self.lane_selection_status(primary_lane).await;
+        let primary_status = primary_lane.selection_status().await;
 
         let secondary_lane = &self.lanes[secondary];
-        let secondary_status = self.lane_selection_status(secondary_lane).await;
+        let secondary_status = secondary_lane.selection_status().await;
         match (primary_status, secondary_status) {
             (
                 AgentLaneSelectionStatus::Available { load: primary_load },
@@ -680,9 +612,7 @@ impl ReconnectingAgentBridge {
             .iter()
             .filter(|lane| lane.index != first_skipped && lane.index != second_skipped)
         {
-            if let AgentLaneSelectionStatus::Available { load } =
-                self.lane_selection_status(lane).await
-            {
+            if let AgentLaneSelectionStatus::Available { load } = lane.selection_status().await {
                 let candidate = (load, lane.index);
                 if best.is_none_or(|current| candidate < current) {
                     best = Some(candidate);
@@ -706,31 +636,6 @@ impl ReconnectingAgentBridge {
         }
     }
 
-    async fn lane_selection_status(&self, lane: &AgentBridgeLane) -> AgentLaneSelectionStatus {
-        if self.lane_quarantine_remaining(lane).await.is_some() {
-            return AgentLaneSelectionStatus::Quarantined;
-        }
-        if self.lane_is_repairing(lane).await {
-            return AgentLaneSelectionStatus::Repairing;
-        }
-        match self.current_transport(lane).await {
-            Some(transport) => {
-                if let Some(failure) = transport.failure_message().await {
-                    AgentLaneSelectionStatus::Failed { failure }
-                } else {
-                    AgentLaneSelectionStatus::Available {
-                        load: lane.load.load(Ordering::Acquire),
-                    }
-                }
-            }
-            None => AgentLaneSelectionStatus::Missing,
-        }
-    }
-
-    async fn lane_is_repairing(&self, lane: &AgentBridgeLane) -> bool {
-        lane.health.lock().await.background_repair_in_progress
-    }
-
     pub(crate) fn spawn_lane_repair(&self, lane_index: usize, failure: String) {
         self.spawn_lane_repair_with_delay(lane_index, failure, None);
     }
@@ -742,7 +647,7 @@ impl ReconnectingAgentBridge {
         delay: Option<Duration>,
     ) {
         let lane = &self.lanes[lane_index];
-        if !self.try_start_background_lane_repair(lane) {
+        if !lane.try_start_background_repair() {
             return;
         }
 
@@ -763,7 +668,7 @@ impl ReconnectingAgentBridge {
                 };
                 let remaining = {
                     let lane = &lanes_for_wait[lane_index];
-                    ReconnectingAgentBridge::lane_quarantine_remaining_for(lane).await
+                    lane.quarantine_remaining().await
                 };
                 drop(lanes_for_wait);
                 if let Some(remaining) = remaining {
@@ -776,7 +681,7 @@ impl ReconnectingAgentBridge {
                         return;
                     };
                     let lane = &lanes_for_finish[lane_index];
-                    ReconnectingAgentBridge::finish_background_lane_repair_for(lane).await;
+                    lane.finish_background_repair().await;
                     eprintln!(
                         "agent: background repair of lane {} stopped after {} failed attempt(s)",
                         lane.index, attempts
@@ -801,7 +706,7 @@ impl ReconnectingAgentBridge {
                 .await
                 {
                     Ok(_) => {
-                        ReconnectingAgentBridge::finish_background_lane_repair_for(lane).await;
+                        lane.finish_background_repair().await;
                         return;
                     }
                     Err(err) => {
@@ -816,22 +721,6 @@ impl ReconnectingAgentBridge {
         });
     }
 
-    fn try_start_background_lane_repair(&self, lane: &AgentBridgeLane) -> bool {
-        let Ok(mut health) = lane.health.try_lock() else {
-            return false;
-        };
-        if health.background_repair_in_progress || health.quarantine_until.is_some() {
-            return false;
-        }
-        health.background_repair_in_progress = true;
-        true
-    }
-
-    async fn finish_background_lane_repair_for(lane: &AgentBridgeLane) {
-        let mut health = lane.health.lock().await;
-        health.background_repair_in_progress = false;
-    }
-
     #[cfg(test)]
     pub(crate) async fn choose_lane_index_for_test(
         &self,
@@ -843,12 +732,12 @@ impl ReconnectingAgentBridge {
 
     #[cfg(test)]
     pub(crate) fn lane_load_for_test(&self, lane_index: usize) -> usize {
-        self.lanes[lane_index].load.load(Ordering::Acquire)
+        self.lanes[lane_index].load()
     }
 
     #[cfg(test)]
     pub(crate) fn set_lane_load_for_test(&self, lane_index: usize, load: usize) {
-        self.lanes[lane_index].load.store(load, Ordering::Release);
+        self.lanes[lane_index].set_load(load);
     }
 
     #[cfg(test)]
@@ -863,20 +752,16 @@ impl ReconnectingAgentBridge {
 
     #[cfg(test)]
     pub(crate) fn try_start_background_lane_repair_for_test(&self, lane_index: usize) -> bool {
-        self.try_start_background_lane_repair(&self.lanes[lane_index])
+        self.lanes[lane_index].try_start_background_repair()
     }
 
     #[cfg(test)]
     pub(crate) async fn finish_background_lane_repair_for_test(&self, lane_index: usize) {
-        Self::finish_background_lane_repair_for(&self.lanes[lane_index]).await;
+        self.lanes[lane_index].finish_background_repair().await;
     }
 
     pub(crate) fn reconnect_snapshot(&self) -> AgentReconnectSnapshot {
-        AgentReconnectSnapshot {
-            attempts: self.reconnects.attempts.load(Ordering::Acquire),
-            successes: self.reconnects.successes.load(Ordering::Acquire),
-            failures: self.reconnects.failures.load(Ordering::Acquire),
-        }
+        self.reconnects.snapshot()
     }
 
     pub(crate) async fn snapshot(&self) -> AgentBridgeSnapshot {
@@ -888,10 +773,10 @@ impl ReconnectingAgentBridge {
         };
 
         for lane in self.lanes.iter() {
-            let lane_load = lane.load.load(Ordering::Acquire);
+            let lane_load = lane.load();
             snapshot.active_streams = snapshot.active_streams.saturating_add(lane_load);
             snapshot.max_lane_load = snapshot.max_lane_load.max(lane_load);
-            let (quarantine_ms, repairing) = self.lane_snapshot_health(lane).await;
+            let (quarantine_ms, repairing) = lane.snapshot_health().await;
             if let Some(quarantine_ms) = quarantine_ms {
                 snapshot.lanes_quarantined = snapshot.lanes_quarantined.saturating_add(1);
                 snapshot.max_quarantine_ms = snapshot.max_quarantine_ms.max(quarantine_ms);
@@ -900,7 +785,7 @@ impl ReconnectingAgentBridge {
                 snapshot.lanes_repairing = snapshot.lanes_repairing.saturating_add(1);
             }
 
-            match self.current_transport(lane).await {
+            match lane.current_transport().await {
                 Some(transport) => {
                     if transport.failure_message().await.is_some() {
                         snapshot.lanes_failed = snapshot.lanes_failed.saturating_add(1);
@@ -917,76 +802,6 @@ impl ReconnectingAgentBridge {
         snapshot
     }
 
-    async fn lane_snapshot_health(&self, lane: &AgentBridgeLane) -> (Option<u64>, bool) {
-        let mut health = lane.health.lock().await;
-        let quarantine_ms = match health.quarantine_until {
-            Some(until) => match until.checked_duration_since(StdInstant::now()) {
-                Some(remaining) if remaining.as_nanos() > 0 => {
-                    Some(remaining.as_millis().try_into().unwrap_or(u64::MAX))
-                }
-                _ => {
-                    health.quarantine_until = None;
-                    None
-                }
-            },
-            None => None,
-        };
-        (quarantine_ms, health.background_repair_in_progress)
-    }
-
-    async fn quarantined_lane_error(&self, lane: &AgentBridgeLane) -> Option<anyhow::Error> {
-        Self::quarantined_lane_error_for(lane).await
-    }
-
-    async fn quarantined_lane_error_for(lane: &AgentBridgeLane) -> Option<anyhow::Error> {
-        Self::lane_quarantine_remaining_for(lane)
-            .await
-            .map(|remaining| {
-                anyhow!(
-                    "agent lane {} is quarantined for {}ms after reconnect failures",
-                    lane.index,
-                    remaining.as_millis()
-                )
-            })
-    }
-
-    async fn lane_quarantine_remaining(&self, lane: &AgentBridgeLane) -> Option<Duration> {
-        Self::lane_quarantine_remaining_for(lane).await
-    }
-
-    async fn lane_quarantine_remaining_for(lane: &AgentBridgeLane) -> Option<Duration> {
-        let mut health = lane.health.lock().await;
-        let until = health.quarantine_until?;
-        match until.checked_duration_since(StdInstant::now()) {
-            Some(remaining) if remaining.as_nanos() > 0 => Some(remaining),
-            _ => {
-                health.quarantine_until = None;
-                None
-            }
-        }
-    }
-
-    async fn mark_lane_open_success(&self, lane: &AgentBridgeLane) {
-        Self::mark_lane_open_success_for(lane).await;
-    }
-
-    async fn mark_lane_open_success_for(lane: &AgentBridgeLane) {
-        let mut health = lane.health.lock().await;
-        health.consecutive_reconnect_failures = 0;
-        health.quarantine_until = None;
-        health.background_repair_in_progress = false;
-    }
-
-    async fn mark_lane_reconnect_failure_for(lane: &AgentBridgeLane) -> Duration {
-        let mut health = lane.health.lock().await;
-        health.consecutive_reconnect_failures =
-            health.consecutive_reconnect_failures.saturating_add(1);
-        let backoff =
-            agent_lane_backoff_duration(lane.index, health.consecutive_reconnect_failures);
-        health.quarantine_until = Some(StdInstant::now() + backoff);
-        backoff
-    }
-
     async fn reconnect_failed_lane(
         &self,
         lane: &AgentBridgeLane,
@@ -1001,7 +816,7 @@ impl ReconnectingAgentBridge {
         lane: &AgentBridgeLane,
         failure: String,
     ) -> Result<agent_transport::AgentTransport> {
-        if let Some(err) = Self::quarantined_lane_error_for(lane).await {
+        if let Some(err) = lane.quarantined_error().await {
             return Err(err);
         }
         let mut inner = lane.inner.lock().await;
@@ -1026,7 +841,7 @@ impl ReconnectingAgentBridge {
                 lane.index
             );
         }
-        reconnects.attempts.fetch_add(1, Ordering::AcqRel);
+        reconnects.record_attempt();
         let replacement = match Self::reconnect_agent_lane_transport_with(
             connector,
             lane.index,
@@ -1037,8 +852,8 @@ impl ReconnectingAgentBridge {
         {
             Ok(replacement) => replacement,
             Err(err) => {
-                reconnects.failures.fetch_add(1, Ordering::AcqRel);
-                let backoff = Self::mark_lane_reconnect_failure_for(lane).await;
+                reconnects.record_failure();
+                let backoff = lane.mark_reconnect_failure().await;
                 eprintln!(
                     "agent: quarantined lane {} for {}ms after reconnect failure",
                     lane.index,
@@ -1051,8 +866,8 @@ impl ReconnectingAgentBridge {
         let transport = replacement.transport.clone();
         *inner = Some(replacement);
         *lane.agent_command.lock().await = replacement_command;
-        Self::mark_lane_open_success_for(lane).await;
-        reconnects.successes.fetch_add(1, Ordering::AcqRel);
+        lane.mark_open_success().await;
+        reconnects.record_success();
         Ok(transport)
     }
 
