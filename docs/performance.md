@@ -118,6 +118,14 @@ chunked-response cases for local regression checks. When `RUSTLE_HOTPATH_TRACE`
 is enabled, `scripts/bench-bridge-lab.sh` summarizes traced flow timings from
 the per-run stderr logs before cleanup.
 
+The framed-agent stream window starts at 4 MiB and can grow to 24 MiB. The
+initial window is deliberately larger than a minimal LAN default because live
+SSH-agent traffic is RTT-sensitive: at 200 ms RTT, a 1 MiB first-flight window
+caps a fresh flow around 5 MiB/s before growth credit returns, while 4 MiB gives
+the first response roughly 20 MiB/s of headroom. The cap stays below the
+per-flow remote backlog limit so supervisor backpressure still has room to
+absorb local TCP send-window bursts.
+
 This benchmark is useful for bridge regressions because it exercises:
 
 - smoltcp client handshake and receive path
