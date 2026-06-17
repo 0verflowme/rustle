@@ -215,7 +215,7 @@ async fn query_dns_over_quic_native(
                     remote.host, remote.port
                 )
             })?;
-        query_dns_over_agent_tcp_stream(AgentIoStream::QuicNativeTcp(stream), query).await
+        query_dns_over_agent_tcp_stream(AgentIoStream::quic_native_tcp(stream), query).await
     }
 }
 

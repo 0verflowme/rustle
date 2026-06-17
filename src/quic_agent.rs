@@ -23,7 +23,6 @@ use config::{
 };
 pub use native_bridge::{
     connect_quic_bridge, start_quic_bridge_server, QuicBridgeClient, QuicBridgeStream,
-    QUIC_BRIDGE_TCP_CHUNK,
 };
 
 pub struct QuicAgentServer {

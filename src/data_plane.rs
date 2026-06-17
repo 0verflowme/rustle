@@ -28,9 +28,7 @@ mod udp;
 
 pub(crate) use dns::spawn_dns_query_on_data_plane;
 use stream::AgentIoStream;
-use tcp::{
-    spawn_agent_tcp_bridge_with_open, spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge,
-};
+use tcp::{spawn_data_plane_tcp_bridge_with_open, spawn_direct_tcpip_bridge};
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
@@ -249,11 +247,12 @@ impl DataPlane for FramedAgentDataPlane {
             originator_ip: flow.src_ip,
             originator_port: flow.src_port,
         };
-        spawn_agent_tcp_bridge_with_open(
+        spawn_data_plane_tcp_bridge_with_open(
             id,
             event_tx,
             ready_wait_ms,
-            self.agent.clone(),
+            "agent",
+            Some(self.agent.clone()),
             self.open_tcp_ipv4_optimistic(open),
         )
     }
@@ -317,7 +316,20 @@ impl DataPlane for QuicNativeDataPlane {
             "quic-native: opening stream {}:{} for local {}:{} generation={}",
             flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
         );
-        spawn_quic_native_tcp_bridge(id, ready_wait_ms, event_tx, self.bridge.clone())
+        let open = DataPlaneIpv4Open {
+            destination_ip: flow.dst_ip,
+            destination_port: flow.dst_port,
+            originator_ip: flow.src_ip,
+            originator_port: flow.src_port,
+        };
+        spawn_data_plane_tcp_bridge_with_open(
+            id,
+            event_tx,
+            ready_wait_ms,
+            "quic-native",
+            None,
+            self.open_tcp_ipv4_optimistic(open),
+        )
     }
 
     fn query_dns(
@@ -335,7 +347,7 @@ impl DataPlane for QuicNativeDataPlane {
             bridge
                 .open_tcp_ipv4_optimistic(open.into_agent_open())
                 .await
-                .map(AgentIoStream::QuicNativeTcp)
+                .map(AgentIoStream::quic_native_tcp)
         })
     }
 
@@ -696,6 +708,82 @@ mod tests {
             }
         );
 
+        bridge.close_for_test("test complete");
+        bridge_task.await.expect("native bridge task");
+    }
+
+    #[tokio::test]
+    async fn quic_native_data_plane_spawn_tcp_bridge_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP target");
+        let destination = listener.local_addr().expect("TCP target address");
+        let tcp_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+            let mut buf = [0_u8; 10];
+            socket.read_exact(&mut buf).await.expect("read TCP request");
+            assert_eq!(&buf, b"bridge-tcp");
+            socket
+                .write_all(b"bridge-tcp-ok")
+                .await
+                .expect("write TCP response");
+            socket.shutdown().await.expect("shutdown TCP target");
+        });
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        let (data_plane, bridge, bridge_task) = test_quic_native_runtime().await;
+        let id = crate::tcp_core::FlowId::new(
+            crate::tcp_core::FlowKey::tcp(
+                Ipv4Addr::new(10, 255, 255, 1),
+                49152,
+                *destination.ip(),
+                destination.port(),
+            ),
+            1,
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let flow = data_plane.spawn_tcp_bridge(id, 0, event_tx);
+
+        assert!(
+            flow.try_send_local_data(Bytes::from_static(b"bridge-tcp"))
+                .expect("queue local TCP data"),
+            "bridge should accept local TCP data"
+        );
+
+        let mut opened = false;
+        let mut response = Vec::new();
+        while !opened || response.len() < b"bridge-tcp-ok".len() {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("timed out waiting for bridge event")
+                .expect("bridge event channel closed");
+            match event {
+                crate::ssh_bridge::BridgeEvent::Opened { id: event_id, .. } => {
+                    assert_eq!(event_id, id);
+                    opened = true;
+                }
+                crate::ssh_bridge::BridgeEvent::RemoteData {
+                    id: event_id,
+                    bytes,
+                } => {
+                    assert_eq!(event_id, id);
+                    response.extend_from_slice(bytes.as_ref());
+                }
+                crate::ssh_bridge::BridgeEvent::Failed { message, .. } => {
+                    panic!("native QUIC TCP bridge failed: {message}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(response.as_slice(), b"bridge-tcp-ok");
+
+        drop(flow);
+        tcp_server.await.expect("TCP server join");
+        eventually_assert_quic_native_active_streams(&data_plane, 0).await;
         bridge.close_for_test("test complete");
         bridge_task.await.expect("native bridge task");
     }

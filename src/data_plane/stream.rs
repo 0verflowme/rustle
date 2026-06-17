@@ -26,13 +26,23 @@ impl From<crate::agent_transport::AgentStreamSendMetrics> for StreamSendMetrics 
 
 pub(crate) enum AgentIoStream {
     Bridge(AgentBridgeStream),
-    QuicNativeTcp(QuicNativeBridgeStream),
+    QuicNativeTcp {
+        stream: QuicNativeBridgeStream,
+        opened_reported: bool,
+    },
     QuicNativeUdp(QuicNativeBridgeStream),
     #[cfg(test)]
     Raw(agent_transport::AgentStream),
 }
 
 impl AgentIoStream {
+    pub(crate) fn quic_native_tcp(stream: QuicNativeBridgeStream) -> Self {
+        Self::QuicNativeTcp {
+            stream,
+            opened_reported: false,
+        }
+    }
+
     pub(crate) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
         self.send_data_with_metrics(bytes).await.map(|_| ())
     }
@@ -43,7 +53,7 @@ impl AgentIoStream {
     ) -> Result<StreamSendMetrics> {
         match self {
             Self::Bridge(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
-            Self::QuicNativeTcp(stream) => {
+            Self::QuicNativeTcp { stream, .. } => {
                 stream.send_data(bytes.into()).await?;
                 Ok(StreamSendMetrics::default())
             }
@@ -59,7 +69,7 @@ impl AgentIoStream {
     pub(crate) async fn send_eof(&mut self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_eof().await,
-            Self::QuicNativeTcp(stream) => stream.send_eof().await,
+            Self::QuicNativeTcp { stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(stream) => stream.send_eof().await,
             #[cfg(test)]
             Self::Raw(stream) => stream.send_eof().await,
@@ -69,7 +79,25 @@ impl AgentIoStream {
     pub(crate) async fn recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
         match self {
             Self::Bridge(stream) => Ok(stream.recv().await),
-            Self::QuicNativeTcp(stream) => {
+            Self::QuicNativeTcp {
+                stream,
+                opened_reported,
+            } => {
+                if !*opened_reported {
+                    stream
+                        .wait_opened()
+                        .await
+                        .context("failed to read native QUIC TCP open status")?;
+                    *opened_reported = true;
+                    return Ok(Some(
+                        agent_proto::AgentFrame::new(
+                            agent_proto::AgentFrameKind::Opened,
+                            0,
+                            Bytes::new(),
+                        )
+                        .context("failed to synthesize native QUIC TCP opened frame")?,
+                    ));
+                }
                 let payload = stream
                     .recv_chunk(agent_proto::AGENT_MAX_FRAME_PAYLOAD)
                     .await
@@ -96,7 +124,7 @@ impl AgentIoStream {
     pub(crate) async fn close(self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.close().await,
-            Self::QuicNativeTcp(mut stream) => stream.send_eof().await,
+            Self::QuicNativeTcp { mut stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(mut stream) => stream.send_eof().await,
             #[cfg(test)]
             Self::Raw(stream) => stream.close().await,
@@ -134,7 +162,14 @@ mod tests {
             })
             .await
             .expect("open native QUIC TCP stream");
-        let mut stream = AgentIoStream::QuicNativeTcp(stream);
+        let mut stream = AgentIoStream::quic_native_tcp(stream);
+
+        let opened = stream
+            .recv()
+            .await
+            .expect("read native TCP opened event")
+            .expect("opened event");
+        assert_eq!(opened.kind, agent_proto::AgentFrameKind::Opened);
 
         bridge.close_for_test("force receive error");
         let err = stream.recv().await.expect_err("native TCP read error");

@@ -90,6 +90,7 @@ pub(crate) struct AgentBridgeStream {
 }
 
 impl AgentBridgeStream {
+    #[cfg(test)]
     pub(crate) async fn send_data(&self, bytes: impl Into<Bytes>) -> Result<()> {
         let result = self
             .inner

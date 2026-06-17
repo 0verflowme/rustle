@@ -2,15 +2,15 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::time::Instant as StdInstant;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridge, ReconnectingAgentBridge};
+use crate::agent_bridge::ReconnectingAgentBridge;
 use crate::hotpath_trace::TcpFlowTrace;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::DataPlaneIpv4Open;
-use crate::{agent_proto, quic_agent, ssh_bridge, tcp_core};
+use crate::{agent_proto, ssh_bridge, tcp_core};
 
 use super::stream::AgentIoStream;
 
@@ -40,44 +40,33 @@ pub(crate) fn spawn_agent_tcp_bridge(
     agent: ReconnectingAgentBridge,
 ) -> ssh_bridge::FlowBridge {
     let open = tcp_open_request(id);
-    spawn_agent_tcp_bridge_with_open(
+    spawn_data_plane_tcp_bridge_with_open(
         id,
         event_tx,
         0,
-        agent.clone(),
+        "agent",
+        Some(agent.clone()),
         open_agent_tcp_stream(agent, open),
     )
 }
 
-pub(super) fn spawn_agent_tcp_bridge_with_open<Fut>(
+pub(super) fn spawn_data_plane_tcp_bridge_with_open<Fut>(
     id: tcp_core::FlowId,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ready_wait_ms: u64,
-    agent: ReconnectingAgentBridge,
+    transport_label: &'static str,
+    retry_agent: Option<ReconnectingAgentBridge>,
     open_stream: Fut,
 ) -> ssh_bridge::FlowBridge
 where
     Fut: Future<Output = Result<AgentIoStream>> + Send + 'static,
 {
     ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
-        let mut trace = TcpFlowTrace::new("agent", id, ready_wait_ms);
+        let mut trace = TcpFlowTrace::new(transport_label, id, ready_wait_ms);
         let open_started_at = StdInstant::now();
         let open = tcp_open_request(id);
         let mut stream = match open_stream.await {
-            Ok(AgentIoStream::Bridge(stream)) => stream,
-            Ok(_) => {
-                trace.finish("open_wrong_stream");
-                let _ = ssh_bridge::send_bridge_event(
-                    &event_tx,
-                    ssh_bridge::BridgeEvent::Failed {
-                        id,
-                        phase: ssh_bridge::BridgeFailurePhase::Open,
-                        message: "agent data plane returned a non-agent TCP stream".to_owned(),
-                    },
-                )
-                .await;
-                return;
-            }
+            Ok(stream) => stream,
             Err(err) => {
                 trace.finish("open_error");
                 let _ = ssh_bridge::send_bridge_event(
@@ -85,7 +74,7 @@ where
                     ssh_bridge::BridgeEvent::Failed {
                         id,
                         phase: ssh_bridge::BridgeFailurePhase::Open,
-                        message: format!("failed to open agent stream: {err:#}"),
+                        message: format!("failed to open {transport_label} stream: {err:#}"),
                     },
                 )
                 .await;
@@ -110,7 +99,7 @@ where
                             id,
                             phase: ssh_bridge::BridgeFailurePhase::Open,
                             message: format!(
-                                "timed out after {}ms waiting for agent stream open confirmation",
+                                "timed out after {}ms waiting for {transport_label} stream open confirmation",
                                 ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT.as_millis()
                             ),
                         },
@@ -120,7 +109,7 @@ where
                 }
                 remote = stream.recv() => {
                     match remote {
-                        Some(frame) => match frame.kind {
+                        Ok(Some(frame)) => match frame.kind {
                             agent_proto::AgentFrameKind::Opened => {
                                 if !open_reported {
                                     trace.opened();
@@ -171,10 +160,12 @@ where
                             }
                             agent_proto::AgentFrameKind::Close => {
                                 if !open_reported {
-                                    if pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                    if retry_agent.is_some()
+                                        && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
+                                    {
                                         pre_open_retries += 1;
                                         match retry_agent_pre_open_stream(
-                                            &agent,
+                                            retry_agent.as_ref(),
                                             open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
@@ -210,7 +201,7 @@ where
                                         ssh_bridge::BridgeEvent::Failed {
                                             id,
                                             phase: ssh_bridge::BridgeFailurePhase::Open,
-                                            message: "agent stream closed before open confirmation".to_owned(),
+                                            message: format!("{transport_label} stream closed before open confirmation"),
                                         },
                                     )
                                     .await;
@@ -220,10 +211,13 @@ where
                             }
                             agent_proto::AgentFrameKind::Reset => {
                                 let message = String::from_utf8_lossy(&frame.payload).to_string();
-                                if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                if !open_reported
+                                    && retry_agent.is_some()
+                                    && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
+                                {
                                     pre_open_retries += 1;
                                     match retry_agent_pre_open_stream(
-                                        &agent,
+                                        retry_agent.as_ref(),
                                         open.into_agent_open(),
                                         stream,
                                         &pre_open_local,
@@ -264,7 +258,7 @@ where
                                     ssh_bridge::BridgeEvent::Failed {
                                         id,
                                         phase,
-                                        message: format!("agent stream reset: {message}"),
+                                message: format!("{transport_label} stream reset: {message}"),
                                     },
                                 )
                                 .await;
@@ -272,11 +266,14 @@ where
                             }
                             _ => {}
                         },
-                        None => {
-                            if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                        Ok(None) => {
+                            if !open_reported
+                                && retry_agent.is_some()
+                                && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
+                            {
                                 pre_open_retries += 1;
                                 match retry_agent_pre_open_stream(
-                                    &agent,
+                                    retry_agent.as_ref(),
                                     open.into_agent_open(),
                                     stream,
                                     &pre_open_local,
@@ -309,6 +306,24 @@ where
                             trace.outcome("remote_stream_closed");
                             break;
                         },
+                        Err(err) => {
+                            let phase = if open_reported {
+                                ssh_bridge::BridgeFailurePhase::Write
+                            } else {
+                                ssh_bridge::BridgeFailurePhase::Open
+                            };
+                            trace.finish("read_error");
+                            let _ = ssh_bridge::send_bridge_event(
+                                &event_tx,
+                                ssh_bridge::BridgeEvent::Failed {
+                                    id,
+                                    phase,
+                                    message: format!("failed to read {transport_label} stream: {err:#}"),
+                                },
+                            )
+                            .await;
+                            break;
+                        }
                     }
                 }
                 local = local_rx.recv_with_metrics() => {
@@ -330,17 +345,20 @@ where
                             match send_result {
                                 Ok(Ok(metrics)) => {
                                     trace.agent_send_waits(
-                                        metrics.credit_wait_us,
-                                        metrics.outbound_wait_us,
-                                        metrics.frames,
+                                        metrics.agent_credit_wait_us,
+                                        metrics.agent_outbound_wait_us,
+                                        metrics.agent_outbound_frames,
                                     );
                                     trace.local_sent();
                                 }
                                 Ok(Err(err)) => {
-                                    if !open_reported && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+                                    if !open_reported
+                                        && retry_agent.is_some()
+                                        && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
+                                    {
                                         pre_open_retries += 1;
                                         match retry_agent_pre_open_stream(
-                                            &agent,
+                                            retry_agent.as_ref(),
                                             open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
@@ -381,7 +399,7 @@ where
                                         ssh_bridge::BridgeEvent::Failed {
                                             id,
                                             phase,
-                                            message: format!("failed to write to agent stream: {err:#}"),
+                                        message: format!("failed to write to {transport_label} stream: {err:#}"),
                                         },
                                     )
                                     .await;
@@ -400,7 +418,7 @@ where
                                             id,
                                             phase,
                                             message: format!(
-                                                "timed out after {}ms writing to agent stream",
+                                                "timed out after {}ms writing to {transport_label} stream",
                                                 ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
                                             ),
                                         },
@@ -447,246 +465,21 @@ async fn open_agent_tcp_stream(
         .map(AgentIoStream::Bridge)
 }
 
-pub(super) fn spawn_quic_native_tcp_bridge(
-    id: tcp_core::FlowId,
-    ready_wait_ms: u64,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge: QuicNativeBridge,
-) -> ssh_bridge::FlowBridge {
-    ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
-        let mut trace = TcpFlowTrace::new("quic-native", id, ready_wait_ms);
-        let open_started_at = StdInstant::now();
-        let open = agent_proto::AgentOpenIpv4 {
-            destination_ip: id.key.dst_ip,
-            destination_port: id.key.dst_port,
-            originator_ip: id.key.src_ip,
-            originator_port: id.key.src_port,
-        };
-        let mut stream = match bridge.open_tcp_ipv4_optimistic(open).await {
-            Ok(stream) => {
-                trace.stream_ready();
-                stream
-            }
-            Err(err) => {
-                trace.finish("open_error");
-                let _ = ssh_bridge::send_bridge_event(
-                    &event_tx,
-                    ssh_bridge::BridgeEvent::Failed {
-                        id,
-                        phase: ssh_bridge::BridgeFailurePhase::Open,
-                        message: format!("failed to open native QUIC stream: {err:#}"),
-                    },
-                )
-                .await;
-                return;
-            }
-        };
-        let mut open_reported = false;
-
-        loop {
-            if !open_reported {
-                tokio::select! {
-                    local = local_rx.recv_with_metrics() => {
-                        match local {
-                            Some(local) => {
-                                let bytes = local.bytes;
-                                trace.local_queue_wait(local.queue_wait_us);
-                                trace.local_bytes(bytes.len());
-                                let send_started_at = StdInstant::now();
-                                let send_result = tokio::time::timeout(
-                                    ssh_bridge::BRIDGE_WRITE_TIMEOUT,
-                                    stream.send_data(bytes),
-                                )
-                                .await;
-                                trace.local_send_wait(send_started_at);
-                                match send_result {
-                                    Ok(Ok(())) => {
-                                        trace.local_sent();
-                                    }
-                                    Ok(Err(err)) => {
-                                        trace.finish("pending_write_error");
-                                        let _ = ssh_bridge::send_bridge_event(
-                                            &event_tx,
-                                            ssh_bridge::BridgeEvent::Failed {
-                                                id,
-                                                phase: ssh_bridge::BridgeFailurePhase::Open,
-                                                message: format!("failed to write to pending native QUIC stream: {err:#}"),
-                                            },
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        trace.finish("pending_write_timeout");
-                                        let _ = ssh_bridge::send_bridge_event(
-                                            &event_tx,
-                                            ssh_bridge::BridgeEvent::Failed {
-                                                id,
-                                                phase: ssh_bridge::BridgeFailurePhase::Open,
-                                                message: format!(
-                                                    "timed out after {}ms writing to pending native QUIC stream",
-                                                    ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
-                                                ),
-                                            },
-                                        )
-                                        .await;
-                                        break;
-                                    }
-                                }
-                            }
-                            None => {
-                                trace.outcome("local_eof");
-                                let _ = stream.send_eof().await;
-                                break;
-                            }
-                        }
-                    }
-                    opened = stream.wait_opened() => {
-                        match opened {
-                            Ok(()) => {
-                                trace.opened();
-                                if !report_agent_stream_opened(&event_tx, id, open_started_at).await {
-                                    trace.finish("event_channel_closed");
-                                    let _ = stream.send_eof().await;
-                                    return;
-                                }
-                                open_reported = true;
-                            }
-                            Err(err) => {
-                                trace.finish("open_error");
-                                let _ = ssh_bridge::send_bridge_event(
-                                    &event_tx,
-                                    ssh_bridge::BridgeEvent::Failed {
-                                        id,
-                                        phase: ssh_bridge::BridgeFailurePhase::Open,
-                                        message: format!("failed to open native QUIC stream: {err:#}"),
-                                    },
-                                )
-                                .await;
-                                break;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-
-            tokio::select! {
-                local = local_rx.recv_with_metrics() => {
-                    match local {
-                        Some(local) => {
-                            let bytes = local.bytes;
-                            trace.local_queue_wait(local.queue_wait_us);
-                            trace.local_bytes(bytes.len());
-                            let send_started_at = StdInstant::now();
-                            let send_result = tokio::time::timeout(
-                                ssh_bridge::BRIDGE_WRITE_TIMEOUT,
-                                stream.send_data(bytes),
-                            )
-                            .await;
-                            trace.local_send_wait(send_started_at);
-                            match send_result {
-                                Ok(Ok(())) => {
-                                    trace.local_sent();
-                                }
-                                Ok(Err(err)) => {
-                                    trace.finish("write_error");
-                                    let _ = ssh_bridge::send_bridge_event(
-                                        &event_tx,
-                                        ssh_bridge::BridgeEvent::Failed {
-                                            id,
-                                            phase: ssh_bridge::BridgeFailurePhase::Write,
-                                            message: format!("failed to write to native QUIC stream: {err:#}"),
-                                        },
-                                    )
-                                    .await;
-                                    break;
-                                }
-                                Err(_) => {
-                                    trace.finish("write_timeout");
-                                    let _ = ssh_bridge::send_bridge_event(
-                                        &event_tx,
-                                        ssh_bridge::BridgeEvent::Failed {
-                                            id,
-                                            phase: ssh_bridge::BridgeFailurePhase::Write,
-                                            message: format!(
-                                                "timed out after {}ms writing to native QUIC stream",
-                                                ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
-                                            ),
-                                        },
-                                    )
-                                    .await;
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            trace.outcome("local_eof");
-                            let _ = stream.send_eof().await;
-                            break;
-                        }
-                    }
-                }
-                remote = stream.recv_chunk(quic_agent::QUIC_BRIDGE_TCP_CHUNK) => {
-                    match remote {
-                        Ok(Some(bytes)) => {
-                            trace.remote_bytes(bytes.len());
-                            let event_started_at = StdInstant::now();
-                            let event_sent = ssh_bridge::send_bridge_event(
-                                &event_tx,
-                                ssh_bridge::BridgeEvent::RemoteData { id, bytes },
-                            )
-                            .await;
-                            trace.remote_event_wait(event_started_at);
-                            if !event_sent {
-                                trace.finish("event_channel_closed");
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            trace.outcome("remote_eof");
-                            let _ = ssh_bridge::send_bridge_event(
-                                &event_tx,
-                                ssh_bridge::BridgeEvent::RemoteEof { id },
-                            )
-                            .await;
-                            break;
-                        }
-                        Err(err) => {
-                            trace.finish("read_error");
-                            let _ = ssh_bridge::send_bridge_event(
-                                &event_tx,
-                                ssh_bridge::BridgeEvent::Failed {
-                                    id,
-                                    phase: ssh_bridge::BridgeFailurePhase::Write,
-                                    message: format!("failed to read native QUIC stream: {err:#}"),
-                                },
-                            )
-                            .await;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        trace.finish_current_or("closed");
-        let _ =
-            ssh_bridge::send_bridge_event(&event_tx, ssh_bridge::BridgeEvent::Closed { id }).await;
-    })
-}
-
 async fn retry_agent_pre_open_stream(
-    agent: &ReconnectingAgentBridge,
+    agent: Option<&ReconnectingAgentBridge>,
     open: agent_proto::AgentOpenIpv4,
-    old_stream: AgentBridgeStream,
+    old_stream: AgentIoStream,
     replay: &VecDeque<Bytes>,
-) -> Result<AgentBridgeStream> {
+) -> Result<AgentIoStream> {
     let _ = old_stream.close().await;
+    let Some(agent) = agent else {
+        bail!("pre-open retry is not supported for this data plane");
+    };
     let stream = agent
         .open_tcp_ipv4_optimistic(open)
         .await
         .context("failed to reopen optimistic agent stream")?;
+    let mut stream = AgentIoStream::Bridge(stream);
     for bytes in replay {
         stream
             .send_data(bytes.clone())
