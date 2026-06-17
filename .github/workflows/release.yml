@@ -39,6 +39,9 @@ jobs:
       - name: Verify live benchmark row gates
         run: python3 scripts/verify-live-benchmark-rows.py --self-test
 
+      - name: Verify live evidence artifact gates
+        run: python3 scripts/verify-live-evidence.py --self-test
+
       - name: Verify live fixture row gates
         run: python3 scripts/verify-live-fixture-rows.py --self-test
 

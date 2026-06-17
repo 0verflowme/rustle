@@ -51,6 +51,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: python3 scripts/verify-live-benchmark-rows.py --self-test
 
+      - name: Verify live evidence artifact gates
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/verify-live-evidence.py --self-test
+
       - name: Install Linux smoke dependencies
         if: runner.os == 'Linux'
         run: |

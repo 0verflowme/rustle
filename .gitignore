@@ -1,3 +1,4 @@
 /target/
 /dist/
 /.codex-live-artifacts/
+__pycache__/

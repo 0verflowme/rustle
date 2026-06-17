@@ -566,7 +566,15 @@ default and writes compact live benchmark artifacts under
 `target/live-evidence/release-candidate-<timestamp>` unless
 `RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison uses a
 `live-compare` subdirectory, and controlled fixture runs use one
-`fixture-<bytes>-bytes` subdirectory per body size.
+`fixture-<bytes>-bytes` subdirectory per body size. Validate a collected
+artifact tree with:
+
+```sh
+scripts/verify-live-evidence.py --require-hotpath target/live-evidence/release-candidate-YYYYMMDDTHHMMSSZ
+```
+
+The release-candidate wrapper runs that evidence verifier automatically after
+the live gates complete.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is

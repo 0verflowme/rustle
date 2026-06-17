@@ -72,3 +72,13 @@ env \
   RUSTLE_BENCH_RUSTLE_TRANSPORTS="${RUSTLE_BENCH_RUSTLE_TRANSPORTS:-$DEFAULT_BENCH_RUSTLE_TRANSPORTS}" \
   RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO="${MAX_AGENT_SSHUTTLE_P50_RATIO}" \
   "${SCRIPT_DIR}/verify-local.sh"
+
+EVIDENCE_VERIFY_ARGS=("$EVIDENCE_DIR")
+case "$HOTPATH_TRACE" in
+  1 | true | yes) EVIDENCE_VERIFY_ARGS=(--require-hotpath "$EVIDENCE_DIR") ;;
+  0 | false | no) ;;
+  *) smoke_die "RUSTLE_HOTPATH_TRACE must be 0 or 1 for release-candidate evidence verification" ;;
+esac
+
+verify_info "verifying live evidence artifacts"
+"$(smoke_python)" "${SCRIPT_DIR}/verify-live-evidence.py" "${EVIDENCE_VERIFY_ARGS[@]}"

@@ -22,6 +22,7 @@ LIVE_SMOKE = REPO / "scripts" / "smoke-live-tunnel.sh"
 LIVE_UDP_SMOKE = REPO / "scripts" / "smoke-live-udp.sh"
 LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_BENCH_ROWS = REPO / "scripts" / "verify-live-benchmark-rows.py"
+LIVE_EVIDENCE = REPO / "scripts" / "verify-live-evidence.py"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
@@ -117,6 +118,7 @@ REQUIRED_WORKFLOW_SNIPPETS = [
     "cargo clippy --all-targets -- -D warnings",
     "python3 scripts/verify-windows-tun-smoke.py",
     "python3 scripts/verify-live-benchmark-rows.py --self-test",
+    "python3 scripts/verify-live-evidence.py --self-test",
     "python3 scripts/verify-live-fixture-rows.py --self-test",
     "python3 scripts/verify-release-archives.py --self-test",
     "python3 scripts/verify-release-archives.py dist SHA256SUMS",
@@ -378,6 +380,7 @@ REQUIRED_CI_SNIPPETS = [
     "code-health-report",
     "python3 scripts/verify-windows-tun-smoke.py",
     "python3 scripts/verify-live-benchmark-rows.py --self-test",
+    "python3 scripts/verify-live-evidence.py --self-test",
     "cargo fmt --check",
     "cargo test",
     "cargo clippy --all-targets -- -D warnings",
@@ -437,6 +440,7 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "cargo clippy --all-targets -- -D warnings",
     "scripts/verify-windows-tun-smoke.py",
     "scripts/verify-live-fixture-rows.py --self-test",
+    "scripts/verify-live-evidence.py --self-test",
     "scripts/verify-release-archives.py",
     "scripts/smoke-agent-sidecars.sh",
     "scripts/smoke-ssh-config-alias-lab.sh",
@@ -969,6 +973,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        "verify-live-evidence.py",
+    ),
+    (
+        VERIFY_LOCAL,
         "summarize-hotpath-trace.py",
     ),
     (
@@ -1131,6 +1139,14 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
         VERIFY_RELEASE_CANDIDATE,
         "RUSTLE_BENCH_ARTIFACT_DIR",
     ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "verify-live-evidence.py",
+    ),
+    (
+        VERIFY_RELEASE_CANDIDATE,
+        "--require-hotpath",
+    ),
 ]
 
 REQUIRED_LIVE_FIXTURE_SNIPPETS = [
@@ -1180,6 +1196,22 @@ REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS = [
     "produced invalid benchmark rows",
     "--self-test",
     "assert_rejects",
+]
+
+REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
+    "live-compare",
+    "fixture-",
+    "fixture-results.tsv",
+    "live-results.tsv",
+    "hotpath-summary.tsv",
+    "quic-diagnostics.tsv",
+    "--require-hotpath",
+    "--self-test",
+    "assert_rejects",
+    "verify_live_benchmark_rows",
+    "verify_live_fixture_rows",
+    "no controlled fixture evidence",
+    "missing required live evidence file",
 ]
 
 REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
@@ -1648,6 +1680,7 @@ def main() -> None:
     live_udp_smoke = LIVE_UDP_SMOKE.read_text(encoding="utf-8")
     live_bench = LIVE_BENCH.read_text(encoding="utf-8")
     live_bench_rows = LIVE_BENCH_ROWS.read_text(encoding="utf-8")
+    live_evidence = LIVE_EVIDENCE.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
@@ -1759,6 +1792,17 @@ def main() -> None:
         fail(
             "scripts/verify-live-benchmark-rows.py is missing required snippets: "
             f"{missing_live_benchmark_rows!r}"
+        )
+
+    missing_live_evidence = [
+        snippet
+        for snippet in REQUIRED_LIVE_EVIDENCE_SNIPPETS
+        if snippet not in live_evidence
+    ]
+    if missing_live_evidence:
+        fail(
+            "scripts/verify-live-evidence.py is missing required snippets: "
+            f"{missing_live_evidence!r}"
         )
 
     missing_agent_primary_scripts = [

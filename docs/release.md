@@ -160,7 +160,11 @@ artifacts under `target/live-evidence/release-candidate-<timestamp>` unless
 `RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison writes under
 `live-compare`, and each controlled fixture body writes under its own
 `fixture-<bytes>-bytes` directory so evidence from different body sizes is not
-overwritten. The live
+overwritten. After the live run completes, the wrapper runs
+`scripts/verify-live-evidence.py --require-hotpath` against that directory so
+missing live comparison rows, fixture rows, hotpath summaries, or optional QUIC
+diagnostics fail the release-candidate run instead of becoming incomplete
+evidence. The live
 verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
 intentionally narrowing that matrix for diagnostics. Skips are useful
@@ -180,7 +184,8 @@ Required before tagging a release:
 - CI passes on Linux x64, Linux arm64, macOS x64, macOS arm64, Windows x64,
   and Windows arm64.
 - Ubuntu CI runs the deterministic release-mode rootless benchmark gates:
-  `scripts/verify-live-benchmark-rows.py --self-test`, the tiny-response
+  `scripts/verify-live-benchmark-rows.py --self-test`,
+  `scripts/verify-live-evidence.py --self-test`, the tiny-response
   `bench-bridge-lab.sh` p50 gate, the 100 MiB `agent` throughput gate, the
   100 MiB `quic-agent` throughput gate, and DNS p50 gates for both `agent` and
   `quic-agent`, plus the native `quic-native` DNS p50 gate when the local
