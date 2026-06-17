@@ -349,6 +349,10 @@ Required before tagging a release:
 - `carrier_read_buffer_matches_frame_payload_target` passes, proving both
   framed-agent carrier readers use 64 KiB chunks against the 256 KiB protocol
   payload cap instead of the old 8 KiB read loop.
+- `local_drain_chunk_uses_full_tcp_receive_buffer_within_bridge_budget` and
+  `local_drain_records_tcp_recv_queue_wait` pass, proving packet-engine
+  local-byte drain can move one full TCP receive-buffer payload per bridge queue
+  item while preserving queue-wait accounting and bridge byte-budget bounds.
 - `rustle_ssh_client_config_uses_data_plane_sized_channels` passes, proving the
   SSH carrier uses a 64 MiB SSH channel window and 256 KiB max packet instead of
   reintroducing russh's smaller default window below the agent data-plane credit

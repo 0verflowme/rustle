@@ -11,6 +11,9 @@ use crate::{ssh_bridge, tcp_core};
 
 use super::backlog::{RemoteBacklogPush, RemoteBacklogs};
 
+pub(crate) const LOCAL_DRAIN_CHUNK_BYTES: usize = tcp_core::TCP_RECV_BUFFER_BYTES;
+const _: () = assert!(LOCAL_DRAIN_CHUNK_BYTES <= ssh_bridge::FLOW_CHANNEL_BYTES);
+
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct BridgeAdmissionStats {
     pub(crate) deferred_active_limit: u64,
@@ -195,7 +198,7 @@ pub(crate) fn drain_local_bytes_to_bridges(
 
         let flow_bytes = flow_manager.recv_flow_bytes_with_metrics(
             flow,
-            remaining_bridge_bytes.min(16 * 1024),
+            local_drain_chunk_limit(remaining_bridge_bytes),
             now,
         )?;
         let bytes = flow_bytes.bytes;
@@ -232,6 +235,10 @@ pub(crate) fn drain_local_bytes_to_bridges(
         }
     }
     Ok(stats)
+}
+
+fn local_drain_chunk_limit(remaining_bridge_bytes: usize) -> usize {
+    remaining_bridge_bytes.min(LOCAL_DRAIN_CHUNK_BYTES)
 }
 
 #[cfg(test)]
@@ -474,6 +481,14 @@ mod tests {
             bridge_admission_decision(MAX_AGENT_ACTIVE_STREAMS, 0, agent),
             BridgeAdmissionDecision::DeferActive
         );
+    }
+
+    #[test]
+    fn local_drain_chunk_uses_full_tcp_receive_buffer_within_bridge_budget() {
+        assert_eq!(LOCAL_DRAIN_CHUNK_BYTES, tcp_core::TCP_RECV_BUFFER_BYTES);
+        assert_eq!(LOCAL_DRAIN_CHUNK_BYTES, 64 * 1024);
+        assert_eq!(local_drain_chunk_limit(usize::MAX), LOCAL_DRAIN_CHUNK_BYTES);
+        assert_eq!(local_drain_chunk_limit(4096), 4096);
     }
 
     #[test]
@@ -1287,11 +1302,11 @@ mod tests {
             now += smoltcp::time::Duration::from_millis(1);
         }
 
-        let request = b"GET /queued HTTP/1.1\r\n\r\n";
+        let request = vec![0x47; LOCAL_DRAIN_CHUNK_BYTES - 1];
         {
             let client = &mut clients[0];
             let socket = client.sockets.get_mut::<tcp::Socket>(client.handle);
-            socket.send_slice(request).expect("client send");
+            socket.send_slice(&request).expect("client send");
         }
         let packets = {
             let client = &mut clients[0];
@@ -1339,7 +1354,8 @@ mod tests {
             .await
             .expect("bridge should receive local data")
             .expect("bridge should report local data");
-        assert_eq!(bytes, Bytes::copy_from_slice(request));
+        assert_eq!(bytes.len(), request.len());
+        assert_eq!(bytes, Bytes::from(request));
         assert_eq!(wait_us, Some(7_000));
     }
 

@@ -778,6 +778,8 @@ Performance work must preserve these invariants:
   loop does not allocate a fresh `Vec<PacketBuf>` for each packet poll
 - `FlowManager` enumeration for bridge admission and local-byte drain uses
   caller-owned scratch vectors for `FlowId`/`FlowKey` lists; opening-flow counts are computed directly instead of by allocating snapshots
+- local-byte drain moves up to one full 64 KiB TCP receive-buffer payload per
+  bridge queue item, while still capping each item below the bridge byte budget
 - remote backlog flushing, stale-flow expiry, and closed-flow pruning use
   caller-owned scratch vectors for per-tick cleanup scans instead of allocating
   temporary flow lists
