@@ -18,6 +18,8 @@ use crate::tunnel_lifecycle::ShutdownSignal;
 use crate::{ssh_bridge, tcp_core};
 
 mod prepare;
+#[cfg(test)]
+mod prepare_tests;
 
 pub(crate) use prepare::run_tunnel;
 
