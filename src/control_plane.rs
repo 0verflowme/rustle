@@ -1,4 +1,5 @@
 mod agent_startup;
+mod quic_bootstrap;
 mod quic_connect;
 mod quic_startup;
 mod runtime;

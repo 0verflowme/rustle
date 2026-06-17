@@ -1,14 +1,9 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ring::digest;
-use russh::{
-    client::{Handle, Msg},
-    ChannelStream,
-};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use russh::client::Handle;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
@@ -16,8 +11,8 @@ use crate::agent_bridge::{
 };
 use crate::agent_transport::AgentTransport;
 use crate::remote_helper::{
-    connect_prepared_helper_with_upload_fallback, read_quic_helper_bootstrap, HelperCommandPlan,
-    HelperKind, QuicHelperBootstrapRole, QUIC_AGENT_BOOTSTRAP_ROLE, QUIC_NATIVE_BOOTSTRAP_ROLE,
+    connect_prepared_helper_with_upload_fallback, HelperCommandPlan, HelperKind,
+    QUIC_AGENT_BOOTSTRAP_ROLE, QUIC_NATIVE_BOOTSTRAP_ROLE,
 };
 use crate::ssh_control::{
     connect_prepared_ssh, prepare_ssh_connection, Client, PreparedSshConnection,
@@ -25,18 +20,10 @@ use crate::ssh_control::{
 use crate::{quic_agent, SshArgs};
 
 use super::connect_agent_bridge_transports_from_connector;
-use super::quic_connect::{
-    connect_quic_data_plane_any, format_socket_addrs, resolve_quic_helper_addrs,
-};
+use super::quic_bootstrap::{drain_quic_helper_ssh_output, start_quic_helper_ssh_bootstrap};
+use super::quic_connect::{connect_quic_data_plane_any, format_socket_addrs};
 
-const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIC_AGENT_PROTOCOL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
-
-struct StartedQuicHelperSsh {
-    bootstrap: quic_agent::QuicAgentBootstrap,
-    remote_addrs: Vec<SocketAddr>,
-    reader: BufReader<ChannelStream<Msg>>,
-}
 
 pub(super) struct SshQuicAgentBridgeConnector {
     prepared: Arc<PreparedSshConnection>,
@@ -290,85 +277,6 @@ async fn connect_quic_native_bridge_on_handle(
     Ok(QuicNativeBridge::with_ssh_carrier(
         client, handle, drain_task,
     ))
-}
-
-async fn start_quic_helper_ssh_bootstrap(
-    handle: &Handle<Client>,
-    role: QuicHelperBootstrapRole,
-    remote_host: &str,
-    helper_command: &str,
-) -> Result<StartedQuicHelperSsh> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context(role.open_session_context)?;
-    channel
-        .exec(true, helper_command.to_owned())
-        .await
-        .with_context(|| format!("{}: {helper_command}", role.exec_context))?;
-
-    let mut reader = BufReader::new(channel.into_stream());
-    let bootstrap =
-        read_quic_helper_bootstrap(&mut reader, role, QUIC_AGENT_BOOTSTRAP_TIMEOUT).await?;
-    let remote_addrs = resolve_quic_helper_addrs(role.label, remote_host, bootstrap.port)?;
-    let token_prefix = auth_token_sha256_prefix(&bootstrap.auth_token);
-    eprintln!(
-        "{} role={} remote_host={} bootstrap_port={} resolved_addrs={} cert_sha256={} cert_der_len={} auth_token_sha256_prefix={}",
-        role.connect_log_prefix,
-        role.label,
-        remote_host,
-        bootstrap.port,
-        format_socket_addrs(&remote_addrs),
-        bootstrap.cert_sha256,
-        bootstrap.cert_der.len(),
-        token_prefix
-    );
-
-    Ok(StartedQuicHelperSsh {
-        bootstrap,
-        remote_addrs,
-        reader,
-    })
-}
-
-fn auth_token_sha256_prefix(auth_token: &[u8]) -> String {
-    lower_hex(digest::digest(&digest::SHA256, auth_token).as_ref())
-        .chars()
-        .take(12)
-        .collect()
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-async fn drain_quic_helper_ssh_output<R>(label: &'static str, mut reader: BufReader<R>)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
-                let line = line.trim_end_matches(['\r', '\n']);
-                if !line.is_empty() {
-                    eprintln!("{label}: remote output: {line}");
-                }
-            }
-            Err(err) => {
-                eprintln!("{label}: failed to drain remote output: {err:#}");
-                break;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
