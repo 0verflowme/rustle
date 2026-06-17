@@ -324,6 +324,10 @@ Required before tagging a release:
   proving non-priority data and EOF frames are interleaved across active streams
   inside each writer burst while preserving per-stream ordering and control
   frame priority.
+- `output_producer_yield_budget_yields_after_bounded_data_frames` passes,
+  proving remote output producers yield after a bounded number of data frames so
+  one hot response stream cannot monopolize scheduler time before other stream
+  tasks enqueue frames.
 - `credit_window_grows_after_sustained_full_window_consumption`,
   `stream_recv_grows_receive_window_after_sustained_consumption`, and
   `runtime_receive_credit_grows_after_sustained_window_consumption` pass,

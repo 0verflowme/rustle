@@ -765,6 +765,9 @@ Performance work must preserve these invariants:
 - agent writer bursts round-robin non-priority frames across stream ids while
   preserving per-stream order, so concurrent response streams share each encoded
   burst instead of inheriting pure FIFO ordering from the hottest producer
+- remote agent output producers yield after a bounded number of data frames, so
+  one hot TCP or UDP response stream cannot keep enqueueing indefinitely before
+  sibling stream tasks get scheduler time
 - agent peers that advertise heartbeat support must answer periodic zero-stream
   pings; missed pongs must trip sticky transport failure and reconnect handling
 - agent streams can be hashed across multiple SSH exec lanes; the public compact

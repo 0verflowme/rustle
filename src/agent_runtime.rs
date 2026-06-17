@@ -27,6 +27,7 @@ const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_FRAME_WRITE_BURST: usize = 64;
 const AGENT_FRAME_WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_OUTPUT_PRODUCER_YIELD_FRAMES: usize = 8;
 
 const _: () = assert!(
     AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_LOCAL_INPUT_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
@@ -100,6 +101,22 @@ struct AgentTcpStreamOptions {
     connect_timeout: Duration,
     max_frame_payload: usize,
     done_tx: mpsc::Sender<u64>,
+}
+
+#[derive(Debug, Default)]
+struct OutputProducerYieldBudget {
+    frames_since_yield: usize,
+}
+
+impl OutputProducerYieldBudget {
+    fn record_data_frame(&mut self) -> bool {
+        self.frames_since_yield = self.frames_since_yield.saturating_add(1);
+        if self.frames_since_yield < AGENT_OUTPUT_PRODUCER_YIELD_FRAMES {
+            return false;
+        }
+        self.frames_since_yield = 0;
+        true
+    }
 }
 
 impl AgentStreamHandle {
@@ -766,6 +783,7 @@ async fn run_tcp_connected_stream(
 
     let read_chunk = max_frame_payload.clamp(1, AGENT_TCP_READ_CHUNK);
     let mut read_buf = vec![0_u8; read_chunk];
+    let mut output_yield_budget = OutputProducerYieldBudget::default();
     loop {
         match reader.read(&mut read_buf).await {
             Ok(0) => {
@@ -793,6 +811,7 @@ async fn run_tcp_connected_stream(
                     break;
                 }
                 permit.forget();
+                yield_after_output_data_frame(&mut output_yield_budget).await;
             }
             Err(err) => {
                 let _ = send_reset(
@@ -899,6 +918,7 @@ async fn run_udp_stream_inner(
     });
 
     let mut read_buf = vec![0_u8; AGENT_UDP_READ_CHUNK];
+    let mut output_yield_budget = OutputProducerYieldBudget::default();
     loop {
         match socket.recv(&mut read_buf).await {
             Ok(len) => {
@@ -917,6 +937,7 @@ async fn run_udp_stream_inner(
                     break;
                 }
                 permit.forget();
+                yield_after_output_data_frame(&mut output_yield_budget).await;
             }
             Err(err) => {
                 let _ = send_reset(
@@ -936,6 +957,12 @@ async fn run_udp_stream_inner(
         AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()).expect("empty frame"),
     )
     .await;
+}
+
+async fn yield_after_output_data_frame(budget: &mut OutputProducerYieldBudget) {
+    if budget.record_data_frame() {
+        tokio::task::yield_now().await;
+    }
 }
 
 async fn record_receive_credit(
@@ -1201,6 +1228,24 @@ mod tests {
 
         assert_eq!(writes.load(Ordering::Acquire), 2);
         assert_eq!(flushes.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn output_producer_yield_budget_yields_after_bounded_data_frames() {
+        let mut budget = OutputProducerYieldBudget::default();
+
+        for _ in 1..AGENT_OUTPUT_PRODUCER_YIELD_FRAMES {
+            assert!(
+                !budget.record_data_frame(),
+                "producer should keep sending until the yield budget is exhausted"
+            );
+        }
+
+        assert!(budget.record_data_frame(), "budget should yield on the cap");
+        assert!(
+            !budget.record_data_frame(),
+            "budget should reset after forcing a yield"
+        );
     }
 
     #[test]

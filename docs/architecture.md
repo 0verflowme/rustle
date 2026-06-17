@@ -183,10 +183,12 @@ bounded batches; within a batch, priority control frames move ahead of data, and
 protocol `Hello` remains first. Non-priority data, EOF, and close frames are
 round-robined across stream ids inside the collected burst while preserving each
 stream's own ordering, so one busy stream cannot monopolize every encoded frame
-in that burst. Each writer task reuses one burst frame buffer and one
-encoded-byte buffer across bursts, so sustained traffic does not allocate a fresh
-burst vector and encoded buffer for every flush. Agent transport failure is
-sticky: once the underlying
+in that burst. Remote output producers also yield after a bounded number of
+data frames, giving sibling stream tasks a chance to enqueue before one hot
+socket fills the shared writer queue. Each writer task reuses one burst frame
+buffer and one encoded-byte buffer across bursts, so sustained traffic does not
+allocate a fresh burst vector and encoded buffer for every flush. Agent transport
+failure is sticky: once the underlying
 SSH exec channel reports EOF or a frame write failure, current streams are reset
 and later stream opens fail immediately instead of occupying bridge admission
 slots until timeout. Active stream wrappers also observe carrier-level reset or
