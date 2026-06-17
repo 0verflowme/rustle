@@ -66,6 +66,9 @@ case "$BRIDGE_TRANSPORT" in
   agent|quic-agent|quic-native) ;;
   *) smoke_die "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT must be agent, quic-agent, or quic-native" ;;
 esac
+if [[ -n "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" && -n "${RUSTLE_LIVE_UDP_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
+  smoke_die "RUSTLE_LIVE_UDP_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH"
+fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-udp-smoke.XXXXXX")"
 RUSTLE_PID=""
@@ -441,6 +444,9 @@ fi
 CMD+=(--bridge-transport "$BRIDGE_TRANSPORT")
 if [[ -n "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" ]]; then
   CMD+=(--agent-command "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}")
+fi
+if [[ -n "${RUSTLE_LIVE_UDP_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
+  CMD+=(--agent-path "${RUSTLE_LIVE_UDP_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}")
 fi
 if [[ -n "${RUSTLE_LIVE_UDP_AGENT_SESSIONS:-${RUSTLE_LIVE_AGENT_SESSIONS:-}}" ]]; then
   CMD+=(--agent-sessions "${RUSTLE_LIVE_UDP_AGENT_SESSIONS:-${RUSTLE_LIVE_AGENT_SESSIONS:-}}")

@@ -60,6 +60,10 @@ musl sidecar preference when both musl and GNU archives are available.
 The live smoke and benchmark launchers preserve `RUSTLE_AGENT_DIR` through
 their privileged `sudo` wrapper so agent-mode release proof can use the same
 sidecar store that automatic upload bootstrap uses in production.
+When a live lab has a known-good remote Rustle install, the live smoke
+launchers also accept `RUSTLE_LIVE_AGENT_PATH` and the UDP-specific
+`RUSTLE_LIVE_UDP_AGENT_PATH`; like the CLI, those path overrides are mutually
+exclusive with raw agent-command overrides.
 
 For live labs that need a sidecar before published release artifacts exist,
 `scripts/build-agent-sidecars.sh` builds selected release targets, packages them
@@ -476,7 +480,9 @@ Required before tagging a release:
   reachability evidence, not an agent-product regression. For OpenSSH `Host`
   aliases under `sudo`, pass `RUSTLE_LIVE_SSH_CONFIG` or
   `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the
-  same alias as the fixture SSH command.
+  same alias as the fixture SSH command. Use `RUSTLE_LIVE_UDP_AGENT_PATH` only
+  when this UDP proof needs a different preinstalled remote Rustle binary from
+  the main live smoke.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. The release workflow runs
   this smoke against the packaged Windows binary with embedded Wintun before

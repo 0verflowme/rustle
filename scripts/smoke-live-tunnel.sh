@@ -51,6 +51,9 @@ fi
 if [[ "$CONCURRENCY" -gt "$REQUESTS" ]]; then
   CONCURRENCY="$REQUESTS"
 fi
+if [[ -n "${RUSTLE_LIVE_AGENT_COMMAND:-}" && -n "${RUSTLE_LIVE_AGENT_PATH:-}" ]]; then
+  smoke_die "RUSTLE_LIVE_AGENT_COMMAND cannot be combined with RUSTLE_LIVE_AGENT_PATH"
+fi
 
 URL_ROUTE_PROBE_IP="${RUSTLE_LIVE_ROUTE_PROBE_IP:-}"
 if [[ -z "$URL_ROUTE_PROBE_IP" ]]; then
@@ -295,6 +298,9 @@ if [[ -n "${RUSTLE_LIVE_BRIDGE_TRANSPORT:-}" ]]; then
 fi
 if [[ -n "${RUSTLE_LIVE_AGENT_COMMAND:-}" ]]; then
   CMD+=(--agent-command "$RUSTLE_LIVE_AGENT_COMMAND")
+fi
+if [[ -n "${RUSTLE_LIVE_AGENT_PATH:-}" ]]; then
+  CMD+=(--agent-path "$RUSTLE_LIVE_AGENT_PATH")
 fi
 if [[ -n "${RUSTLE_LIVE_AGENT_SESSIONS:-}" ]]; then
   CMD+=(--agent-sessions "$RUSTLE_LIVE_AGENT_SESSIONS")

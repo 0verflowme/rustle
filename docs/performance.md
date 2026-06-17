@@ -495,7 +495,10 @@ benchmark launchers preserve that variable through `sudo` so Rustle can upload
 the matching sidecar after route setup. When published archives are not
 available yet, use `scripts/build-agent-sidecars.sh` to build selected release
 targets from source and populate the same sidecar store before running the live
-fixture.
+fixture. If the remote already has a specific Rustle binary installed, set
+`RUSTLE_LIVE_AGENT_PATH` for the live smokes or `RUSTLE_BENCH_AGENT_PATH` for
+the live benchmark; the launchers append the helper subcommand for the selected
+transport and reject simultaneous raw command/path overrides.
 
 For password-auth labs, the fixture SSH command can reuse
 `RUSTLE_BENCH_PASSWORD_VALUE`/`RUSTLE_LIVE_PASSWORD_VALUE`, or prompt with
@@ -564,7 +567,9 @@ When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
 alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific
 `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the same
-alias as the fixture SSH command.
+alias as the fixture SSH command. Use `RUSTLE_LIVE_UDP_AGENT_PATH` when the UDP
+smoke should use a different preinstalled remote helper binary from the main
+live smoke.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 

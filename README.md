@@ -166,7 +166,9 @@ Live UDP uses the default SSH-agent path; set
 the target allows Rustle's SSH-bootstrapped UDP/QUIC helper data plane. When
 `RUSTLE_LIVE_REMOTE` is an OpenSSH `Host` alias, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` so the privileged Rustle process can
-resolve the same alias.
+resolve the same alias. For labs with a preinstalled remote Rustle binary, set
+`RUSTLE_LIVE_AGENT_PATH=/opt/rustle/rustle`; live UDP can override that with
+`RUSTLE_LIVE_UDP_AGENT_PATH`.
 
 Run the rootless DNS latency benchmark:
 
