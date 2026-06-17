@@ -19,6 +19,12 @@ TIMING_FIELDS = (
     "first_remote_us",
     "duration_us",
 )
+DERIVED_LATENCIES = (
+    ("remote_open_wait_us", "stream_ready_us", "opened_us"),
+    ("payload_queue_wait_us", "first_local_us", "first_local_sent_us"),
+    ("first_byte_wait_us", "first_local_sent_us", "first_remote_us"),
+    ("body_drain_us", "first_remote_us", "duration_us"),
+)
 SUCCESS_OUTCOMES = {
     "closed",
     "local_eof",
@@ -53,6 +59,14 @@ def parse_optional_us(value: str) -> int | None:
     if parsed < 0:
         raise SystemExit(f"invalid negative trace duration value {value!r}")
     return parsed
+
+
+def nonnegative_delta(row: dict[str, str], start_field: str, end_field: str) -> int | None:
+    start = parse_optional_us(row[start_field])
+    end = parse_optional_us(row[end_field])
+    if start is None or end is None or end < start:
+        return None
+    return end - start
 
 
 def parse_trace_line(line: str) -> dict[str, str] | None:
@@ -115,6 +129,25 @@ def summarize(text: str) -> list[dict[str, object]]:
             ]
             for field in TIMING_FIELDS
         }
+        derived_values = {
+            name: [
+                value
+                for row in rows
+                if (value := nonnegative_delta(row, start, end)) is not None
+            ]
+            for name, start, end in DERIVED_LATENCIES
+        }
+        derived_p50 = {
+            name: percentile(values, 50) for name, values in derived_values.items()
+        }
+        likely_bottleneck = max(
+            (
+                (value, name.removesuffix("_us"))
+                for name, value in derived_p50.items()
+                if value is not None
+            ),
+            default=(None, "-"),
+        )[1]
         remote_bytes = sum(int(row["remote_bytes"]) for row in rows)
         local_bytes = sum(int(row["local_bytes"]) for row in rows)
         duration_values = timing_values["duration_us"]
@@ -141,9 +174,14 @@ def summarize(text: str) -> list[dict[str, object]]:
                 ),
                 "first_remote_p50_ms": format_ms(percentile(timing_values["first_remote_us"], 50)),
                 "first_remote_p95_ms": format_ms(percentile(timing_values["first_remote_us"], 95)),
+                "remote_open_wait_p50_ms": format_ms(derived_p50["remote_open_wait_us"]),
+                "payload_queue_wait_p50_ms": format_ms(derived_p50["payload_queue_wait_us"]),
+                "first_byte_wait_p50_ms": format_ms(derived_p50["first_byte_wait_us"]),
+                "body_drain_p50_ms": format_ms(derived_p50["body_drain_us"]),
                 "duration_p50_ms": format_ms(percentile(duration_values, 50)),
                 "duration_p95_ms": format_ms(percentile(duration_values, 95)),
                 "avg_flow_throughput_mib_s": f"{avg_flow_throughput:.2f}",
+                "likely_bottleneck": likely_bottleneck,
                 "outcomes": ",".join(
                     f"{outcome}:{count}" for outcome, count in sorted(outcomes.items())
                 ),
@@ -166,9 +204,14 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "first_local_sent_p50_ms",
         "first_remote_p50_ms",
         "first_remote_p95_ms",
+        "remote_open_wait_p50_ms",
+        "payload_queue_wait_p50_ms",
+        "first_byte_wait_p50_ms",
+        "body_drain_p50_ms",
         "duration_p50_ms",
         "duration_p95_ms",
         "avg_flow_throughput_mib_s",
+        "likely_bottleneck",
         "outcomes",
     )
     print("\t".join(columns))
@@ -209,10 +252,17 @@ def self_test() -> None:
     assert agent["remote_bytes"] == 3072
     assert agent["first_remote_p50_ms"] == "10.000"
     assert agent["first_remote_p95_ms"] == "30.000"
+    assert agent["remote_open_wait_p50_ms"] == "1.000"
+    assert agent["payload_queue_wait_p50_ms"] == "1.000"
+    assert agent["first_byte_wait_p50_ms"] == "6.000"
+    assert agent["body_drain_p50_ms"] == "10.000"
+    assert agent["likely_bottleneck"] == "body_drain"
     assert agent["outcomes"] == "closed:1,remote_eof:1"
     native = next(summary for summary in summaries if summary["transport"] == "quic-native")
     assert native["failed_flows"] == 1
     assert native["first_remote_p50_ms"] == "-"
+    assert native["first_byte_wait_p50_ms"] == "-"
+    assert native["likely_bottleneck"] == "remote_open_wait"
     assert native["outcomes"] == "open_timeout:1"
 
     assert_rejects("", "no rustle_hotpath_tcp")

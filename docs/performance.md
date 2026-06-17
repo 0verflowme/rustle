@@ -534,11 +534,13 @@ find /tmp/rustle-live-bench.xxxxxx -name rustle.log -print0 |
 
 The summary groups flows by transport and reports `stream_ready`, `opened`,
 first local payload, first local payload sent, first remote byte, duration,
-bytes, and outcomes. Use it to decide which bottleneck to attack first: remote
-open latency, delayed first payload forwarding, remote first-byte delay, flow
-duration/windowing, or failed/reset flows. The trace is deliberately opt-in and
-does not include payload bytes. Replace `/tmp/rustle-live-bench.xxxxxx` with the
-log directory printed by the benchmark cleanup message.
+bytes, and outcomes. It also derives `remote_open_wait`, `payload_queue_wait`,
+`first_byte_wait`, `body_drain`, and a `likely_bottleneck` label. Use those
+derived terms to decide which fix comes first: remote open latency, delayed
+first payload forwarding, remote first-byte delay, flow duration/windowing, or
+failed/reset flows. The trace is deliberately opt-in and does not include
+payload bytes. Replace `/tmp/rustle-live-bench.xxxxxx` with the log directory
+printed by the benchmark cleanup message.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is
