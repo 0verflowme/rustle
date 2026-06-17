@@ -42,6 +42,7 @@ LIVE_MAX_P50_MS="${RUSTLE_BENCH_LIVE_MAX_P50_MS:-}"
 LIVE_MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S:-}"
 EXPECT_BYTES="${RUSTLE_BENCH_EXPECT_BYTES:-${RUSTLE_LIVE_EXPECT_BYTES:-}}"
 ALLOW_FAILED_TOOLS="${RUSTLE_BENCH_ALLOW_FAILED_TOOLS:-}"
+ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$TARGET_CIDR" ]] || smoke_die "set RUSTLE_BENCH_TARGET_CIDR, for example 192.168.0.0/16"
@@ -301,9 +302,21 @@ delete_target_route_best_effort() {
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-bench.XXXXXX")"
 RESULTS_TSV="${TMPDIR}/live-results.tsv"
 : >"$RESULTS_TSV"
+if [[ -n "$ARTIFACT_DIR" ]]; then
+  mkdir -p "$ARTIFACT_DIR"
+fi
 ROUTE_BEFORE="$(route_snapshot)"
 CURRENT_STOPPER=""
 CURRENT_PASSWORD_FILE=""
+
+publish_live_artifact() {
+  local source="$1"
+  local name="$2"
+  [[ -n "$ARTIFACT_DIR" ]] || return 0
+  [[ -s "$source" ]] || return 0
+  cp "$source" "${ARTIFACT_DIR}/${name}"
+  smoke_info "wrote live benchmark artifact ${ARTIFACT_DIR}/${name}"
+}
 
 summarize_hotpath_trace_logs() {
   [[ -n "${RUSTLE_HOTPATH_TRACE:-}" ]] || return 0
@@ -318,8 +331,12 @@ summarize_hotpath_trace_logs() {
   [[ "${#logs[@]}" -gt 0 ]] || return 0
   grep -q 'rustle_hotpath_tcp' "${logs[@]}" 2>/dev/null || return 0
 
+  local summary="${TMPDIR}/hotpath-summary.tsv"
   smoke_info "hotpath trace summary for live benchmark logs"
-  "${SCRIPT_DIR}/summarize-hotpath-trace.py" "${logs[@]}" >&2 || true
+  if "${SCRIPT_DIR}/summarize-hotpath-trace.py" "${logs[@]}" >"$summary"; then
+    cat "$summary" >&2
+    publish_live_artifact "$summary" "hotpath-summary.tsv"
+  fi
 }
 
 summarize_quic_diagnostic_logs() {
@@ -335,8 +352,12 @@ summarize_quic_diagnostic_logs() {
   grep -E -q 'UDP data plane|QUIC agent.*stage=|native QUIC bridge.*stage=|server auth' \
     "${logs[@]}" 2>/dev/null || return 0
 
+  local summary="${TMPDIR}/quic-diagnostics.tsv"
   smoke_info "QUIC diagnostic summary for live benchmark logs"
-  "${SCRIPT_DIR}/summarize-quic-diagnostics.py" "${logs[@]}" >&2 || true
+  if "${SCRIPT_DIR}/summarize-quic-diagnostics.py" "${logs[@]}" >"$summary"; then
+    cat "$summary" >&2
+    publish_live_artifact "$summary" "quic-diagnostics.tsv"
+  fi
 }
 
 cleanup() {
@@ -354,6 +375,7 @@ cleanup() {
   fi
   summarize_hotpath_trace_logs
   summarize_quic_diagnostic_logs
+  publish_live_artifact "$RESULTS_TSV" "live-results.tsv"
   if [[ "$status" -ne 0 || "$KEEP_LOGS" == "1" ]]; then
     smoke_info "kept live benchmark logs in ${TMPDIR}"
   else
