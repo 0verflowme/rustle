@@ -356,7 +356,11 @@ async fn query_dns_over_agent_tcp_stream(mut stream: AgentIoStream, query: &[u8]
         let mut received = BytesMut::with_capacity(512);
         let mut expected_len = None;
 
-        while let Some(frame) = stream.recv().await {
+        while let Some(frame) = stream
+            .recv()
+            .await
+            .context("failed to read DNS TCP response over agent")?
+        {
             match frame.kind {
                 agent_proto::AgentFrameKind::Data => {
                     received.extend_from_slice(frame.payload.as_ref());
@@ -396,7 +400,11 @@ async fn query_dns_over_agent_udp_stream(mut stream: AgentIoStream, query: &[u8]
         .context("failed to write DNS UDP query over agent")?;
 
     let response = tokio::time::timeout(DNS_QUERY_TIMEOUT, async {
-        while let Some(frame) = stream.recv().await {
+        while let Some(frame) = stream
+            .recv()
+            .await
+            .context("failed to read DNS UDP response over agent")?
+        {
             match frame.kind {
                 agent_proto::AgentFrameKind::Data => return Ok(frame.payload),
                 agent_proto::AgentFrameKind::Eof | agent_proto::AgentFrameKind::Close => break,

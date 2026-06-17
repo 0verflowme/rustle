@@ -207,7 +207,12 @@ async fn run_udp_association_stream(
                 idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
             maybe_frame = stream.recv() => {
-                let Some(frame) = maybe_frame else {
+                let Some(frame) = maybe_frame.with_context(|| {
+                    format!(
+                        "failed to read UDP datagram over agent from {}:{}",
+                        key.dst_ip, key.dst_port
+                    )
+                })? else {
                     break;
                 };
                 match frame.kind {

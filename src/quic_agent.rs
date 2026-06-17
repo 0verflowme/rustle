@@ -875,7 +875,6 @@ async fn read_quic_bridge_exact_or_eof(
             Ok(Some(len)) => offset += len,
             Ok(None) if offset == 0 => return Ok(false),
             Ok(None) => bail!("native QUIC bridge UDP datagram ended mid-frame"),
-            Err(quinn::ReadError::ConnectionLost(_)) if offset == 0 => return Ok(false),
             Err(err) => {
                 return Err(err).context("failed to read native QUIC bridge UDP datagram length")
             }
