@@ -267,6 +267,8 @@ REQUIRED_MAIN_SOURCE_SNIPPETS = [
     "accounted_bridge_event_releases_remote_data_on_send_timeout",
     "bridge_event_batch_releases_accounted_remote_data_on_dequeue",
     "bridge_event_queue=remote_bytes",
+    "remote_bytes_raw",
+    "max_raw",
     "tun_write=calls",
     "bridge_event_batch=count",
     "record_bridge_event_batch",
@@ -1374,7 +1376,9 @@ REQUIRED_LIVE_BENCHMARK_ROW_SNIPPETS = [
     "agent_reconnect_failed=1",
     "backlog_overflow=1",
     "bridge_event_queue_remote_bytes",
+    "bridge_event_queue_remote_bytes_max",
     "bridge_event_queue_remote_bytes=4096",
+    "bridge_event_queue_remote_bytes_max is not numeric",
     "matched no successful rows",
     "--self-test",
     "assert_rejects",
@@ -1386,7 +1390,7 @@ REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "RUSTLE_LIVE_AGENT_PATH",
     "cannot be combined with RUSTLE_LIVE_AGENT_PATH",
     "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
-    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
+    'smoke_require_stat_zero "bridge event queued remote bytes"',
     "--ssh-config",
     "--agent-path",
     "--password-file",
@@ -1406,7 +1410,7 @@ REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
     "RUSTLE_LIVE_AGENT_PATH",
     "cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH",
     "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
-    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
+    'smoke_require_stat_zero "bridge event queued remote bytes"',
     "agent|quic-agent|quic-native",
     "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS",
     "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES",
@@ -1440,7 +1444,6 @@ REQUIRED_SMOKE_LIB_SNIPPETS = [
     "smoke_process_fd_count",
     "smoke_process_tree_fd_count",
     "smoke_require_process_tree_fd_count_at_most",
-    "smoke_require_stat_zero_bytes",
     "route: added 0.0.0.0/1",
     "route: added 128.0.0.0/1",
 ]
@@ -1486,7 +1489,7 @@ REQUIRED_TUN_DNS_SMOKE_SNIPPETS = [
     "resolvectl status",
     "networksetup -getdnsservers",
     "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
-    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
+    'smoke_require_stat_zero "bridge event queued remote bytes"',
 ]
 
 REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
@@ -1496,7 +1499,7 @@ REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
     "waiting for UDP association idle cleanup",
     'smoke_require_stat_zero "UDP active associations"',
     "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
-    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
+    'smoke_require_stat_zero "bridge event queued remote bytes"',
 ]
 
 REQUIRED_SSH_CONFIG_ALIAS_SMOKE_SNIPPETS = [
@@ -1585,6 +1588,9 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "64 KiB chunks",
     "protocol payload cap",
     "bridge_event_queue=remote_bytes",
+    "remote_bytes_raw",
+    "max_raw",
+    "bridge_event_queue_remote_bytes_max",
     "tun_write=calls",
     "bridge_event_batch=count",
     "quic-auth:",

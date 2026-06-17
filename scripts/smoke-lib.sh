@@ -759,21 +759,3 @@ smoke_require_stat_zero() {
     smoke_die "expected ${label}=0, saw ${value}"
   fi
 }
-
-smoke_require_stat_zero_bytes() {
-  local label="$1"
-  local value="$2"
-  local final_stats="$3"
-  case "$value" in
-    0 | 0B)
-      ;;
-    '')
-      printf 'final stats: %s\n' "$final_stats" >&2
-      smoke_die "could not parse byte final stat ${label}"
-      ;;
-    *)
-      printf 'final stats: %s\n' "$final_stats" >&2
-      smoke_die "expected ${label}=0B, saw ${value}"
-      ;;
-  esac
-}

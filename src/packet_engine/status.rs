@@ -235,7 +235,7 @@ impl TunnelStats {
             .unwrap_or(0);
 
         format!(
-            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} bridge_event_queue=remote_bytes:{} max:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
+            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} bridge_event_queue=remote_bytes:{} max:{} remote_bytes_raw:{} max_raw:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
             format_duration(self.started_at.elapsed()),
             snapshot.tcp.active_flows,
             snapshot.tcp.ssh_channels,
@@ -243,6 +243,8 @@ impl TunnelStats {
             format_bytes(snapshot.tcp.backlog_bytes),
             format_bytes(snapshot.bridge_events.remote_bytes),
             format_bytes(snapshot.bridge_events.remote_bytes_max),
+            snapshot.bridge_events.remote_bytes,
+            snapshot.bridge_events.remote_bytes_max,
             self.tun_rx_packets,
             format_bytes(self.tun_rx_bytes),
             self.tun_tx_packets,
@@ -441,7 +443,9 @@ mod tests {
         });
 
         assert!(line.contains("active_flows=1 ssh_channels=1 backlog_flows=0"));
-        assert!(line.contains("bridge_event_queue=remote_bytes:4.0KiB max:8.0KiB"));
+        assert!(line.contains(
+            "bridge_event_queue=remote_bytes:4.0KiB max:8.0KiB remote_bytes_raw:4096 max_raw:8192"
+        ));
         assert!(line.contains("tun_tx=2/2.0KiB"));
         assert!(line.contains("tun_drop=1/512B"));
         assert!(line.contains("tun_write=calls:3 total_us:77 max_us:55"));

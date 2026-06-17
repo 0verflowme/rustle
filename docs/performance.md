@@ -328,14 +328,16 @@ scripts/bench-live-compare.sh
 Output is tab-separated:
 
 ```text
-tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  bytes  throughput_mib_s  req_s  avg_cpu_pct  max_cpu_pct  ssh_opened  ssh_failed  agent_reconnect_attempts  agent_reconnect_ok  agent_reconnect_failed  backlog_overflow  bridge_event_queue_remote_bytes
+tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  bytes  throughput_mib_s  req_s  avg_cpu_pct  max_cpu_pct  ssh_opened  ssh_failed  agent_reconnect_attempts  agent_reconnect_ok  agent_reconnect_failed  backlog_overflow  bridge_event_queue_remote_bytes  bridge_event_queue_remote_bytes_max
 ```
 
 Every run is verified before the script exits. Successful Rustle rows must have
 zero diagnostic failure counters for `ssh_failed`, `agent_reconnect_failed`,
 `backlog_overflow`, and `bridge_event_queue_remote_bytes`; nonzero values fail
 the live benchmark even when request success and optional performance thresholds
-pass.
+pass. `bridge_event_queue_remote_bytes_max` records the high-water remote bytes
+queued before packet-engine ingestion so live throughput runs can distinguish
+event-loop pressure from downstream backlog or TUN write pressure.
 
 By default the live harness benchmarks Rustle with the primary `agent` transport
 first, then the `direct-tcpip` compatibility path, producing `rustle-agent` and
@@ -591,8 +593,9 @@ keep the raw per-run `rustle.log` files.
 
 The regular `stats:` line also carries live drain counters for untraced runs:
 `tun_write=calls:<n> total_us:<n> max_us:<n>` reports TUN write pressure, and
-`bridge_event_queue=remote_bytes:<n> max:<n>` reports remote `RemoteData` bytes
-already queued by bridge tasks but not yet dequeued by the packet engine.
+`bridge_event_queue=remote_bytes:<n> max:<n> remote_bytes_raw:<n> max_raw:<n>`
+reports remote `RemoteData` bytes already queued by bridge tasks but not yet
+dequeued by the packet engine.
 `bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
 supervisor bridge-event batch pressure and backlog pauses.
 Use those fields with hotpath `pre_bridge_queue_wait`, `remote_event_wait`, and
