@@ -129,6 +129,7 @@ pub struct ReceivedLocalData {
 }
 
 impl LocalDataReceiver {
+    #[cfg(test)]
     pub async fn recv(&mut self) -> Option<Bytes> {
         self.recv_with_metrics().await.map(|local| local.bytes)
     }
@@ -211,7 +212,8 @@ where
     }
 }
 
-pub fn spawn_direct_tcpip_bridge_with_opener<F, Fut>(
+#[cfg(test)]
+fn spawn_direct_tcpip_bridge_with_opener<F, Fut>(
     id: FlowId,
     event_tx: mpsc::Sender<BridgeEvent>,
     open_channel: F,

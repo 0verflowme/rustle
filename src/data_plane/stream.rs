@@ -6,6 +6,7 @@ use crate::agent_proto;
 use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream};
 #[cfg(test)]
 use crate::agent_transport;
+use crate::ssh_bridge::DirectTcpipChannel;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct StreamSendMetrics {
@@ -26,6 +27,10 @@ impl From<crate::agent_transport::AgentStreamSendMetrics> for StreamSendMetrics 
 
 pub(crate) enum AgentIoStream {
     Bridge(AgentBridgeStream),
+    DirectTcpip {
+        channel: DirectTcpipChannel,
+        opened_reported: bool,
+    },
     QuicNativeTcp {
         stream: QuicNativeBridgeStream,
         opened_reported: bool,
@@ -36,6 +41,13 @@ pub(crate) enum AgentIoStream {
 }
 
 impl AgentIoStream {
+    pub(crate) fn direct_tcpip(channel: DirectTcpipChannel) -> Self {
+        Self::DirectTcpip {
+            channel,
+            opened_reported: false,
+        }
+    }
+
     pub(crate) fn quic_native_tcp(stream: QuicNativeBridgeStream) -> Self {
         Self::quic_native_tcp_with_open_status(stream, false)
     }
@@ -64,6 +76,10 @@ impl AgentIoStream {
     ) -> Result<StreamSendMetrics> {
         match self {
             Self::Bridge(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
+            Self::DirectTcpip { channel, .. } => {
+                channel.data_bytes(bytes.into()).await?;
+                Ok(StreamSendMetrics::default())
+            }
             Self::QuicNativeTcp { stream, .. } => {
                 stream.send_data(bytes.into()).await?;
                 Ok(StreamSendMetrics::default())
@@ -80,6 +96,10 @@ impl AgentIoStream {
     pub(crate) async fn send_eof(&mut self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_eof().await,
+            Self::DirectTcpip { channel, .. } => channel
+                .eof()
+                .await
+                .context("failed to send EOF over direct-tcpip channel"),
             Self::QuicNativeTcp { stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(stream) => stream.send_eof().await,
             #[cfg(test)]
@@ -90,6 +110,48 @@ impl AgentIoStream {
     pub(crate) async fn recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
         match self {
             Self::Bridge(stream) => Ok(stream.recv().await),
+            Self::DirectTcpip {
+                channel,
+                opened_reported,
+            } => {
+                if !*opened_reported {
+                    *opened_reported = true;
+                    return Ok(Some(
+                        agent_proto::AgentFrame::new(
+                            agent_proto::AgentFrameKind::Opened,
+                            0,
+                            Bytes::new(),
+                        )
+                        .context("failed to synthesize direct-tcpip opened frame")?,
+                    ));
+                }
+
+                while let Some(message) = channel.wait().await {
+                    match message {
+                        russh::ChannelMsg::Data { data }
+                        | russh::ChannelMsg::ExtendedData { data, .. } => {
+                            return Ok(agent_proto::AgentFrame::new(
+                                agent_proto::AgentFrameKind::Data,
+                                0,
+                                data,
+                            )
+                            .ok());
+                        }
+                        russh::ChannelMsg::Eof => {
+                            return Ok(Some(
+                                agent_proto::AgentFrame::new(
+                                    agent_proto::AgentFrameKind::Eof,
+                                    0,
+                                    Bytes::new(),
+                                )
+                                .context("failed to synthesize direct-tcpip EOF frame")?,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(None)
+            }
             Self::QuicNativeTcp {
                 stream,
                 opened_reported,
@@ -135,6 +197,10 @@ impl AgentIoStream {
     pub(crate) async fn close(self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.close().await,
+            Self::DirectTcpip { channel, .. } => channel
+                .close()
+                .await
+                .context("failed to close direct-tcpip channel"),
             Self::QuicNativeTcp { mut stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(mut stream) => stream.send_eof().await,
             #[cfg(test)]

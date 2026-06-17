@@ -195,11 +195,45 @@ impl DataPlane for DirectTcpipDataPlane {
         open: DataPlaneTcpOpen,
         _mode: DataPlaneTcpOpenMode,
     ) -> OpenTcpFuture<'static> {
+        let ssh = self.ssh.clone();
         Box::pin(async move {
-            bail!(
-                "data plane does not support stream-style TCP opens to {}",
-                open.destination_label()
+            let destination_label = open.destination_label();
+            let (destination_host, destination_port, originator_ip, originator_port) = match open {
+                DataPlaneTcpOpen::Ipv4(open) => (
+                    open.destination_ip.to_string(),
+                    u32::from(open.destination_port),
+                    open.originator_ip.to_string(),
+                    u32::from(open.originator_port),
+                ),
+                DataPlaneTcpOpen::Host {
+                    destination_host,
+                    destination_port,
+                    originator_ip,
+                    originator_port,
+                } => (
+                    destination_host,
+                    u32::from(destination_port),
+                    originator_ip.to_string(),
+                    u32::from(originator_port),
+                ),
+            };
+            let channel = tokio::time::timeout(
+                ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                ssh.open_background_direct_tcpip(
+                    destination_host,
+                    destination_port,
+                    originator_ip,
+                    originator_port,
+                ),
             )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                )
+            })??;
+            Ok(AgentIoStream::direct_tcpip(channel))
         })
     }
 

@@ -18,7 +18,7 @@ const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
 pub(super) fn spawn_direct_tcpip_bridge(
     id: tcp_core::FlowId,
-    _ready_wait_ms: u64,
+    ready_wait_ms: u64,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ssh: SshSessionPool,
 ) -> ssh_bridge::FlowBridge {
@@ -27,9 +27,19 @@ pub(super) fn spawn_direct_tcpip_bridge(
         "ssh: opening direct-tcpip {}:{} for local {}:{} generation={}",
         flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
     );
-    ssh_bridge::spawn_direct_tcpip_bridge_with_opener(id, event_tx, move |id| {
-        let ssh = ssh.clone();
-        async move { ssh.open_direct_tcpip_for_flow(id).await }
+    spawn_data_plane_tcp_bridge_with_open(id, event_tx, ready_wait_ms, "SSH", None, async move {
+        let channel = tokio::time::timeout(
+            ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+            ssh.open_direct_tcpip_for_flow(id),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "timed out after {}ms opening direct-tcpip stream",
+                ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+            )
+        })??;
+        Ok(AgentIoStream::direct_tcpip(channel))
     })
 }
 
