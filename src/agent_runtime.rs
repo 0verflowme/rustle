@@ -93,6 +93,13 @@ enum AgentStreamHandle {
     Udp(AgentUdpHandle),
 }
 
+#[derive(Clone)]
+struct AgentTcpStreamOptions {
+    connect_timeout: Duration,
+    max_frame_payload: usize,
+    done_tx: mpsc::Sender<u64>,
+}
+
 impl AgentStreamHandle {
     fn abort(self) {
         match self {
@@ -228,6 +235,7 @@ where
     let mut read_buf = [0_u8; 8192];
     let mut streams = HashMap::<u64, AgentStreamHandle>::new();
     let (done_tx, mut done_rx) = mpsc::channel(AGENT_STREAM_COMPLETIONS);
+    let mut peer_max_frame_payload = AGENT_MAX_FRAME_PAYLOAD;
 
     loop {
         drain_completed_streams(&mut done_rx, &mut streams);
@@ -235,7 +243,15 @@ where
             try_decode_frame(&mut input).context("failed to decode agent frame")?
         {
             drain_completed_streams(&mut done_rx, &mut streams);
-            handle_agent_frame(frame, config, &out_tx, &done_tx, &mut streams).await?;
+            handle_agent_frame(
+                frame,
+                config,
+                &out_tx,
+                &done_tx,
+                &mut streams,
+                &mut peer_max_frame_payload,
+            )
+            .await?;
         }
         drain_completed_streams(&mut done_rx, &mut streams);
 
@@ -285,6 +301,7 @@ async fn handle_agent_frame(
     out_tx: &mpsc::Sender<AgentFrame>,
     done_tx: &mpsc::Sender<u64>,
     streams: &mut HashMap<u64, AgentStreamHandle>,
+    peer_max_frame_payload: &mut usize,
 ) -> Result<()> {
     match frame.kind {
         AgentFrameKind::Hello => {
@@ -298,6 +315,11 @@ async fn handle_agent_frame(
             if peer.capabilities & CAP_FLOW_CONTROL == 0 {
                 bail!("agent controller does not advertise flow-control support");
             }
+            if peer.max_frame_payload == 0 {
+                bail!("agent controller advertised zero max frame payload");
+            }
+            *peer_max_frame_payload =
+                (peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD);
             send_agent_frame(
                 out_tx,
                 AgentFrame::new(
@@ -321,14 +343,18 @@ async fn handle_agent_frame(
             let open = AgentOpenIpv4::decode(&frame.payload)?;
             let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
             let output_credit = Arc::new(Semaphore::new(0));
+            let options = AgentTcpStreamOptions {
+                connect_timeout: config.tcp_connect_timeout,
+                max_frame_payload: *peer_max_frame_payload,
+                done_tx: done_tx.clone(),
+            };
             let task = tokio::spawn(run_tcp_stream(
                 frame.stream_id,
                 open,
                 from_local,
                 out_tx.clone(),
                 Arc::clone(&output_credit),
-                config.tcp_connect_timeout,
-                done_tx.clone(),
+                options,
             ));
             streams.insert(
                 frame.stream_id,
@@ -352,14 +378,18 @@ async fn handle_agent_frame(
             let open = AgentOpenHost::decode(&frame.payload)?;
             let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
             let output_credit = Arc::new(Semaphore::new(0));
+            let options = AgentTcpStreamOptions {
+                connect_timeout: config.tcp_connect_timeout,
+                max_frame_payload: *peer_max_frame_payload,
+                done_tx: done_tx.clone(),
+            };
             let task = tokio::spawn(run_tcp_host_stream(
                 frame.stream_id,
                 open,
                 from_local,
                 out_tx.clone(),
                 Arc::clone(&output_credit),
-                config.tcp_connect_timeout,
-                done_tx.clone(),
+                options,
             ));
             streams.insert(
                 frame.stream_id,
@@ -519,8 +549,7 @@ async fn run_tcp_stream(
     from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
-    connect_timeout: Duration,
-    done_tx: mpsc::Sender<u64>,
+    options: AgentTcpStreamOptions,
 ) {
     run_tcp_stream_inner(
         stream_id,
@@ -528,10 +557,10 @@ async fn run_tcp_stream(
         from_local,
         out_tx,
         output_credit,
-        connect_timeout,
+        options.clone(),
     )
     .await;
-    let _ = done_tx.try_send(stream_id);
+    let _ = options.done_tx.try_send(stream_id);
 }
 
 async fn run_tcp_host_stream(
@@ -540,8 +569,7 @@ async fn run_tcp_host_stream(
     from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
-    connect_timeout: Duration,
-    done_tx: mpsc::Sender<u64>,
+    options: AgentTcpStreamOptions,
 ) {
     run_tcp_host_stream_inner(
         stream_id,
@@ -549,10 +577,10 @@ async fn run_tcp_host_stream(
         from_local,
         out_tx,
         output_credit,
-        connect_timeout,
+        options.clone(),
     )
     .await;
-    let _ = done_tx.try_send(stream_id);
+    let _ = options.done_tx.try_send(stream_id);
 }
 
 async fn run_tcp_stream_inner(
@@ -561,11 +589,20 @@ async fn run_tcp_stream_inner(
     from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
-    connect_timeout: Duration,
+    options: AgentTcpStreamOptions,
 ) {
     let destination = SocketAddrV4::new(open.destination_ip, open.destination_port);
-    let stream = tcp_connect_with_timeout(TcpStream::connect(destination), connect_timeout).await;
-    run_tcp_connected_stream(stream_id, stream, from_local, out_tx, output_credit).await;
+    let stream =
+        tcp_connect_with_timeout(TcpStream::connect(destination), options.connect_timeout).await;
+    run_tcp_connected_stream(
+        stream_id,
+        stream,
+        from_local,
+        out_tx,
+        output_credit,
+        options.max_frame_payload,
+    )
+    .await;
 }
 
 async fn run_tcp_host_stream_inner(
@@ -574,14 +611,22 @@ async fn run_tcp_host_stream_inner(
     from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
-    connect_timeout: Duration,
+    options: AgentTcpStreamOptions,
 ) {
     let stream = tcp_connect_with_timeout(
         TcpStream::connect((open.destination_host.as_str(), open.destination_port)),
-        connect_timeout,
+        options.connect_timeout,
     )
     .await;
-    run_tcp_connected_stream(stream_id, stream, from_local, out_tx, output_credit).await;
+    run_tcp_connected_stream(
+        stream_id,
+        stream,
+        from_local,
+        out_tx,
+        output_credit,
+        options.max_frame_payload,
+    )
+    .await;
 }
 
 async fn tcp_connect_with_timeout<F>(
@@ -609,6 +654,7 @@ async fn run_tcp_connected_stream(
     mut from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
+    max_frame_payload: usize,
 ) {
     let stream = match stream {
         Ok(stream) => {
@@ -685,7 +731,8 @@ async fn run_tcp_connected_stream(
         }
     });
 
-    let mut read_buf = vec![0_u8; AGENT_TCP_READ_CHUNK];
+    let read_chunk = max_frame_payload.clamp(1, AGENT_TCP_READ_CHUNK);
+    let mut read_buf = vec![0_u8; read_chunk];
     loop {
         match reader.read(&mut read_buf).await {
             Ok(0) => {
@@ -1364,6 +1411,7 @@ mod tests {
                 task,
             }),
         );
+        let mut peer_max_frame_payload = AGENT_MAX_FRAME_PAYLOAD;
 
         handle_agent_frame(
             AgentFrame::new(AgentFrameKind::Data, 7, Bytes::from_static(b"blocked")).unwrap(),
@@ -1371,6 +1419,7 @@ mod tests {
             &out_tx,
             &done_tx,
             &mut streams,
+            &mut peer_max_frame_payload,
         )
         .await
         .expect("full stream input queue should reset stream");
@@ -1422,8 +1471,11 @@ mod tests {
                 remote_rx,
                 out_tx,
                 output_credit,
-                AGENT_TCP_CONNECT_TIMEOUT,
-                done_tx,
+                AgentTcpStreamOptions {
+                    connect_timeout: AGENT_TCP_CONNECT_TIMEOUT,
+                    max_frame_payload: AGENT_TCP_READ_CHUNK,
+                    done_tx,
+                },
             ),
         )
         .await
@@ -1460,6 +1512,7 @@ mod tests {
             from_local,
             out_tx,
             Arc::new(Semaphore::new(0)),
+            AGENT_TCP_READ_CHUNK,
         )
         .await;
 
@@ -1613,6 +1666,114 @@ mod tests {
         }
 
         assert_eq!(response, b"echo:hello");
+        assert!(saw_eof);
+        assert!(saw_close);
+
+        drop(client_writer);
+        drop(client_reader);
+        timeout(Duration::from_secs(1), agent)
+            .await
+            .expect("agent task should exit after client EOF")
+            .expect("agent task join")
+            .expect("agent run");
+        server.await.expect("server task join");
+    }
+
+    #[tokio::test]
+    async fn agent_tcp_output_honors_controller_frame_cap() {
+        let peer_frame_cap = 1024_usize;
+        let response_body = vec![0x5a; peer_frame_cap * 3 + 17];
+        let expected_response_len = response_body.len();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP listener");
+        let destination = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept remote TCP");
+            socket
+                .write_all(&response_body)
+                .await
+                .expect("write remote response");
+            socket.shutdown().await.expect("shutdown remote TCP");
+        });
+
+        let (client_io, agent_io) = duplex(256 * 1024);
+        let (agent_reader, agent_writer) = split(agent_io);
+        let agent = tokio::spawn(run(
+            agent_reader,
+            agent_writer,
+            AgentRuntimeConfig::new(1300),
+        ));
+        let (mut client_reader, mut client_writer) = split(client_io);
+
+        let mut controller_hello = AgentHello::current(1300);
+        controller_hello.max_frame_payload = peer_frame_cap as u32;
+        write_test_frame(
+            &mut client_writer,
+            AgentFrame::new(AgentFrameKind::Hello, 0, controller_hello.encode()).unwrap(),
+        )
+        .await;
+
+        let mut inbound = BytesMut::new();
+        let hello = read_test_frame(&mut client_reader, &mut inbound, "hello").await;
+        assert_eq!(hello.kind, AgentFrameKind::Hello);
+
+        let destination = match destination {
+            std::net::SocketAddr::V4(addr) => addr,
+            std::net::SocketAddr::V6(_) => panic!("listener should be IPv4"),
+        };
+        write_test_frame(
+            &mut client_writer,
+            AgentFrame::new(
+                AgentFrameKind::OpenTcp,
+                1,
+                AgentOpenIpv4 {
+                    destination_ip: *destination.ip(),
+                    destination_port: destination.port(),
+                    originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+                    originator_port: 49152,
+                }
+                .encode(),
+            )
+            .unwrap(),
+        )
+        .await;
+
+        let opened = read_test_frame(&mut client_reader, &mut inbound, "opened").await;
+        assert_eq!(opened.kind, AgentFrameKind::Opened);
+        assert_eq!(opened.stream_id, 1);
+        write_test_frame(
+            &mut client_writer,
+            AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
+                .unwrap()
+                .with_credit(AGENT_STREAM_WINDOW_BYTES as u32),
+        )
+        .await;
+
+        let mut response_len = 0_usize;
+        let mut saw_eof = false;
+        let mut saw_close = false;
+        for _ in 0..16 {
+            let frame = read_test_frame(&mut client_reader, &mut inbound, "capped response").await;
+            match frame.kind {
+                AgentFrameKind::Data => {
+                    assert!(
+                        frame.payload.len() <= peer_frame_cap,
+                        "payload length {} exceeded controller cap {peer_frame_cap}",
+                        frame.payload.len()
+                    );
+                    response_len += frame.payload.len();
+                }
+                AgentFrameKind::Eof => saw_eof = true,
+                AgentFrameKind::Close => {
+                    saw_close = true;
+                    break;
+                }
+                other => panic!("unexpected frame from agent: {other:?}"),
+            }
+        }
+
+        assert_eq!(response_len, expected_response_len);
         assert!(saw_eof);
         assert!(saw_close);
 
