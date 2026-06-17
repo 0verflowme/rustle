@@ -1,34 +1,33 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
-use quinn::{
-    ClientConfig, Connection, Endpoint, EndpointConfig, MtuDiscoveryConfig, ServerConfig,
-    TransportConfig,
-};
-use rcgen::generate_simple_self_signed;
-use ring::rand::SecureRandom;
-use ring::{digest, rand};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use quinn::{Connection, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 use crate::agent_proto::{AgentOpenHost, AgentOpenIpv4};
 
-pub const QUIC_AGENT_SERVER_NAME: &str = "rustle-agent";
-pub const QUIC_AGENT_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_AGENT_V2";
-pub const QUIC_BRIDGE_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_BRIDGE_V2";
-const QUIC_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const QUIC_AGENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
-const QUIC_AGENT_MAX_CONCURRENT_BIDI_STREAMS: u16 = 1;
-const QUIC_BRIDGE_MAX_CONCURRENT_BIDI_STREAMS: u16 = 1024;
-const QUIC_AGENT_MAX_CONCURRENT_UNI_STREAMS: u16 = 0;
-const QUIC_AGENT_STREAM_RECEIVE_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
-const QUIC_AGENT_CONNECTION_RECEIVE_WINDOW_BYTES: u32 = 64 * 1024 * 1024;
-const QUIC_AGENT_SEND_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
-const QUIC_AGENT_MAX_UDP_PAYLOAD_BYTES: u16 = 9000;
+mod auth;
+mod bootstrap;
+mod config;
+
+use auth::{
+    authenticate_quic_bridge_connection_on_client, authenticate_quic_bridge_connection_on_server,
+    generate_quic_auth_token, open_quic_bi_stream_with_timeout, read_quic_auth_ok,
+    verify_quic_auth_token, write_quic_auth_ok, write_quic_auth_token, QUIC_AUTH_FAILED_CODE,
+    QUIC_AUTH_TIMEOUT,
+};
+use bootstrap::sha256_hex;
+pub use bootstrap::QuicAgentBootstrap;
+pub use config::QUIC_AGENT_SERVER_NAME;
+use config::{
+    quic_client_config, quic_client_endpoint, quic_server_config, quic_server_endpoint,
+    QUIC_AGENT_MAX_CONCURRENT_BIDI_STREAMS, QUIC_BRIDGE_MAX_CONCURRENT_BIDI_STREAMS,
+};
+
 const QUIC_BRIDGE_OPEN_MAGIC: &[u8; 4] = b"RQB2";
 const QUIC_BRIDGE_OPEN_HEADER_LEN: usize = 20;
 const QUIC_BRIDGE_STATUS_OK: u8 = 0;
@@ -38,11 +37,7 @@ const QUIC_BRIDGE_UDP_CHUNK: usize = u16::MAX as usize;
 const QUIC_BRIDGE_PROTO_TCP: u8 = 6;
 const QUIC_BRIDGE_PROTO_UDP: u8 = 17;
 const QUIC_BRIDGE_PROTO_TCP_HOST: u8 = 12;
-const QUIC_AUTH_TOKEN_BYTES: usize = 32;
-const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const QUIC_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
-const QUIC_AUTH_FAILED_CODE: u32 = 0x5255_4155;
-const QUIC_AUTH_STATUS_OK: u8 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuicBridgeProtocol {
@@ -89,104 +84,6 @@ enum QuicBridgeOpenHeader {
     Ipv4(QuicBridgeIpv4Open),
     TcpHost(QuicBridgeHostOpenHeader),
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuicAgentBootstrap {
-    pub port: u16,
-    pub cert_sha256: String,
-    pub cert_der: Vec<u8>,
-    pub auth_token: Vec<u8>,
-}
-
-impl QuicAgentBootstrap {
-    pub fn encode_line(&self) -> String {
-        self.encode_line_with_magic(QUIC_AGENT_BOOTSTRAP_MAGIC)
-    }
-
-    pub fn encode_bridge_line(&self) -> String {
-        self.encode_line_with_magic(QUIC_BRIDGE_BOOTSTRAP_MAGIC)
-    }
-
-    fn encode_line_with_magic(&self, magic: &str) -> String {
-        format!(
-            "{magic} {} {} {} {}",
-            self.port,
-            self.cert_sha256,
-            lower_hex(&self.cert_der),
-            lower_hex(&self.auth_token)
-        )
-    }
-
-    pub fn decode_line(line: &str) -> Result<Self> {
-        Self::decode_line_with_magic(line, QUIC_AGENT_BOOTSTRAP_MAGIC)
-    }
-
-    pub fn decode_bridge_line(line: &str) -> Result<Self> {
-        Self::decode_line_with_magic(line, QUIC_BRIDGE_BOOTSTRAP_MAGIC)
-    }
-
-    fn decode_line_with_magic(line: &str, expected_magic: &str) -> Result<Self> {
-        let mut fields = line.split_whitespace();
-        let Some(magic) = fields.next() else {
-            bail!("empty QUIC agent bootstrap line");
-        };
-        if magic != expected_magic {
-            bail!("unexpected QUIC bootstrap magic {magic:?}");
-        }
-        let port = fields
-            .next()
-            .context("missing QUIC agent UDP port")?
-            .parse::<u16>()
-            .context("invalid QUIC agent UDP port")?;
-        let cert_sha256 = fields
-            .next()
-            .context("missing QUIC agent certificate SHA-256")?
-            .to_ascii_lowercase();
-        if !is_sha256_hex(&cert_sha256) {
-            bail!("invalid QUIC agent certificate SHA-256 {cert_sha256:?}");
-        }
-        let cert_der = decode_hex(
-            fields
-                .next()
-                .context("missing QUIC agent certificate DER")?,
-        )
-        .context("invalid QUIC agent certificate DER")?;
-        let auth_token = decode_hex(fields.next().context("missing QUIC agent auth token")?)
-            .context("invalid QUIC agent auth token")?;
-        if auth_token.len() != QUIC_AUTH_TOKEN_BYTES {
-            bail!(
-                "invalid QUIC agent auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
-                auth_token.len()
-            );
-        }
-        if fields.next().is_some() {
-            bail!("unexpected trailing fields in QUIC agent bootstrap line");
-        }
-        let actual_sha256 = sha256_hex(&cert_der);
-        if actual_sha256 != cert_sha256 {
-            bail!(
-                "QUIC agent certificate SHA-256 mismatch: expected {cert_sha256}, got {actual_sha256}"
-            );
-        }
-        Ok(Self {
-            port,
-            cert_sha256,
-            cert_der,
-            auth_token,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct QuicAuthError;
-
-impl std::fmt::Display for QuicAuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("invalid QUIC helper auth token")
-    }
-}
-
-impl std::error::Error for QuicAuthError {}
 
 pub struct QuicAgentServer {
     endpoint: Endpoint,
@@ -384,7 +281,7 @@ pub async fn connect_quic_agent_stream(
     let (mut send, mut recv) =
         open_quic_bi_stream_with_timeout(&connection, QUIC_AUTH_TIMEOUT, "QUIC agent auth stream")
             .await?;
-    write_quic_auth_token(&mut send, bootstrap)
+    write_quic_auth_token(&mut send, &bootstrap.auth_token)
         .await
         .context("failed to authenticate QUIC agent stream")?;
     read_quic_auth_ok(&mut recv)
@@ -411,7 +308,7 @@ pub async fn connect_quic_bridge(
         .context("failed to start QUIC bridge connection")?
         .await
         .context("failed to establish QUIC bridge connection")?;
-    authenticate_quic_bridge_connection_on_client(&connection, bootstrap)
+    authenticate_quic_bridge_connection_on_client(&connection, &bootstrap.auth_token)
         .await
         .context("failed to authenticate native QUIC bridge connection")?;
     Ok(QuicBridgeClient {
@@ -781,17 +678,6 @@ async fn run_bridge_udp_stream(
     Ok(())
 }
 
-async fn open_quic_bi_stream_with_timeout(
-    connection: &Connection,
-    timeout: Duration,
-    label: &str,
-) -> Result<(quinn::SendStream, quinn::RecvStream)> {
-    tokio::time::timeout(timeout, connection.open_bi())
-        .await
-        .with_context(|| format!("timed out opening {label} after {}ms", timeout.as_millis()))?
-        .with_context(|| format!("failed to open {label}"))
-}
-
 async fn write_quic_open_bytes_with_timeout(
     send: &mut quinn::SendStream,
     bytes: &[u8],
@@ -822,186 +708,6 @@ async fn read_quic_open_exact_with_timeout(
             )
         })?
         .with_context(|| format!("failed to read {label}"))
-}
-
-fn generate_quic_auth_token() -> Result<Vec<u8>> {
-    let mut token = vec![0_u8; QUIC_AUTH_TOKEN_BYTES];
-    rand::SystemRandom::new()
-        .fill(&mut token)
-        .map_err(|_| anyhow!("failed to generate QUIC helper auth token"))?;
-    Ok(token)
-}
-
-async fn write_quic_auth_token(
-    send: &mut quinn::SendStream,
-    bootstrap: &QuicAgentBootstrap,
-) -> Result<()> {
-    if bootstrap.auth_token.len() != QUIC_AUTH_TOKEN_BYTES {
-        bail!(
-            "invalid QUIC helper auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
-            bootstrap.auth_token.len()
-        );
-    }
-    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.write_all(&bootstrap.auth_token))
-        .await
-        .context("timed out writing QUIC helper auth token")?
-        .context("failed to write QUIC helper auth token")
-}
-
-async fn verify_quic_auth_token(recv: &mut quinn::RecvStream, expected: &[u8]) -> Result<()> {
-    if expected.len() != QUIC_AUTH_TOKEN_BYTES {
-        bail!(
-            "invalid expected QUIC helper auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
-            expected.len()
-        );
-    }
-    let mut actual = [0_u8; QUIC_AUTH_TOKEN_BYTES];
-    tokio::time::timeout(QUIC_AUTH_TIMEOUT, recv.read_exact(&mut actual))
-        .await
-        .context("timed out waiting for QUIC helper auth token")?
-        .context("failed to read QUIC helper auth token")?;
-    if !quic_auth_tokens_match(&actual, expected) {
-        return Err(QuicAuthError.into());
-    }
-    Ok(())
-}
-
-fn quic_auth_tokens_match(actual: &[u8; QUIC_AUTH_TOKEN_BYTES], expected: &[u8]) -> bool {
-    if expected.len() != QUIC_AUTH_TOKEN_BYTES {
-        return false;
-    }
-    let mut diff = 0_u8;
-    for (left, right) in actual.iter().zip(expected.iter()) {
-        diff |= left ^ right;
-    }
-    diff == 0
-}
-
-async fn write_quic_auth_ok(send: &mut quinn::SendStream) -> Result<()> {
-    send.write_all(&[QUIC_AUTH_STATUS_OK])
-        .await
-        .context("failed to write QUIC helper auth acknowledgement")
-}
-
-async fn read_quic_auth_ok(recv: &mut quinn::RecvStream) -> Result<()> {
-    let mut status = [0_u8; 1];
-    tokio::time::timeout(QUIC_AUTH_TIMEOUT, recv.read_exact(&mut status))
-        .await
-        .context("timed out waiting for QUIC helper auth acknowledgement")?
-        .context("failed to read QUIC helper auth acknowledgement")?;
-    if status[0] != QUIC_AUTH_STATUS_OK {
-        bail!(
-            "QUIC helper returned invalid auth acknowledgement {}",
-            status[0]
-        );
-    }
-    Ok(())
-}
-
-async fn authenticate_quic_bridge_connection_on_client(
-    connection: &Connection,
-    bootstrap: &QuicAgentBootstrap,
-) -> Result<()> {
-    let (mut send, mut recv) = open_quic_bi_stream_with_timeout(
-        connection,
-        QUIC_AUTH_TIMEOUT,
-        "native QUIC bridge auth stream",
-    )
-    .await?;
-    write_quic_auth_token(&mut send, bootstrap).await?;
-    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown())
-        .await
-        .context("timed out finishing native QUIC bridge auth stream")?
-        .context("failed to finish native QUIC bridge auth stream")?;
-    read_quic_auth_ok(&mut recv).await
-}
-
-async fn authenticate_quic_bridge_connection_on_server(
-    connection: &Connection,
-    expected_token: &[u8],
-) -> Result<()> {
-    let (mut send, mut recv) = tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi())
-        .await
-        .context("timed out waiting for native QUIC bridge auth stream")?
-        .context("failed to accept native QUIC bridge auth stream")?;
-    verify_quic_auth_token(&mut recv, expected_token).await?;
-    write_quic_auth_ok(&mut send).await?;
-    let _ = send.shutdown().await;
-    Ok(())
-}
-
-fn quic_server_config(
-    max_concurrent_bidi_streams: u16,
-) -> Result<(ServerConfig, CertificateDer<'static>)> {
-    let cert = generate_simple_self_signed(vec![QUIC_AGENT_SERVER_NAME.to_owned()])
-        .context("failed to generate QUIC agent certificate")?;
-    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
-    let cert_der = CertificateDer::from(cert.cert);
-    let mut server_config = ServerConfig::with_single_cert(vec![cert_der.clone()], key.into())
-        .context("failed to build QUIC agent server TLS config")?;
-    let transport = Arc::get_mut(&mut server_config.transport)
-        .context("QUIC server transport config is unexpectedly shared")?;
-    configure_quic_agent_transport(transport, max_concurrent_bidi_streams)?;
-    Ok((server_config, cert_der))
-}
-
-fn quic_client_config(bootstrap: &QuicAgentBootstrap) -> Result<ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(bootstrap.cert_der.clone()))
-        .context("failed to add pinned QUIC agent certificate")?;
-    let mut client_config = ClientConfig::with_root_certificates(Arc::new(roots))
-        .context("failed to build QUIC agent client TLS config")?;
-    let mut transport = TransportConfig::default();
-    configure_quic_agent_transport(&mut transport, 0)?;
-    client_config.transport_config(Arc::new(transport));
-    Ok(client_config)
-}
-
-fn configure_quic_agent_transport(
-    transport: &mut TransportConfig,
-    max_concurrent_bidi_streams: u16,
-) -> Result<()> {
-    let mut mtu_discovery = MtuDiscoveryConfig::default();
-    mtu_discovery.upper_bound(QUIC_AGENT_MAX_UDP_PAYLOAD_BYTES);
-    transport
-        .max_concurrent_bidi_streams(max_concurrent_bidi_streams.into())
-        .max_concurrent_uni_streams(QUIC_AGENT_MAX_CONCURRENT_UNI_STREAMS.into())
-        .stream_receive_window(QUIC_AGENT_STREAM_RECEIVE_WINDOW_BYTES.into())
-        .receive_window(QUIC_AGENT_CONNECTION_RECEIVE_WINDOW_BYTES.into())
-        .send_window(QUIC_AGENT_SEND_WINDOW_BYTES)
-        .mtu_discovery_config(Some(mtu_discovery))
-        .keep_alive_interval(Some(QUIC_AGENT_KEEPALIVE_INTERVAL))
-        .max_idle_timeout(Some(QUIC_AGENT_IDLE_TIMEOUT.try_into()?));
-    Ok(())
-}
-
-fn quic_endpoint_config() -> Result<EndpointConfig> {
-    let mut config = EndpointConfig::default();
-    config
-        .max_udp_payload_size(QUIC_AGENT_MAX_UDP_PAYLOAD_BYTES)
-        .context("failed to configure QUIC endpoint UDP payload size")?;
-    Ok(config)
-}
-
-fn quic_server_endpoint(server_config: ServerConfig, bind: SocketAddr) -> Result<Endpoint> {
-    let socket = std::net::UdpSocket::bind(bind).context("failed to bind QUIC UDP socket")?;
-    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no QUIC async runtime found"))?;
-    Endpoint::new(
-        quic_endpoint_config()?,
-        Some(server_config),
-        socket,
-        runtime,
-    )
-    .context("failed to create QUIC server endpoint")
-}
-
-fn quic_client_endpoint(remote: SocketAddr) -> Result<Endpoint> {
-    let socket = std::net::UdpSocket::bind(client_bind_addr_for(remote))
-        .context("failed to bind QUIC client UDP socket")?;
-    let runtime = quinn::default_runtime().ok_or_else(|| anyhow!("no QUIC async runtime found"))?;
-    Endpoint::new(quic_endpoint_config()?, None, socket, runtime)
-        .context("failed to create QUIC client endpoint")
 }
 
 fn encode_quic_bridge_ipv4_open(open: QuicBridgeIpv4Open) -> [u8; QUIC_BRIDGE_OPEN_HEADER_LEN] {
@@ -1146,53 +852,6 @@ async fn read_quic_bridge_error(recv: &mut quinn::RecvStream) -> Result<String> 
     Ok(String::from_utf8_lossy(&reason).into_owned())
 }
 
-fn client_bind_addr_for(remote: SocketAddr) -> SocketAddr {
-    match remote {
-        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-    }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    lower_hex(digest::digest(&digest::SHA256, bytes).as_ref())
-}
-
-fn is_sha256_hex(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if !value.len().is_multiple_of(2) {
-        bail!("hex string has an odd length");
-    }
-    let mut bytes = Vec::with_capacity(value.len() / 2);
-    for chunk in value.as_bytes().chunks_exact(2) {
-        let high = decode_hex_nibble(chunk[0])?;
-        let low = decode_hex_nibble(chunk[1])?;
-        bytes.push((high << 4) | low);
-    }
-    Ok(bytes)
-}
-
-fn decode_hex_nibble(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => bail!("non-hex byte 0x{byte:02x}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1200,125 +859,10 @@ mod tests {
     use super::*;
     use crate::agent_proto::AgentOpenIpv4;
 
-    fn test_auth_token() -> Vec<u8> {
-        (0..QUIC_AUTH_TOKEN_BYTES)
-            .map(|index| index as u8)
-            .collect()
-    }
-
-    fn test_bootstrap(port: u16) -> QuicAgentBootstrap {
-        let cert_der = vec![0, 1, 2, 0xfe, 0xff];
-        QuicAgentBootstrap {
-            port,
-            cert_sha256: sha256_hex(&cert_der),
-            cert_der,
-            auth_token: test_auth_token(),
-        }
-    }
-
     fn tampered_bootstrap_token(bootstrap: &QuicAgentBootstrap) -> QuicAgentBootstrap {
         let mut tampered = bootstrap.clone();
         tampered.auth_token[0] ^= 0xff;
         tampered
-    }
-
-    #[test]
-    fn bootstrap_line_round_trips_and_verifies_hash() {
-        let bootstrap = test_bootstrap(4433);
-
-        assert_eq!(
-            QuicAgentBootstrap::decode_line(&bootstrap.encode_line()).unwrap(),
-            bootstrap
-        );
-    }
-
-    #[test]
-    fn bridge_bootstrap_line_round_trips_with_bridge_magic() {
-        let bootstrap = test_bootstrap(4434);
-        let line = bootstrap.encode_bridge_line();
-
-        assert!(line.starts_with(QUIC_BRIDGE_BOOTSTRAP_MAGIC));
-        assert_eq!(
-            QuicAgentBootstrap::decode_bridge_line(&line).unwrap(),
-            bootstrap
-        );
-    }
-
-    #[test]
-    fn bridge_bootstrap_line_rejects_agent_magic() {
-        let bootstrap = test_bootstrap(4434);
-
-        assert!(QuicAgentBootstrap::decode_bridge_line(&bootstrap.encode_line()).is_err());
-        assert!(QuicAgentBootstrap::decode_line(&bootstrap.encode_bridge_line()).is_err());
-    }
-
-    #[test]
-    fn bootstrap_line_rejects_tampered_cert() {
-        let bootstrap = test_bootstrap(4433);
-        let mut line = bootstrap.encode_line();
-        line.push_str("00");
-
-        assert!(QuicAgentBootstrap::decode_line(&line).is_err());
-    }
-
-    #[test]
-    fn bootstrap_line_requires_valid_auth_token() {
-        let bootstrap = test_bootstrap(4433);
-        let cert_hex = lower_hex(&bootstrap.cert_der);
-        let missing = format!(
-            "{} {} {} {}",
-            QUIC_AGENT_BOOTSTRAP_MAGIC, bootstrap.port, bootstrap.cert_sha256, cert_hex
-        );
-        let short = format!("{missing} aa");
-        let non_hex = format!("{missing} {}", "x".repeat(QUIC_AUTH_TOKEN_BYTES * 2));
-        let mut trailing = bootstrap.encode_line();
-        trailing.push_str(" extra");
-
-        assert!(QuicAgentBootstrap::decode_line(&missing).is_err());
-        assert!(QuicAgentBootstrap::decode_line(&short).is_err());
-        assert!(QuicAgentBootstrap::decode_line(&non_hex).is_err());
-        assert!(QuicAgentBootstrap::decode_line(&trailing).is_err());
-    }
-
-    #[test]
-    fn quic_agent_server_transport_is_tuned_for_single_agent_stream() {
-        let mut transport = TransportConfig::default();
-        configure_quic_agent_transport(&mut transport, QUIC_AGENT_MAX_CONCURRENT_BIDI_STREAMS)
-            .expect("configure server QUIC transport");
-        let debug = format!("{transport:?}");
-
-        assert!(debug.contains("max_concurrent_bidi_streams: 1"));
-        assert!(debug.contains("max_concurrent_uni_streams: 0"));
-        assert!(debug.contains("stream_receive_window: 16777216"));
-        assert!(debug.contains("receive_window: 67108864"));
-        assert!(debug.contains("send_window: 67108864"));
-        assert!(debug.contains("upper_bound: 9000"));
-        assert!(debug.contains("max_idle_timeout: Some(30000)"));
-        assert!(debug.contains("keep_alive_interval: Some(5s)"));
-    }
-
-    #[test]
-    fn quic_agent_client_rejects_remote_initiated_streams_but_uses_same_windows() {
-        let mut transport = TransportConfig::default();
-        configure_quic_agent_transport(&mut transport, 0).expect("configure client QUIC transport");
-        let debug = format!("{transport:?}");
-
-        assert!(debug.contains("max_concurrent_bidi_streams: 0"));
-        assert!(debug.contains("max_concurrent_uni_streams: 0"));
-        assert!(debug.contains("stream_receive_window: 16777216"));
-        assert!(debug.contains("receive_window: 67108864"));
-        assert!(debug.contains("send_window: 67108864"));
-        assert!(debug.contains("upper_bound: 9000"));
-    }
-
-    #[test]
-    fn quic_endpoint_accepts_jumbo_payloads_for_mtu_discovery() {
-        let config = quic_endpoint_config().expect("QUIC endpoint config");
-
-        assert_eq!(
-            config.get_max_udp_payload_size(),
-            u64::from(QUIC_AGENT_MAX_UDP_PAYLOAD_BYTES)
-        );
     }
 
     #[tokio::test]
