@@ -138,6 +138,9 @@ Rustle keeps three transport choices, but only one is the normal path:
   or UDP association to its own QUIC bidirectional stream with a compact open
   header. TCP uses raw stream bytes, hostname TCP opens carry a bounded hostname
   payload, and UDP preserves datagram boundaries with a compact length prefix.
+  Native stream creation, open-header writes, and open-status reads have explicit
+  deadlines so a wedged QUIC path fails in the open phase instead of hanging a
+  DNS/UDP/TCP flow indefinitely.
   IPv4 DNS remotes, hostname DNS remotes, and generic IPv4 UDP can now use this
   native QUIC data plane. Same-host bridge and DNS benchmarks must compare
   `quic-native` against `agent` before making a faster-than-SSH-agent claim.

@@ -12,6 +12,11 @@ import tempfile
 
 
 EXPECTED_COLUMNS = 20
+DIAGNOSTIC_FAILURE_COLUMNS = (
+    ("ssh_failed", 15),
+    ("agent_reconnect_failed", 18),
+    ("backlog_overflow", 19),
+)
 
 
 def parse_rows(path: pathlib.Path) -> list[list[str]]:
@@ -34,6 +39,29 @@ def successful_rows(rows: list[list[str]]) -> list[list[str]]:
         for parts in rows
         if int(parts[4]) > 0 and int(parts[5]) == 0
     ]
+
+
+def verify_successful_rustle_diagnostics_zero(rows: list[list[str]]) -> None:
+    failures: list[str] = []
+    for parts in successful_rows(rows):
+        tool = parts[0]
+        if tool != "rustle" and not tool.startswith("rustle-"):
+            continue
+        run = parts[1]
+        for column_name, column in DIAGNOSTIC_FAILURE_COLUMNS:
+            try:
+                value = int(parts[column])
+            except ValueError:
+                failures.append(f"{tool} run={run} {column_name} is not numeric")
+                continue
+            if value != 0:
+                failures.append(f"{tool} run={run} {column_name}={value}")
+
+    if failures:
+        raise SystemExit(
+            "successful Rustle benchmark rows reported diagnostic failures:\n"
+            + "\n".join(failures)
+        )
 
 
 def require_agent_and_sshuttle(
@@ -232,6 +260,7 @@ def verify(
     min_throughput_mib_s: float | None = None,
 ) -> None:
     rows = parse_rows(path)
+    verify_successful_rustle_diagnostics_zero(rows)
     if min_agent_sshuttle_throughput_ratio is not None:
         verify_min_agent_sshuttle_throughput_ratio(
             rows, min_agent_sshuttle_throughput_ratio
@@ -337,6 +366,24 @@ def self_test() -> None:
     assert_rejects(
         header + "rustle-agent\t1\t4\t2\t4\t1\t100\t8.0\t20.0\t4096\t40.00\n",
         "invalid live benchmark row",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
+        "40.00\t1.0\t2.0\t4\t1\t0\t0\t0\t0\n",
+        "ssh_failed=1",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
+        "40.00\t1.0\t2.0\t4\t0\t1\t0\t1\t0\n",
+        "agent_reconnect_failed=1",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t1\n",
+        "backlog_overflow=1",
     )
     assert_rejects(
         good,

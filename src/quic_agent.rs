@@ -40,6 +40,7 @@ const QUIC_BRIDGE_PROTO_UDP: u8 = 17;
 const QUIC_BRIDGE_PROTO_TCP_HOST: u8 = 12;
 const QUIC_AUTH_TOKEN_BYTES: usize = 32;
 const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const QUIC_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(8);
 const QUIC_AUTH_FAILED_CODE: u32 = 0x5255_4155;
 const QUIC_AUTH_STATUS_OK: u8 = 0;
 
@@ -380,10 +381,9 @@ pub async fn connect_quic_agent_stream(
         .context("failed to start QUIC agent connection")?
         .await
         .context("failed to establish QUIC agent connection")?;
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("failed to open QUIC agent stream")?;
+    let (mut send, mut recv) =
+        open_quic_bi_stream_with_timeout(&connection, QUIC_AUTH_TIMEOUT, "QUIC agent auth stream")
+            .await?;
     write_quic_auth_token(&mut send, bootstrap)
         .await
         .context("failed to authenticate QUIC agent stream")?;
@@ -485,19 +485,21 @@ impl QuicBridgeClient {
         header: [u8; QUIC_BRIDGE_OPEN_HEADER_LEN],
         payload: &[u8],
     ) -> Result<QuicBridgeStream> {
-        let (mut send, recv) = self
-            .inner
-            .connection
-            .open_bi()
-            .await
-            .context("failed to open native QUIC bridge stream")?;
-        send.write_all(&header)
-            .await
-            .context("failed to write native QUIC bridge open header")?;
+        let (mut send, recv) = open_quic_bi_stream_with_timeout(
+            &self.inner.connection,
+            QUIC_STREAM_OPEN_TIMEOUT,
+            "native QUIC bridge stream",
+        )
+        .await?;
+        write_quic_open_bytes_with_timeout(&mut send, &header, "native QUIC bridge open header")
+            .await?;
         if !payload.is_empty() {
-            send.write_all(payload)
-                .await
-                .context("failed to write native QUIC bridge open payload")?;
+            write_quic_open_bytes_with_timeout(
+                &mut send,
+                payload,
+                "native QUIC bridge open payload",
+            )
+            .await?;
         }
         Ok(QuicBridgeStream {
             recv,
@@ -519,17 +521,24 @@ impl QuicBridgeStream {
         }
 
         let mut status = [0_u8; 1];
-        self.recv
-            .read_exact(&mut status)
-            .await
-            .context("failed to read native QUIC bridge open status")?;
+        read_quic_open_exact_with_timeout(
+            &mut self.recv,
+            &mut status,
+            "native QUIC bridge open status",
+        )
+        .await?;
         match status[0] {
             QUIC_BRIDGE_STATUS_OK => {
                 self.open_status = QuicBridgeOpenStatus::Opened;
                 Ok(())
             }
             QUIC_BRIDGE_STATUS_ERR => {
-                let reason = read_quic_bridge_error(&mut self.recv).await?;
+                let reason = tokio::time::timeout(
+                    QUIC_STREAM_OPEN_TIMEOUT,
+                    read_quic_bridge_error(&mut self.recv),
+                )
+                .await
+                .context("timed out reading native QUIC bridge open error")??;
                 bail!("native QUIC bridge failed to open stream: {reason}");
             }
             other => bail!("native QUIC bridge returned invalid open status {other}"),
@@ -772,6 +781,49 @@ async fn run_bridge_udp_stream(
     Ok(())
 }
 
+async fn open_quic_bi_stream_with_timeout(
+    connection: &Connection,
+    timeout: Duration,
+    label: &str,
+) -> Result<(quinn::SendStream, quinn::RecvStream)> {
+    tokio::time::timeout(timeout, connection.open_bi())
+        .await
+        .with_context(|| format!("timed out opening {label} after {}ms", timeout.as_millis()))?
+        .with_context(|| format!("failed to open {label}"))
+}
+
+async fn write_quic_open_bytes_with_timeout(
+    send: &mut quinn::SendStream,
+    bytes: &[u8],
+    label: &str,
+) -> Result<()> {
+    tokio::time::timeout(QUIC_STREAM_OPEN_TIMEOUT, send.write_all(bytes))
+        .await
+        .with_context(|| {
+            format!(
+                "timed out writing {label} after {}ms",
+                QUIC_STREAM_OPEN_TIMEOUT.as_millis()
+            )
+        })?
+        .with_context(|| format!("failed to write {label}"))
+}
+
+async fn read_quic_open_exact_with_timeout(
+    recv: &mut quinn::RecvStream,
+    buf: &mut [u8],
+    label: &str,
+) -> Result<()> {
+    tokio::time::timeout(QUIC_STREAM_OPEN_TIMEOUT, recv.read_exact(buf))
+        .await
+        .with_context(|| {
+            format!(
+                "timed out reading {label} after {}ms",
+                QUIC_STREAM_OPEN_TIMEOUT.as_millis()
+            )
+        })?
+        .with_context(|| format!("failed to read {label}"))
+}
+
 fn generate_quic_auth_token() -> Result<Vec<u8>> {
     let mut token = vec![0_u8; QUIC_AUTH_TOKEN_BYTES];
     rand::SystemRandom::new()
@@ -790,8 +842,9 @@ async fn write_quic_auth_token(
             bootstrap.auth_token.len()
         );
     }
-    send.write_all(&bootstrap.auth_token)
+    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.write_all(&bootstrap.auth_token))
         .await
+        .context("timed out writing QUIC helper auth token")?
         .context("failed to write QUIC helper auth token")
 }
 
@@ -849,13 +902,16 @@ async fn authenticate_quic_bridge_connection_on_client(
     connection: &Connection,
     bootstrap: &QuicAgentBootstrap,
 ) -> Result<()> {
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .context("failed to open native QUIC bridge auth stream")?;
+    let (mut send, mut recv) = open_quic_bi_stream_with_timeout(
+        connection,
+        QUIC_AUTH_TIMEOUT,
+        "native QUIC bridge auth stream",
+    )
+    .await?;
     write_quic_auth_token(&mut send, bootstrap).await?;
-    send.shutdown()
+    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown())
         .await
+        .context("timed out finishing native QUIC bridge auth stream")?
         .context("failed to finish native QUIC bridge auth stream")?;
     read_quic_auth_ok(&mut recv).await
 }

@@ -1037,7 +1037,5 @@ if [[ -n "$LIVE_MAX_P50_MS" || -n "$LIVE_MIN_THROUGHPUT_MIB_S" ]]; then
     live_gate_args+=(--min-throughput-mib-s "$LIVE_MIN_THROUGHPUT_MIB_S")
   fi
 fi
-if [[ "${#live_gate_args[@]}" -gt 0 ]]; then
-  "$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" \
-    "$RESULTS_TSV" "${live_gate_args[@]}"
-fi
+"$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" \
+  "$RESULTS_TSV" "${live_gate_args[@]}"

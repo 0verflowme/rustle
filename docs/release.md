@@ -379,8 +379,8 @@ Required before tagging a release:
   SSH-agent data path when the remote UDP path supports QUIC.
   `scripts/verify-live-benchmark-rows.py --self-test` must pass so the
   sshuttle throughput ratio, sshuttle p50 ratio, native QUIC throughput ratio,
-  native QUIC p50 ratio, and live row threshold gates are checked locally before
-  a live target is available.
+  native QUIC p50 ratio, live row threshold gates, and diagnostic failure counters
+  are checked locally before a live target is available.
 - `scripts/verify-local.sh` includes release-mode 1-flow bridge benchmarks:
   a tiny-response gate with `RUSTLE_BENCH_MAX_ELAPSED_MS=2000` and
   median measured `RUSTLE_BENCH_MAX_P50_US=25000` across the fast-path
