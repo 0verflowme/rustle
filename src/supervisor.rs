@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 use crate::data_plane::DataPlane;
 use crate::packet_engine::{
@@ -144,25 +144,16 @@ impl TunnelSupervisor {
                         continue;
                     }
 
-                    engine
-                        .ingest_tcp_packet(packet)
-                        .context("failed to feed packet into userspace TCP engine")?;
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.plan_bridge_starts(
-                        data_plane.admission_limits(),
-                        &mut tcp_bridge_starts,
-                    )?;
-                    tcp::execute_bridge_starts(
+                    tcp::execute_ingress_packet(
                         engine,
+                        &tun,
+                        packet,
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
                         &bridge_event_accounting,
-                    )?;
-                    engine.drain_local_bytes_to_bridges()?;
-                    engine.flush_remote_backlogs()?;
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.expire_and_prune()?;
+                    )
+                    .await?;
                 }
                 event = dns_rx.recv() => {
                     if let Some(event) = event {
@@ -189,11 +180,7 @@ impl TunnelSupervisor {
                         &mut event_rx,
                         &bridge_event_accounting,
                     )?;
-                    engine.poll_tcp();
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.flush_remote_backlogs()?;
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.expire_and_prune()?;
+                    tcp::execute_bridge_event_cycle(engine, &tun).await?;
                 }
                 _ = stats_tick.tick() => {
                     eprintln!(
@@ -205,23 +192,14 @@ impl TunnelSupervisor {
                     );
                 }
                 _ = tick.tick() => {
-                    engine.poll_tcp();
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.flush_remote_backlogs()?;
-                    tun::write_engine_packets(&tun, engine).await?;
-                    engine.plan_bridge_starts(
-                        data_plane.admission_limits(),
-                        &mut tcp_bridge_starts,
-                    )?;
-                    tcp::execute_bridge_starts(
+                    tcp::execute_tick_cycle(
                         engine,
+                        &tun,
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
                         &bridge_event_accounting,
-                    )?;
-                    engine.drain_local_bytes_to_bridges()?;
-                    engine.expire_and_prune()?;
+                    ).await?;
                 }
             }
         }
