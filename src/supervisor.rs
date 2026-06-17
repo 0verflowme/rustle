@@ -3,18 +3,17 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane};
-use crate::defaults::DEFAULT_TUN_IP;
+use crate::data_plane::DataPlane;
 use crate::packet_engine::{
-    parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, tun_ipv4_packet,
-    TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
-    MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
+    parse_udp_request_for_agent_tunnel, tun_ipv4_packet, TunnelEngine, UdpAssociationTransportPlan,
+    MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
 };
-use crate::transport_model::{Destination, DnsResponseEvent, UdpAssociationEvents};
+use crate::transport_model::{Destination, UdpAssociationEvents};
 use crate::tun_io::TunWriter;
 use crate::tunnel_lifecycle::ShutdownSignal;
 use crate::{ssh_bridge, tcp_core};
 
+mod dns;
 mod events;
 mod prepare;
 #[cfg(test)]
@@ -115,40 +114,16 @@ impl TunnelSupervisor {
                     let Some(packet) = tun_ipv4_packet(&buf[..len]) else {
                         continue;
                     };
-                    if let Some(request) = parse_dns_request_for_tunnel(packet) {
-                        engine.record_dns_forwarded();
-                        eprintln!(
-                            "dns: forwarding UDP query {}:{} -> {}:{} over {} to {}:{}",
-                            request.src_ip,
-                            request.src_port,
-                            request.dst_ip,
-                            request.dst_port,
-                            data_plane.label(),
-                            dns_remote.host,
-                            dns_remote.port
-                        );
-                        if engine.try_admit_dns() {
-                            spawn_dns_query_on_data_plane(
-                                Arc::clone(&data_plane),
-                                dns_remote.clone(),
-                                request,
-                                dns_tx.clone(),
-                                DEFAULT_TUN_IP,
-                            );
-                        } else {
-                            eprintln!(
-                                "dns: dropping query because {} DNS queries are already in flight",
-                                engine.dns_admission_limit()
-                            );
-                            engine.record_dns_drop();
-                            let tun_write = tun
-                                .write_dns_event(DnsResponseEvent {
-                                    request,
-                                    result: Err("DNS in-flight limit reached".to_owned()),
-                                })
-                                .await?;
-                            engine.record_tun_write(tun_write);
-                        }
+                    if dns::execute_ingress_packet(
+                        engine,
+                        &tun,
+                        &data_plane,
+                        &dns_remote,
+                        &dns_tx,
+                        packet,
+                    )
+                    .await?
+                    {
                         continue;
                     }
                     if let Some(request) = parse_udp_request_for_agent_tunnel(packet) {
@@ -191,10 +166,7 @@ impl TunnelSupervisor {
                 }
                 event = dns_rx.recv() => {
                     if let Some(event) = event {
-                        engine.complete_dns();
-                        let remote_ok = event.result.is_ok();
-                        let tun_write = tun.write_dns_event(event).await?;
-                        engine.record_dns_delivery(remote_ok, tun_write);
+                        dns::execute_response_event(engine, &tun, event).await?;
                     }
                 }
                 event = udp_response_rx.recv() => {
