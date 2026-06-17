@@ -158,13 +158,6 @@ fi
 
 if [[ "$RUN_BENCH" == "1" ]]; then
   verify_run cargo build --locked --release
-  QUIC_NATIVE_AGENT_RATIO_ENV=()
-  if [[ -n "${RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO:-}" ]]; then
-    QUIC_NATIVE_AGENT_RATIO_ENV=(
-      RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO="$RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO"
-    )
-  fi
-
   verify_run env \
     RUSTLE_BENCH_RUNS=3 \
     RUSTLE_BENCH_WARMUP_RUNS=1 \
@@ -207,15 +200,22 @@ if [[ "$RUN_BENCH" == "1" ]]; then
     RUSTLE_BENCH_MAX_ELAPSED_MS=1000 \
     "${SCRIPT_DIR}/bench-bridge-lab.sh"
 
-  verify_run env \
+  bench_quic_native_args=(
+    env
     RUSTLE_BENCH_RUNS=3 \
     RUSTLE_BENCH_WARMUP_RUNS=0 \
     RUSTLE_BENCH_BODY_BYTES=104857600 \
     RUSTLE_BENCH_CONNECTIONS=1 \
     RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent quic-native" \
-    RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5 \
-    "${QUIC_NATIVE_AGENT_RATIO_ENV[@]}" \
-    "${SCRIPT_DIR}/bench-bridge-lab.sh"
+    RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5
+  )
+  if [[ -n "${RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO:-}" ]]; then
+    bench_quic_native_args+=(
+      RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO="$RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO"
+    )
+  fi
+  bench_quic_native_args+=("${SCRIPT_DIR}/bench-bridge-lab.sh")
+  verify_run "${bench_quic_native_args[@]}"
 
   verify_run env \
     RUSTLE_BENCH_RUNS=1 \
