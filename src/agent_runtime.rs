@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 
 use crate::agent_proto::{
     encode_frame_into, encoded_frame_len, encoded_frames_len, try_decode_frame, AgentFrame,
-    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
-    CAP_FLOW_CONTROL,
+    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_CARRIER_READ_BUFFER_BYTES,
+    AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -282,7 +282,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut input = BytesMut::with_capacity(AGENT_MAX_FRAME_PAYLOAD);
-    let mut read_buf = [0_u8; 8192];
+    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
     let mut streams = HashMap::<u64, AgentStreamHandle>::new();
     let (done_tx, mut done_rx) = mpsc::channel(AGENT_STREAM_COMPLETIONS);
     let mut peer_max_frame_payload = AGENT_MAX_FRAME_PAYLOAD;

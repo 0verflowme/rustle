@@ -6,6 +6,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
 pub const AGENT_MAX_FRAME_PAYLOAD: usize = 256 * 1024;
+pub const AGENT_CARRIER_READ_BUFFER_BYTES: usize = 64 * 1024;
 pub const AGENT_FRAME_HEADER_LEN: usize = 24;
 pub const AGENT_MAGIC: [u8; 4] = *b"RLA1";
 
@@ -357,6 +358,13 @@ mod tests {
 
         assert_eq!(decoded, frame);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn carrier_read_buffer_matches_frame_payload_target() {
+        assert_eq!(AGENT_CARRIER_READ_BUFFER_BYTES, 64 * 1024);
+        assert_eq!(AGENT_MAX_FRAME_PAYLOAD / AGENT_CARRIER_READ_BUFFER_BYTES, 4);
+        assert_eq!(AGENT_MAX_FRAME_PAYLOAD % AGENT_CARRIER_READ_BUFFER_BYTES, 0);
     }
 
     #[test]

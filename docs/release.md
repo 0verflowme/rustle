@@ -346,6 +346,9 @@ Required before tagging a release:
   proving agent receive windows start at the latency-friendly 4 MiB window and
   adapt to a bounded 24 MiB cap on sustained streams on both sides of the agent
   protocol.
+- `carrier_read_buffer_matches_frame_payload_target` passes, proving both
+  framed-agent carrier readers use 64 KiB chunks against the 256 KiB protocol
+  payload cap instead of the old 8 KiB read loop.
 - `rustle_ssh_client_config_uses_data_plane_sized_channels` passes, proving the
   SSH carrier uses a 64 MiB SSH channel window and 256 KiB max packet instead of
   reintroducing russh's smaller default window below the agent data-plane credit

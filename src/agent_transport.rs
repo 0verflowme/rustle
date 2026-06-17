@@ -10,8 +10,9 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 
 use crate::agent_proto::{
     encode_frame_into, encoded_frame_len, encoded_frames_len, try_decode_frame, AgentFrame,
-    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
-    AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
+    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_CARRIER_READ_BUFFER_BYTES,
+    AGENT_MAX_FRAME_PAYLOAD, AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT,
+    CAP_TCP_CONNECT_HOST,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -812,8 +813,9 @@ async fn read_agent_frames<R>(
 ) where
     R: AsyncRead + Unpin,
 {
+    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
     loop {
-        match read_agent_frame(&mut reader, &mut inbound).await {
+        match read_agent_frame_with_buffer(&mut reader, &mut inbound, &mut read_buf).await {
             Ok(frame) => dispatch_agent_frame(&streams, heartbeat.as_ref(), frame).await,
             Err(err) => {
                 mark_agent_failed(&failure, &streams, err.to_string()).await;
@@ -827,20 +829,31 @@ async fn read_agent_frame<R>(reader: &mut R, inbound: &mut BytesMut) -> Result<A
 where
     R: AsyncRead + Unpin,
 {
+    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
+    read_agent_frame_with_buffer(reader, inbound, &mut read_buf).await
+}
+
+async fn read_agent_frame_with_buffer<R>(
+    reader: &mut R,
+    inbound: &mut BytesMut,
+    read_buf: &mut [u8],
+) -> Result<AgentFrame>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
         if let Some(frame) = try_decode_frame(inbound)? {
             return Ok(frame);
         }
 
-        let mut buf = [0_u8; 8192];
         let read = reader
-            .read(&mut buf)
+            .read(read_buf)
             .await
             .context("failed to read agent frame")?;
         if read == 0 {
             bail!("agent stream closed before next frame");
         }
-        inbound.extend_from_slice(&buf[..read]);
+        inbound.extend_from_slice(&read_buf[..read]);
     }
 }
 

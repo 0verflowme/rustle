@@ -134,6 +134,11 @@ Rustle also configures the SSH client channel around the agent data plane: a
 smaller defaults from becoming the real WAN throughput cap underneath the
 framed-agent stream credit window.
 
+Both sides of the framed-agent carrier read in 64 KiB chunks against the 256 KiB
+protocol payload cap. That keeps max-size data frames to four carrier reads on
+SSH stdio or `quic-agent` streams without making every carrier-read future hold
+a full max-payload buffer.
+
 This benchmark is useful for bridge regressions because it exercises:
 
 - smoltcp client handshake and receive path
