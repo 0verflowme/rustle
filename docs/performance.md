@@ -565,14 +565,18 @@ first local payload, first local payload sent, first remote byte, duration,
 bytes, per-flow byte distribution, per-flow throughput distribution, and
 outcomes. It also derives `remote_open_wait`, `ready_wait`,
 `payload_queue_wait`, `first_byte_wait`, `body_drain`, cumulative
-`local_send_wait`, `local_queue_wait`, framed-agent `agent_send_credit_wait` and
+`local_send_wait`, `tcp_recv_queue_wait`, `local_queue_wait`,
+`pre_bridge_queue_wait`, framed-agent `agent_send_credit_wait` and
 `agent_send_outbound_wait`, `remote_event_wait`, and a `likely_bottleneck`
-label. Use those derived terms to decide which fix comes first: remote open
-latency, packet-engine bridge admission delay, delayed first payload forwarding,
-local bridge queueing, remote first-byte delay, flow duration/windowing,
-per-flow starvation, framed-agent flow-control credit, framed-agent outbound
-queue pressure, supervisor event pressure, or failed/reset flows. The trace is
-deliberately opt-in and does not include payload bytes.
+label. `tcp_recv_queue_wait` is the age of payload inside smoltcp before the
+packet engine drains it; `local_queue_wait` is the bridge mpsc wait; and
+`pre_bridge_queue_wait` combines the two as a coarse "before the data-plane task
+can act" diagnostic. Use those derived terms to decide which fix comes first:
+remote open latency, packet-engine bridge admission/drain delay, delayed first
+payload forwarding, local bridge queueing, remote first-byte delay, flow
+duration/windowing, per-flow starvation, framed-agent flow-control credit,
+framed-agent outbound queue pressure, supervisor event pressure, or failed/reset
+flows. The trace is deliberately opt-in and does not include payload bytes.
 `scripts/bench-live-compare.sh` prints the summary to stderr during cleanup when
 traced flow lines exist; set `RUSTLE_BENCH_KEEP_LOGS=1` when you also want to
 keep the raw per-run `rustle.log` files.
@@ -581,9 +585,9 @@ The regular `stats:` line also carries live drain counters for untraced runs:
 `tun_write=calls:<n> total_us:<n> max_us:<n>` reports TUN write pressure, and
 `bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
 supervisor bridge-event batch pressure and backlog pauses.
-Use those fields with hotpath `remote_event_wait` and `body_drain` when deciding
-whether a WAN throughput failure is in the data plane, packet engine, smoltcp
-drain, or TUN device writes.
+Use those fields with hotpath `pre_bridge_queue_wait`, `remote_event_wait`, and
+`body_drain` when deciding whether a WAN throughput failure is in the data
+plane, packet engine, smoltcp drain, or TUN device writes.
 `scripts/verify-release-candidate.sh` enables `RUSTLE_HOTPATH_TRACE=1` by
 default and writes compact live benchmark artifacts under
 `target/live-evidence/release-candidate-<timestamp>` unless

@@ -27,6 +27,9 @@ HOTPATH_COLUMNS = {
     "local_queue_wait_p50_ms",
     "local_queue_wait_max_ms",
     "local_queue_wait_avg_ms",
+    "pre_bridge_queue_wait_p50_ms",
+    "pre_bridge_queue_wait_max_ms",
+    "pre_bridge_queue_wait_avg_ms",
     "remote_event_wait_max_ms",
     "remote_event_wait_avg_ms",
     "likely_bottleneck",
@@ -226,6 +229,9 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "local_queue_wait_p50_ms\tlocal_queue_wait_total_ms\t"
                     "local_queue_wait_max_ms\tlocal_queue_wait_avg_ms\t"
                     "local_queue_waits\t"
+                    "pre_bridge_queue_wait_p50_ms\tpre_bridge_queue_wait_total_ms\t"
+                    "pre_bridge_queue_wait_max_ms\tpre_bridge_queue_wait_avg_ms\t"
+                    "pre_bridge_queue_waits\t"
                     "agent_send_credit_wait_p50_ms\tagent_send_credit_wait_total_ms\t"
                     "agent_send_credit_wait_max_ms\tagent_send_credit_wait_avg_ms\t"
                     "agent_send_outbound_wait_p50_ms\t"
@@ -242,6 +248,7 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "agent\t2\t2\t0\t512\t4096\t2048\t2048\t0.100\t0.200\t0.300\t"
                     "0.400\t0.500\t0.700\t0.100\t0.050\t0.100\t0.100\t"
                     "0.100\t0.200\t"
+                    "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t-\t0\t"

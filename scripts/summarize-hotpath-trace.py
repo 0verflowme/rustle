@@ -112,6 +112,12 @@ def parse_counter(value: str, field: str) -> int:
     return parsed
 
 
+def optional_counter(row: dict[str, str], field: str) -> int | None:
+    if field not in row:
+        return None
+    return parse_counter(row[field], field)
+
+
 def nonnegative_delta(row: dict[str, str], start_field: str, end_field: str) -> int | None:
     start = parse_optional_us(row[start_field])
     end = parse_optional_us(row[end_field])
@@ -233,6 +239,28 @@ def summarize(text: str) -> list[dict[str, object]]:
             for row in rows
             if "local_queue_wait_max_us" in row
         ]
+        pre_bridge_queue_wait_values = []
+        pre_bridge_queue_wait_max_values = []
+        pre_bridge_queue_waits = 0
+        for row in rows:
+            tcp_wait = optional_counter(row, "tcp_recv_queue_wait_us")
+            local_wait = optional_counter(row, "local_queue_wait_us")
+            if tcp_wait is not None or local_wait is not None:
+                pre_bridge_queue_wait_values.append((tcp_wait or 0) + (local_wait or 0))
+
+            tcp_wait_max = optional_counter(row, "tcp_recv_queue_wait_max_us")
+            local_wait_max = optional_counter(row, "local_queue_wait_max_us")
+            if tcp_wait_max is not None or local_wait_max is not None:
+                pre_bridge_queue_wait_max_values.append(
+                    (tcp_wait_max or 0) + (local_wait_max or 0)
+                )
+
+            wait_counts = [
+                value
+                for field in ("tcp_recv_queue_waits", "local_queue_waits")
+                if (value := optional_counter(row, field)) is not None
+            ]
+            pre_bridge_queue_waits += max(wait_counts, default=0)
         agent_send_credit_wait_values = [
             parse_counter(row["agent_send_credit_wait_us"], "agent_send_credit_wait_us")
             for row in rows
@@ -272,6 +300,7 @@ def summarize(text: str) -> list[dict[str, object]]:
             "local_send_wait_us": percentile(local_send_wait_values, 50),
             "tcp_recv_queue_wait_us": percentile(tcp_recv_queue_wait_values, 50),
             "local_queue_wait_us": percentile(local_queue_wait_values, 50),
+            "pre_bridge_queue_wait_us": percentile(pre_bridge_queue_wait_values, 50),
             "agent_send_credit_wait_us": percentile(agent_send_credit_wait_values, 50),
             "agent_send_outbound_wait_us": percentile(agent_send_outbound_wait_values, 50),
             "remote_event_wait_us": percentile(remote_event_wait_values, 50),
@@ -309,6 +338,7 @@ def summarize(text: str) -> list[dict[str, object]]:
             if "local_queue_waits" in row
         )
         local_queue_wait_total = sum(local_queue_wait_values)
+        pre_bridge_queue_wait_total = sum(pre_bridge_queue_wait_values)
         agent_send_credit_wait_total = sum(agent_send_credit_wait_values)
         agent_send_outbound_wait_total = sum(agent_send_outbound_wait_values)
         agent_send_frames = sum(
@@ -381,6 +411,17 @@ def summarize(text: str) -> list[dict[str, object]]:
                     local_queue_wait_total, local_queue_waits
                 ),
                 "local_queue_waits": local_queue_waits,
+                "pre_bridge_queue_wait_p50_ms": format_ms(
+                    wait_p50["pre_bridge_queue_wait_us"]
+                ),
+                "pre_bridge_queue_wait_total_ms": format_ms(pre_bridge_queue_wait_total),
+                "pre_bridge_queue_wait_max_ms": format_ms(
+                    max(pre_bridge_queue_wait_max_values, default=None)
+                ),
+                "pre_bridge_queue_wait_avg_ms": format_average_ms(
+                    pre_bridge_queue_wait_total, pre_bridge_queue_waits
+                ),
+                "pre_bridge_queue_waits": pre_bridge_queue_waits,
                 "agent_send_credit_wait_p50_ms": format_ms(
                     wait_p50["agent_send_credit_wait_us"]
                 ),
@@ -469,6 +510,11 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "local_queue_wait_max_ms",
         "local_queue_wait_avg_ms",
         "local_queue_waits",
+        "pre_bridge_queue_wait_p50_ms",
+        "pre_bridge_queue_wait_total_ms",
+        "pre_bridge_queue_wait_max_ms",
+        "pre_bridge_queue_wait_avg_ms",
+        "pre_bridge_queue_waits",
         "agent_send_credit_wait_p50_ms",
         "agent_send_credit_wait_total_ms",
         "agent_send_credit_wait_max_ms",
@@ -553,6 +599,11 @@ def self_test() -> None:
     assert agent["local_queue_wait_max_ms"] == "4.000"
     assert agent["local_queue_wait_avg_ms"] == "1.600"
     assert agent["local_queue_waits"] == 5
+    assert agent["pre_bridge_queue_wait_p50_ms"] == "7.000"
+    assert agent["pre_bridge_queue_wait_total_ms"] == "24.000"
+    assert agent["pre_bridge_queue_wait_max_ms"] == "14.000"
+    assert agent["pre_bridge_queue_wait_avg_ms"] == "4.800"
+    assert agent["pre_bridge_queue_waits"] == 5
     assert agent["agent_send_credit_wait_p50_ms"] == "2.000"
     assert agent["agent_send_credit_wait_total_ms"] == "8.000"
     assert agent["agent_send_credit_wait_max_ms"] == "4.000"
