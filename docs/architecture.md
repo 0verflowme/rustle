@@ -167,6 +167,10 @@ close, reset, and zero-stream heartbeat ping/pong. Payload sizes are validated
 before payload allocation, reserved bits must be zero, and the decoder is
 incremental so it can run directly on SSH channel byte streams.
 
+The SSH client channel is sized for this framed data plane: Rustle advertises a
+64 MiB SSH channel window and 256 KiB max packet so the carrier channel does not
+reimpose russh's smaller default window below the agent stream-credit policy.
+
 Agent mode preserves the same outer invariants as `direct-tcpip`: one local flow
 maps to one stream id, remote payload is admitted only into bounded local
 buffers, and backpressure is represented by explicit byte credit instead of

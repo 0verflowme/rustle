@@ -14,6 +14,8 @@ use super::auth::authenticate;
 use super::config::{prepare_ssh_connection, PreparedSshConnection};
 
 pub(crate) const MAX_SSH_SESSIONS: usize = 16;
+pub(crate) const RUSTLE_SSH_CHANNEL_WINDOW_BYTES: u32 = 64 * 1024 * 1024;
+pub(crate) const RUSTLE_SSH_MAX_PACKET_BYTES: u32 = 256 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct SshSessionPool {
@@ -272,14 +274,13 @@ pub(crate) async fn connect_prepared_ssh(
         prepared.insecure_accept_host_key,
         prepared.accept_new_host_key,
     );
-    let config = Arc::new(Config {
-        inactivity_timeout: Some(Duration::from_secs(30)),
-        keepalive_interval: Some(Duration::from_secs(10)),
-        keepalive_max: 3,
-        nodelay: true,
-        ..Config::default()
-    });
+    let config = Arc::new(rustle_ssh_client_config());
 
+    eprintln!(
+        "ssh: channel window={}MiB max_packet={}KiB",
+        RUSTLE_SSH_CHANNEL_WINDOW_BYTES / (1024 * 1024),
+        RUSTLE_SSH_MAX_PACKET_BYTES / 1024
+    );
     eprintln!(
         "ssh: connecting to {} with timeout {}s",
         target.addr,
@@ -305,6 +306,18 @@ pub(crate) async fn connect_prepared_ssh(
     authenticate(&mut handle, &target.user, prepared).await?;
     eprintln!("ssh: authenticated to {}", target.addr);
     Ok(handle)
+}
+
+fn rustle_ssh_client_config() -> Config {
+    Config {
+        inactivity_timeout: Some(Duration::from_secs(30)),
+        keepalive_interval: Some(Duration::from_secs(10)),
+        keepalive_max: 3,
+        window_size: RUSTLE_SSH_CHANNEL_WINDOW_BYTES,
+        maximum_packet_size: RUSTLE_SSH_MAX_PACKET_BYTES,
+        nodelay: true,
+        ..Config::default()
+    }
 }
 
 #[derive(Clone)]
@@ -355,6 +368,22 @@ mod tests {
             ssh_config: None,
             ssh_connect_timeout_secs: DEFAULT_SSH_CONNECT_TIMEOUT_SECS,
         }
+    }
+
+    #[test]
+    fn rustle_ssh_client_config_uses_data_plane_sized_channels() {
+        let config = rustle_ssh_client_config();
+
+        assert_eq!(config.window_size, RUSTLE_SSH_CHANNEL_WINDOW_BYTES);
+        assert_eq!(config.maximum_packet_size, RUSTLE_SSH_MAX_PACKET_BYTES);
+        assert_eq!(config.window_size, 64 * 1024 * 1024);
+        assert_eq!(
+            config.maximum_packet_size,
+            crate::agent_proto::AGENT_MAX_FRAME_PAYLOAD as u32
+        );
+        assert!(config.nodelay);
+        assert_eq!(config.keepalive_interval, Some(Duration::from_secs(10)));
+        assert_eq!(config.keepalive_max, 3);
     }
 
     #[tokio::test]

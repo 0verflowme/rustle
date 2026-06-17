@@ -129,6 +129,11 @@ the first response roughly 20 MiB/s of headroom. The cap stays below the
 per-flow remote backlog limit so supervisor backpressure still has room to
 absorb local TCP send-window bursts.
 
+Rustle also configures the SSH client channel around the agent data plane: a
+64 MiB SSH channel window and a 256 KiB max packet. Those values keep russh's
+smaller defaults from becoming the real WAN throughput cap underneath the
+framed-agent stream credit window.
+
 This benchmark is useful for bridge regressions because it exercises:
 
 - smoltcp client handshake and receive path

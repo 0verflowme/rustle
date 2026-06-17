@@ -346,6 +346,10 @@ Required before tagging a release:
   proving agent receive windows start at the latency-friendly 4 MiB window and
   adapt to a bounded 24 MiB cap on sustained streams on both sides of the agent
   protocol.
+- `rustle_ssh_client_config_uses_data_plane_sized_channels` passes, proving the
+  SSH carrier uses a 64 MiB SSH channel window and 256 KiB max packet instead of
+  reintroducing russh's smaller default window below the agent data-plane credit
+  policy.
 - `remote_backlog_per_flow_has_agent_window_frame_headroom` passes, proving the
   per-flow remote backlog is sized from the local TCP send window with multiple
   windows of burst headroom, while the global backlog cap still bounds aggregate
