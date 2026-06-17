@@ -7,11 +7,12 @@ use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use super::{DataPlane, DataPlaneDnsFuture};
-use crate::agent_bridge::{QuicNativeBridge, ReconnectingAgentBridge};
 #[cfg(test)]
 use crate::agent_transport;
 use crate::ssh_control::SshSessionPool;
-use crate::transport_model::{Destination, DnsResponseEvent};
+use crate::transport_model::{
+    DataPlaneIpv4Open, DataPlaneTcpOpen, DataPlaneTcpOpenMode, Destination, DnsResponseEvent,
+};
 use crate::{agent_proto, dns, ssh_bridge};
 
 use super::stream::AgentIoStream;
@@ -60,25 +61,17 @@ pub(super) fn query_dns_over_ssh_future(
     Box::pin(async move { query_dns_over_ssh(ssh, &remote, query.as_ref()).await })
 }
 
-pub(super) fn query_dns_over_agent_future(
-    agent: ReconnectingAgentBridge,
+pub(super) fn query_dns_over_stream_data_plane_future<D>(
+    data_plane: D,
     remote: Destination,
     query: Bytes,
     originator_ip: Ipv4Addr,
-) -> DataPlaneDnsFuture<'static> {
+) -> DataPlaneDnsFuture<'static>
+where
+    D: DataPlane + 'static,
+{
     Box::pin(async move {
-        query_dns_over_reconnecting_agent(agent, &remote, query.as_ref(), originator_ip).await
-    })
-}
-
-pub(super) fn query_dns_over_quic_native_future(
-    bridge: QuicNativeBridge,
-    remote: Destination,
-    query: Bytes,
-    originator_ip: Ipv4Addr,
-) -> DataPlaneDnsFuture<'static> {
-    Box::pin(async move {
-        query_dns_over_quic_native(bridge, &remote, query.as_ref(), originator_ip).await
+        query_dns_over_stream_data_plane(&data_plane, &remote, query.as_ref(), originator_ip).await
     })
 }
 
@@ -150,15 +143,18 @@ async fn query_dns_over_ssh(
     Ok(response)
 }
 
-async fn query_dns_over_reconnecting_agent(
-    agent: ReconnectingAgentBridge,
+async fn query_dns_over_stream_data_plane<D>(
+    data_plane: &D,
     remote: &Destination,
     query: &[u8],
     originator_ip: Ipv4Addr,
-) -> Result<Bytes> {
+) -> Result<Bytes>
+where
+    D: DataPlane,
+{
     if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
-        let stream = agent
-            .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
+        let stream = data_plane
+            .open_udp_ipv4(DataPlaneIpv4Open {
                 destination_ip: remote_ip,
                 destination_port: remote.port,
                 originator_ip,
@@ -167,60 +163,39 @@ async fn query_dns_over_reconnecting_agent(
             .await
             .with_context(|| {
                 format!(
-                    "failed to open agent UDP DNS association to {}:{}",
-                    remote.host, remote.port
+                    "failed to open {} UDP DNS association to {}:{}",
+                    data_plane.label(),
+                    remote.host,
+                    remote.port
                 )
             })?;
-        query_dns_over_agent_udp_stream(AgentIoStream::Bridge(stream), query).await
+        query_dns_over_agent_udp_stream(stream, query).await
     } else {
-        let stream = open_dns_agent_stream(agent, remote, originator_ip).await?;
+        let stream = data_plane
+            .open_tcp(
+                DataPlaneTcpOpen::Host {
+                    destination_host: remote.host.clone(),
+                    destination_port: remote.port,
+                    originator_ip,
+                    originator_port: 0,
+                },
+                DataPlaneTcpOpenMode::Strict,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to open {} hostname DNS stream to {}:{}",
+                    data_plane.label(),
+                    remote.host,
+                    remote.port
+                )
+            })?;
         query_dns_over_agent_tcp_stream(stream, query).await
     }
 }
 
-async fn query_dns_over_quic_native(
-    bridge: QuicNativeBridge,
-    remote: &Destination,
-    query: &[u8],
-    originator_ip: Ipv4Addr,
-) -> Result<Bytes> {
-    if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
-        let stream = bridge
-            .open_udp_ipv4(agent_proto::AgentOpenIpv4 {
-                destination_ip: remote_ip,
-                destination_port: remote.port,
-                originator_ip,
-                originator_port: 0,
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to open native QUIC UDP DNS association to {}:{}",
-                    remote.host, remote.port
-                )
-            })?;
-        query_dns_over_agent_udp_stream(AgentIoStream::QuicNativeUdp(stream), query).await
-    } else {
-        let stream = bridge
-            .open_tcp_host(agent_proto::AgentOpenHost {
-                destination_host: remote.host.clone(),
-                destination_port: remote.port,
-                originator_ip,
-                originator_port: 0,
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to open native QUIC hostname DNS stream to {}:{}",
-                    remote.host, remote.port
-                )
-            })?;
-        query_dns_over_agent_tcp_stream(AgentIoStream::quic_native_tcp(stream), query).await
-    }
-}
-
 #[cfg(test)]
-pub(crate) async fn query_dns_over_agent(
+async fn query_dns_over_agent_transport(
     agent: agent_transport::AgentTransport,
     remote: &Destination,
     query: &[u8],
@@ -231,7 +206,7 @@ pub(crate) async fn query_dns_over_agent(
 }
 
 #[cfg(test)]
-pub(crate) async fn query_dns_over_agent_udp(
+async fn query_dns_over_agent_transport_udp(
     agent: agent_transport::AgentTransport,
     remote: &Destination,
     query: &[u8],
@@ -258,44 +233,24 @@ pub(crate) async fn query_dns_over_agent_udp(
     query_dns_over_agent_udp_stream(AgentIoStream::Raw(stream), query).await
 }
 
-async fn open_dns_agent_stream(
-    agent: ReconnectingAgentBridge,
+#[cfg(test)]
+pub(crate) async fn query_dns_over_agent(
+    agent: agent_transport::AgentTransport,
     remote: &Destination,
+    query: &[u8],
     originator_ip: Ipv4Addr,
-) -> Result<AgentIoStream> {
-    if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
-        agent
-            .open_tcp_ipv4(agent_proto::AgentOpenIpv4 {
-                destination_ip: remote_ip,
-                destination_port: remote.port,
-                originator_ip,
-                originator_port: 0,
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to open agent stream to DNS resolver {}:{}",
-                    remote.host, remote.port
-                )
-            })
-            .map(AgentIoStream::Bridge)
-    } else {
-        agent
-            .open_tcp_host(agent_proto::AgentOpenHost {
-                destination_host: remote.host.clone(),
-                destination_port: remote.port,
-                originator_ip,
-                originator_port: 0,
-            })
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to open agent hostname stream to DNS resolver {}:{}",
-                    remote.host, remote.port
-                )
-            })
-            .map(AgentIoStream::Bridge)
-    }
+) -> Result<Bytes> {
+    query_dns_over_agent_transport(agent, remote, query, originator_ip).await
+}
+
+#[cfg(test)]
+pub(crate) async fn query_dns_over_agent_udp(
+    agent: agent_transport::AgentTransport,
+    remote: &Destination,
+    query: &[u8],
+    originator_ip: Ipv4Addr,
+) -> Result<Bytes> {
+    query_dns_over_agent_transport_udp(agent, remote, query, originator_ip).await
 }
 
 #[cfg(test)]
@@ -597,9 +552,10 @@ mod tests {
             port: destination.port(),
         };
         let (bridge, bridge_task) = test_quic_native_bridge().await;
+        let data_plane = super::super::QuicNativeDataPlane::new(bridge.clone());
 
-        let response = query_dns_over_quic_native(
-            bridge.clone(),
+        let response = query_dns_over_stream_data_plane(
+            &data_plane,
             &remote,
             b"\x12\x34native-query",
             DEFAULT_TUN_IP,
@@ -715,9 +671,10 @@ mod tests {
             port: destination.port(),
         };
         let (bridge, bridge_task) = test_quic_native_bridge().await;
+        let data_plane = super::super::QuicNativeDataPlane::new(bridge.clone());
 
-        let response = query_dns_over_quic_native(
-            bridge.clone(),
+        let response = query_dns_over_stream_data_plane(
+            &data_plane,
             &remote,
             b"\xab\xcdnative-name-query",
             DEFAULT_TUN_IP,

@@ -101,6 +101,36 @@ impl DataPlaneIpv4Open {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DataPlaneTcpOpen {
+    Ipv4(DataPlaneIpv4Open),
+    Host {
+        destination_host: String,
+        destination_port: u16,
+        originator_ip: Ipv4Addr,
+        originator_port: u16,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataPlaneTcpOpenMode {
+    Strict,
+    Optimistic,
+}
+
+impl DataPlaneTcpOpen {
+    pub(crate) fn destination_label(&self) -> String {
+        match self {
+            Self::Ipv4(open) => format!("{}:{}", open.destination_ip, open.destination_port),
+            Self::Host {
+                destination_host,
+                destination_port,
+                ..
+            } => format!("{destination_host}:{destination_port}"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DataPlaneReconnectSnapshot {
     pub(crate) attempts: u64,

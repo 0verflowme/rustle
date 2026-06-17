@@ -15,7 +15,8 @@ use crate::quic_agent;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneReconnectSnapshot,
-    DataPlaneRuntimeSnapshot, Destination, UdpAssociationEvents, UdpFlowKey,
+    DataPlaneRuntimeSnapshot, DataPlaneTcpOpen, DataPlaneTcpOpenMode, Destination,
+    UdpAssociationEvents, UdpFlowKey,
 };
 use crate::{ssh_bridge, tcp_core};
 
@@ -56,7 +57,11 @@ pub(crate) trait DataPlane: Send + Sync {
         query: Bytes,
         originator_ip: Ipv4Addr,
     ) -> DataPlaneDnsFuture<'_>;
-    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static>;
+    fn open_tcp(
+        &self,
+        open: DataPlaneTcpOpen,
+        mode: DataPlaneTcpOpenMode,
+    ) -> OpenTcpFuture<'static>;
     fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static>;
 }
 
@@ -185,12 +190,15 @@ impl DataPlane for DirectTcpipDataPlane {
         dns::query_dns_over_ssh_future(self.ssh.clone(), remote, query)
     }
 
-    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+    fn open_tcp(
+        &self,
+        open: DataPlaneTcpOpen,
+        _mode: DataPlaneTcpOpenMode,
+    ) -> OpenTcpFuture<'static> {
         Box::pin(async move {
             bail!(
-                "data plane does not support agent-style optimistic TCP stream opens to {}:{}",
-                open.destination_ip,
-                open.destination_port
+                "data plane does not support stream-style TCP opens to {}",
+                open.destination_label()
             )
         })
     }
@@ -253,7 +261,10 @@ impl DataPlane for FramedAgentDataPlane {
             ready_wait_ms,
             "agent",
             Some(self.agent.clone()),
-            self.open_tcp_ipv4_optimistic(open),
+            self.open_tcp(
+                DataPlaneTcpOpen::Ipv4(open),
+                DataPlaneTcpOpenMode::Optimistic,
+            ),
         )
     }
 
@@ -263,16 +274,42 @@ impl DataPlane for FramedAgentDataPlane {
         query: Bytes,
         originator_ip: Ipv4Addr,
     ) -> DataPlaneDnsFuture<'_> {
-        dns::query_dns_over_agent_future(self.agent.clone(), remote, query, originator_ip)
+        dns::query_dns_over_stream_data_plane_future(self.clone(), remote, query, originator_ip)
     }
 
-    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+    fn open_tcp(
+        &self,
+        open: DataPlaneTcpOpen,
+        mode: DataPlaneTcpOpenMode,
+    ) -> OpenTcpFuture<'static> {
         let agent = self.agent.clone();
         Box::pin(async move {
-            agent
-                .open_tcp_ipv4_optimistic(open.into_agent_open())
-                .await
-                .map(AgentIoStream::Bridge)
+            match open {
+                DataPlaneTcpOpen::Ipv4(open) => match mode {
+                    DataPlaneTcpOpenMode::Strict => {
+                        agent.open_tcp_ipv4(open.into_agent_open()).await
+                    }
+                    DataPlaneTcpOpenMode::Optimistic => {
+                        agent.open_tcp_ipv4_optimistic(open.into_agent_open()).await
+                    }
+                },
+                DataPlaneTcpOpen::Host {
+                    destination_host,
+                    destination_port,
+                    originator_ip,
+                    originator_port,
+                } => {
+                    agent
+                        .open_tcp_host(crate::agent_proto::AgentOpenHost {
+                            destination_host,
+                            destination_port,
+                            originator_ip,
+                            originator_port,
+                        })
+                        .await
+                }
+            }
+            .map(AgentIoStream::Bridge)
         })
     }
 
@@ -328,7 +365,10 @@ impl DataPlane for QuicNativeDataPlane {
             ready_wait_ms,
             "quic-native",
             None,
-            self.open_tcp_ipv4_optimistic(open),
+            self.open_tcp(
+                DataPlaneTcpOpen::Ipv4(open),
+                DataPlaneTcpOpenMode::Optimistic,
+            ),
         )
     }
 
@@ -338,16 +378,46 @@ impl DataPlane for QuicNativeDataPlane {
         query: Bytes,
         originator_ip: Ipv4Addr,
     ) -> DataPlaneDnsFuture<'_> {
-        dns::query_dns_over_quic_native_future(self.bridge.clone(), remote, query, originator_ip)
+        dns::query_dns_over_stream_data_plane_future(self.clone(), remote, query, originator_ip)
     }
 
-    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+    fn open_tcp(
+        &self,
+        open: DataPlaneTcpOpen,
+        mode: DataPlaneTcpOpenMode,
+    ) -> OpenTcpFuture<'static> {
         let bridge = self.bridge.clone();
         Box::pin(async move {
-            bridge
-                .open_tcp_ipv4_optimistic(open.into_agent_open())
-                .await
-                .map(AgentIoStream::quic_native_tcp)
+            match open {
+                DataPlaneTcpOpen::Ipv4(open) => {
+                    let mut stream = bridge
+                        .open_tcp_ipv4_optimistic(open.into_agent_open())
+                        .await?;
+                    match mode {
+                        DataPlaneTcpOpenMode::Strict => {
+                            stream.wait_opened().await?;
+                            Ok(AgentIoStream::quic_native_tcp_opened(stream))
+                        }
+                        DataPlaneTcpOpenMode::Optimistic => {
+                            Ok(AgentIoStream::quic_native_tcp(stream))
+                        }
+                    }
+                }
+                DataPlaneTcpOpen::Host {
+                    destination_host,
+                    destination_port,
+                    originator_ip,
+                    originator_port,
+                } => bridge
+                    .open_tcp_host(crate::agent_proto::AgentOpenHost {
+                        destination_host,
+                        destination_port,
+                        originator_ip,
+                        originator_port,
+                    })
+                    .await
+                    .map(AgentIoStream::quic_native_tcp_opened),
+            }
         })
     }
 
@@ -664,7 +734,10 @@ mod tests {
         let data_plane: Arc<dyn DataPlane> = Arc::new(data_plane);
 
         let mut stream = data_plane
-            .open_tcp_ipv4_optimistic(data_plane_ipv4_open(destination))
+            .open_tcp(
+                DataPlaneTcpOpen::Ipv4(data_plane_ipv4_open(destination)),
+                DataPlaneTcpOpenMode::Optimistic,
+            )
             .await
             .expect("open optimistic TCP stream");
         stream
@@ -674,6 +747,59 @@ mod tests {
         assert_eq!(
             recv_data_payload(&mut stream).await,
             Bytes::from_static(b"trait-tcp-ok")
+        );
+        stream.close().await.expect("close TCP stream");
+
+        drop(data_plane);
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent_task)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        tcp_server.await.expect("TCP server join");
+    }
+
+    #[tokio::test]
+    async fn framed_agent_data_plane_open_tcp_host_strict_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP target");
+        let destination = listener.local_addr().expect("TCP target address");
+        let tcp_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+            let mut buf = [0_u8; 10];
+            socket.read_exact(&mut buf).await.expect("read TCP request");
+            assert_eq!(&buf, b"trait-host");
+            socket
+                .write_all(b"trait-host-ok")
+                .await
+                .expect("write TCP response");
+        });
+        let (data_plane, bridge, agent_task) = test_agent_data_plane().await;
+        let data_plane: Arc<dyn DataPlane> = Arc::new(data_plane);
+
+        let mut stream = data_plane
+            .open_tcp(
+                DataPlaneTcpOpen::Host {
+                    destination_host: "localhost".to_owned(),
+                    destination_port: destination.port(),
+                    originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+                    originator_port: 49152,
+                },
+                DataPlaneTcpOpenMode::Strict,
+            )
+            .await
+            .expect("open strict hostname TCP stream");
+        stream
+            .send_data(Bytes::from_static(b"trait-host"))
+            .await
+            .expect("write TCP request");
+        assert_eq!(
+            recv_data_payload(&mut stream).await,
+            Bytes::from_static(b"trait-host-ok")
         );
         stream.close().await.expect("close TCP stream");
 
@@ -708,6 +834,60 @@ mod tests {
             }
         );
 
+        bridge.close_for_test("test complete");
+        bridge_task.await.expect("native bridge task");
+    }
+
+    #[tokio::test]
+    async fn quic_native_data_plane_open_tcp_host_strict_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP target");
+        let destination = listener.local_addr().expect("TCP target address");
+        let tcp_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+            let mut buf = [0_u8; 16];
+            socket
+                .read_exact(&mut buf)
+                .await
+                .expect("read native TCP request");
+            assert_eq!(&buf, b"native-host-open");
+            socket
+                .write_all(b"native-host-ok")
+                .await
+                .expect("write native TCP response");
+        });
+        let (data_plane, bridge, bridge_task) = test_quic_native_runtime().await;
+        let data_plane_snapshot = data_plane.clone();
+        let data_plane: Arc<dyn DataPlane> = Arc::new(data_plane);
+
+        let mut stream = data_plane
+            .open_tcp(
+                DataPlaneTcpOpen::Host {
+                    destination_host: "localhost".to_owned(),
+                    destination_port: destination.port(),
+                    originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+                    originator_port: 49152,
+                },
+                DataPlaneTcpOpenMode::Strict,
+            )
+            .await
+            .expect("open native strict hostname TCP stream");
+        stream
+            .send_data(Bytes::from_static(b"native-host-open"))
+            .await
+            .expect("write native TCP request");
+        assert_eq!(
+            recv_data_payload(&mut stream).await,
+            Bytes::from_static(b"native-host-ok")
+        );
+        stream.close().await.expect("close native TCP stream");
+
+        drop(data_plane);
+        tcp_server.await.expect("TCP server join");
+        eventually_assert_quic_native_active_streams(&data_plane_snapshot, 0).await;
         bridge.close_for_test("test complete");
         bridge_task.await.expect("native bridge task");
     }

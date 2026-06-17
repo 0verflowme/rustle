@@ -37,9 +37,20 @@ pub(crate) enum AgentIoStream {
 
 impl AgentIoStream {
     pub(crate) fn quic_native_tcp(stream: QuicNativeBridgeStream) -> Self {
+        Self::quic_native_tcp_with_open_status(stream, false)
+    }
+
+    pub(crate) fn quic_native_tcp_opened(stream: QuicNativeBridgeStream) -> Self {
+        Self::quic_native_tcp_with_open_status(stream, true)
+    }
+
+    fn quic_native_tcp_with_open_status(
+        stream: QuicNativeBridgeStream,
+        opened_reported: bool,
+    ) -> Self {
         Self::QuicNativeTcp {
             stream,
-            opened_reported: false,
+            opened_reported,
         }
     }
 
