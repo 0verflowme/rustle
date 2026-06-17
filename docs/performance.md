@@ -527,9 +527,7 @@ When a live fixture fails a latency or throughput gate, enable the opt-in TCP
 hotpath trace and summarize Rustle's stderr/log output:
 
 ```sh
-RUSTLE_HOTPATH_TRACE=1 RUSTLE_BENCH_KEEP_LOGS=1 scripts/bench-live-fixture.sh
-find /tmp/rustle-live-bench.xxxxxx -name rustle.log -print0 |
-  xargs -0 scripts/summarize-hotpath-trace.py
+RUSTLE_HOTPATH_TRACE=1 scripts/bench-live-fixture.sh
 ```
 
 The summary groups flows by transport and reports `stream_ready`, `opened`,
@@ -539,8 +537,9 @@ bytes, and outcomes. It also derives `remote_open_wait`, `payload_queue_wait`,
 derived terms to decide which fix comes first: remote open latency, delayed
 first payload forwarding, remote first-byte delay, flow duration/windowing, or
 failed/reset flows. The trace is deliberately opt-in and does not include
-payload bytes. Replace `/tmp/rustle-live-bench.xxxxxx` with the log directory
-printed by the benchmark cleanup message.
+payload bytes. `scripts/bench-live-compare.sh` prints the summary to stderr
+during cleanup when traced flow lines exist; set `RUSTLE_BENCH_KEEP_LOGS=1` when
+you also want to keep the raw per-run `rustle.log` files.
 
 Rustle's expected advantage is lower overhead from a native Rust single binary,
 explicit bounded queues, and cross-platform TUN support. sshuttle's advantage is

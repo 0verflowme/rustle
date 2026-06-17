@@ -305,6 +305,23 @@ ROUTE_BEFORE="$(route_snapshot)"
 CURRENT_STOPPER=""
 CURRENT_PASSWORD_FILE=""
 
+summarize_hotpath_trace_logs() {
+  [[ -n "${RUSTLE_HOTPATH_TRACE:-}" ]] || return 0
+  [[ -x "${SCRIPT_DIR}/summarize-hotpath-trace.py" ]] || return 0
+
+  local logs=()
+  local log
+  while IFS= read -r -d '' log; do
+    logs+=("$log")
+  done < <(find "$TMPDIR" -name rustle.log -print0)
+
+  [[ "${#logs[@]}" -gt 0 ]] || return 0
+  grep -q 'rustle_hotpath_tcp' "${logs[@]}" 2>/dev/null || return 0
+
+  smoke_info "hotpath trace summary for live benchmark logs"
+  "${SCRIPT_DIR}/summarize-hotpath-trace.py" "${logs[@]}" >&2 || true
+}
+
 cleanup() {
   local status="${1:-0}"
   if [[ -n "$CURRENT_STOPPER" ]]; then
@@ -318,6 +335,7 @@ cleanup() {
   if [[ "$after" != "$ROUTE_BEFORE" ]]; then
     delete_target_route_best_effort
   fi
+  summarize_hotpath_trace_logs
   if [[ "$status" -ne 0 || "$KEEP_LOGS" == "1" ]]; then
     smoke_info "kept live benchmark logs in ${TMPDIR}"
   else

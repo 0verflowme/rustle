@@ -716,6 +716,8 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "RUSTLE_BENCH_READY_METHOD",
     "probe_args+=(--head)",
     "RUSTLE_HOTPATH_TRACE",
+    "summarize_hotpath_trace_logs",
+    "summarize-hotpath-trace.py",
 ]
 
 REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
