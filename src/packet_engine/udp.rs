@@ -9,7 +9,7 @@ use crate::transport_model::{
     UdpAssociation, UdpAssociationEvents, UdpFlowKey, UDP_DATAGRAMS_PER_ASSOCIATION,
 };
 
-use super::{DnsInflight, TunnelStats};
+use super::{AdmissionCounter, TunnelStats};
 
 pub(crate) const MAX_ACTIVE_UDP_ASSOCIATIONS: usize = 512;
 
@@ -87,7 +87,7 @@ pub(crate) fn plan_udp_datagram_actions<T>(
     transport: Option<UdpAssociationTransportPlan<T>>,
     request: dns::UdpPacket,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
+    association_limit: &mut AdmissionCounter,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
     actions: &mut Vec<UdpIngressAction<T>>,
@@ -140,7 +140,7 @@ pub(crate) fn plan_udp_datagram_actions<T>(
 pub(crate) fn apply_udp_ingress_actions<T>(
     actions: &mut Vec<UdpIngressAction<T>>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
+    association_limit: &mut AdmissionCounter,
     stats: &mut TunnelStats,
     starts: &mut Vec<UdpAssociationStart<T>>,
 ) {
@@ -156,7 +156,7 @@ pub(crate) fn apply_udp_ingress_actions<T>(
 pub(crate) fn apply_udp_ingress_action<T>(
     action: UdpIngressAction<T>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
+    association_limit: &mut AdmissionCounter,
     stats: &mut TunnelStats,
 ) -> Option<UdpAssociationStart<T>> {
     match action {
@@ -201,7 +201,7 @@ pub(crate) fn apply_udp_ingress_action<T>(
 #[cfg(test)]
 pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
     let mut associations = HashMap::new();
-    let mut association_limit = DnsInflight::new(1);
+    let mut association_limit = AdmissionCounter::new(1);
     let start = apply_udp_ingress_action::<()>(
         UdpIngressAction::DropDatagram {
             key: UdpFlowKey::from_packet(request),
@@ -218,7 +218,7 @@ fn drop_udp_datagram(
     key: UdpFlowKey,
     reason: UdpDropReason,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
+    association_limit: &mut AdmissionCounter,
     stats: &mut TunnelStats,
 ) {
     if reason == UdpDropReason::AssociationClosed {

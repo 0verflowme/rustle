@@ -250,7 +250,7 @@ impl TunnelSupervisor {
                         } else {
                             eprintln!(
                                 "dns: dropping query because {} DNS queries are already in flight",
-                                engine.dns_inflight_limit()
+                                engine.dns_admission_limit()
                             );
                             engine.record_dns_drop();
                             let tun_write = tun

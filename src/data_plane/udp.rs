@@ -307,7 +307,7 @@ mod tests {
     use super::*;
     use crate::defaults::DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS;
     use crate::dns as dns_proto;
-    use crate::packet_engine::DnsInflight;
+    use crate::packet_engine::AdmissionCounter;
     use crate::transport_model::{UdpAssociation, UDP_DATAGRAMS_PER_ASSOCIATION};
     use std::collections::HashMap;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -565,7 +565,7 @@ mod tests {
         };
         let mut associations = HashMap::new();
         associations.insert(key, UdpAssociation { to_remote });
-        let mut association_limit = DnsInflight::new(1);
+        let mut association_limit = AdmissionCounter::new(1);
         assert!(association_limit.try_admit());
 
         spawn_agent_udp_association_with_idle_timeout(
@@ -616,7 +616,7 @@ mod tests {
         };
         let mut associations = HashMap::new();
         associations.insert(key, UdpAssociation { to_remote });
-        let mut association_limit = DnsInflight::new(1);
+        let mut association_limit = AdmissionCounter::new(1);
         assert!(association_limit.try_admit());
 
         spawn_quic_native_udp_association_with_idle_timeout(
