@@ -18,6 +18,7 @@ HOTPATH_COLUMNS = {
     "transport",
     "flows",
     "failed_flows",
+    "local_queue_wait_p50_ms",
     "likely_bottleneck",
 }
 QUIC_DIAGNOSTIC_COLUMNS = {
@@ -206,6 +207,8 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "payload_queue_wait_p50_ms\tfirst_byte_wait_p50_ms\t"
                     "body_drain_p50_ms\tlocal_send_wait_p50_ms\t"
                     "local_send_wait_total_ms\tlocal_send_waits\t"
+                    "local_queue_wait_p50_ms\tlocal_queue_wait_total_ms\t"
+                    "local_queue_waits\t"
                     "agent_send_credit_wait_p50_ms\tagent_send_credit_wait_total_ms\t"
                     "agent_send_outbound_wait_p50_ms\t"
                     "agent_send_outbound_wait_total_ms\tagent_send_frames\t"
@@ -216,8 +219,9 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                 (
                     "agent\t2\t2\t0\t512\t4096\t0.100\t0.200\t0.300\t"
                     "0.400\t0.500\t0.700\t0.100\t0.100\t0.100\t0.200\t"
-                    "0.000\t0.000\t0\t0.000\t0.000\t0.000\t0.000\t4\t"
-                    "0.000\t0.000\t0\t1.000\t2.000\t1.95\tbody_drain"
+                    "0.000\t0.000\t0\t0.000\t0.000\t0\t0.000\t0.000\t"
+                    "0.000\t0.000\t4\t0.000\t0.000\t0\t1.000\t2.000\t"
+                    "1.95\tbody_drain"
                 ),
             ]
         )

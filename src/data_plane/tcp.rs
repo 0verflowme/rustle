@@ -114,9 +114,11 @@ where
                     .await;
                     break;
                 }
-                local = local_rx.recv() => {
+                local = local_rx.recv_with_metrics() => {
                     match local {
-                        Some(bytes) => {
+                        Some(local) => {
+                            let bytes = local.bytes;
+                            trace.local_queue_wait(local.queue_wait_us);
                             trace.local_bytes(bytes.len());
                             if !open_reported {
                                 pre_open_local.push_back(bytes.clone());
@@ -479,9 +481,11 @@ pub(super) fn spawn_quic_native_tcp_bridge(
         loop {
             if !open_reported {
                 tokio::select! {
-                    local = local_rx.recv() => {
+                    local = local_rx.recv_with_metrics() => {
                         match local {
-                            Some(bytes) => {
+                            Some(local) => {
+                                let bytes = local.bytes;
+                                trace.local_queue_wait(local.queue_wait_us);
                                 trace.local_bytes(bytes.len());
                                 let send_started_at = StdInstant::now();
                                 let send_result = tokio::time::timeout(
@@ -563,9 +567,11 @@ pub(super) fn spawn_quic_native_tcp_bridge(
             }
 
             tokio::select! {
-                local = local_rx.recv() => {
+                local = local_rx.recv_with_metrics() => {
                     match local {
-                        Some(bytes) => {
+                        Some(local) => {
+                            let bytes = local.bytes;
+                            trace.local_queue_wait(local.queue_wait_us);
                             trace.local_bytes(bytes.len());
                             let send_started_at = StdInstant::now();
                             let send_result = tokio::time::timeout(

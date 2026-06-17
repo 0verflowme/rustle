@@ -122,10 +122,25 @@ pub struct LocalDataReceiver {
     rx: mpsc::Receiver<QueuedLocalData>,
 }
 
+#[derive(Debug)]
+pub struct ReceivedLocalData {
+    pub bytes: Bytes,
+    pub queue_wait_us: u128,
+}
+
 impl LocalDataReceiver {
     pub async fn recv(&mut self) -> Option<Bytes> {
+        self.recv_with_metrics().await.map(|local| local.bytes)
+    }
+
+    pub async fn recv_with_metrics(&mut self) -> Option<ReceivedLocalData> {
         let mut queued = self.rx.recv().await?;
-        queued.bytes.take()
+        let queue_wait_us = queued.enqueued_at.elapsed().as_micros();
+        let bytes = queued.bytes.take()?;
+        Some(ReceivedLocalData {
+            bytes,
+            queue_wait_us,
+        })
     }
 }
 
@@ -133,6 +148,7 @@ impl LocalDataReceiver {
 struct QueuedLocalData {
     bytes: Option<Bytes>,
     len: usize,
+    enqueued_at: Instant,
     queued_bytes: Arc<AtomicUsize>,
 }
 
@@ -159,6 +175,7 @@ impl QueuedLocalData {
                     return Some(Self {
                         bytes: Some(bytes),
                         len,
+                        enqueued_at: Instant::now(),
                         queued_bytes,
                     });
                 }

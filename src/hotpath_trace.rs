@@ -19,6 +19,8 @@ pub(crate) struct TcpFlowTrace {
     first_remote_us: Option<u128>,
     local_send_wait_us: u128,
     local_send_waits: u64,
+    local_queue_wait_us: u128,
+    local_queue_waits: u64,
     agent_send_credit_wait_us: u128,
     agent_send_outbound_wait_us: u128,
     agent_send_frames: u64,
@@ -40,6 +42,8 @@ struct TcpFlowTraceSummary {
     first_remote_us: Option<u128>,
     local_send_wait_us: u128,
     local_send_waits: u64,
+    local_queue_wait_us: u128,
+    local_queue_waits: u64,
     agent_send_credit_wait_us: u128,
     agent_send_outbound_wait_us: u128,
     agent_send_frames: u64,
@@ -65,6 +69,8 @@ impl TcpFlowTrace {
             first_remote_us: None,
             local_send_wait_us: 0,
             local_send_waits: 0,
+            local_queue_wait_us: 0,
+            local_queue_waits: 0,
             agent_send_credit_wait_us: 0,
             agent_send_outbound_wait_us: 0,
             agent_send_frames: 0,
@@ -107,6 +113,14 @@ impl TcpFlowTrace {
             .local_send_wait_us
             .saturating_add(started_at.elapsed().as_micros());
         self.local_send_waits = self.local_send_waits.saturating_add(1);
+    }
+
+    pub(crate) fn local_queue_wait(&mut self, queue_wait_us: u128) {
+        if !self.enabled {
+            return;
+        }
+        self.local_queue_wait_us = self.local_queue_wait_us.saturating_add(queue_wait_us);
+        self.local_queue_waits = self.local_queue_waits.saturating_add(1);
     }
 
     pub(crate) fn agent_send_waits(
@@ -204,6 +218,8 @@ impl TcpFlowTrace {
                 first_remote_us: self.first_remote_us,
                 local_send_wait_us: self.local_send_wait_us,
                 local_send_waits: self.local_send_waits,
+                local_queue_wait_us: self.local_queue_wait_us,
+                local_queue_waits: self.local_queue_waits,
                 agent_send_credit_wait_us: self.agent_send_credit_wait_us,
                 agent_send_outbound_wait_us: self.agent_send_outbound_wait_us,
                 agent_send_frames: self.agent_send_frames,
@@ -244,7 +260,7 @@ fn hotpath_trace_enabled() -> bool {
 fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
     let key = summary.id.key;
     format!(
-        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tstream_ready_us={}\topened_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_waits={}\tagent_send_credit_wait_us={}\tagent_send_outbound_wait_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_waits={}\toutcome={}",
+        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tstream_ready_us={}\topened_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_waits={}\tlocal_queue_wait_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_outbound_wait_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_waits={}\toutcome={}",
         summary.transport,
         key.src_ip,
         key.src_port,
@@ -261,6 +277,8 @@ fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
         summary.remote_bytes,
         summary.local_send_wait_us,
         summary.local_send_waits,
+        summary.local_queue_wait_us,
+        summary.local_queue_waits,
         summary.agent_send_credit_wait_us,
         summary.agent_send_outbound_wait_us,
         summary.agent_send_frames,
@@ -301,6 +319,8 @@ mod tests {
             first_remote_us: None,
             local_send_wait_us: 9,
             local_send_waits: 2,
+            local_queue_wait_us: 7,
+            local_queue_waits: 1,
             agent_send_credit_wait_us: 4,
             agent_send_outbound_wait_us: 5,
             agent_send_frames: 6,
@@ -314,7 +334,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tstream_ready_us=10\topened_us=20\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_waits=2\tagent_send_credit_wait_us=4\tagent_send_outbound_wait_us=5\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_waits=3\toutcome=closed"
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tstream_ready_us=10\topened_us=20\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_waits=2\tlocal_queue_wait_us=7\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_outbound_wait_us=5\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_waits=3\toutcome=closed"
         );
         assert!(!line.contains("payload"));
     }
