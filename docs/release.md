@@ -479,10 +479,12 @@ Required before tagging a release:
   QUIC UDP as release evidence on that remote; a failure there is UDP
   reachability evidence, not an agent-product regression. For OpenSSH `Host`
   aliases under `sudo`, pass `RUSTLE_LIVE_SSH_CONFIG` or
-  `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the
-  same alias as the fixture SSH command. Use `RUSTLE_LIVE_UDP_AGENT_PATH` only
-  when this UDP proof needs a different preinstalled remote Rustle binary from
-  the main live smoke.
+  `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process and fixture
+  SSH command resolve the same alias. Controlled live fixture benchmarks can use
+  `RUSTLE_FIXTURE_SSH_CONFIG` to apply the same OpenSSH config to the fixture
+  command and nested Rustle/sshuttle comparison. Use
+  `RUSTLE_LIVE_UDP_AGENT_PATH` only when this UDP proof needs a different
+  preinstalled remote Rustle binary from the main live smoke.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. The release workflow runs
   this smoke against the packaged Windows binary with embedded Wintun before

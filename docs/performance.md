@@ -412,6 +412,9 @@ Set `RUSTLE_BENCH_SSH_CONFIG` to pin the config used by both Rustle and
 sshuttle, or `RUSTLE_BENCH_SSHUTTLE_SSH_CONFIG` when only the sshuttle
 comparator needs a different config. `RUSTLE_BENCH_SSHUTTLE_SSH_CMD` still
 overrides the complete sshuttle SSH command when a lab needs total control.
+The controlled live fixture also accepts `RUSTLE_FIXTURE_SSH_CONFIG`; when that
+fixture-specific variable is set, the remote fixture `ssh` command and the
+nested Rustle/sshuttle benchmark use the same OpenSSH config.
 
 For throwaway lab hosts, `RUSTLE_BENCH_INSECURE_HOST_KEY=1` or
 `RUSTLE_LIVE_INSECURE_HOST_KEY=1` also applies to sshuttle identity mode. When
@@ -566,9 +569,9 @@ inbound UDP to the helper port is blocked.
 When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
 alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific
-`RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the same
-alias as the fixture SSH command. Use `RUSTLE_LIVE_UDP_AGENT_PATH` when the UDP
-smoke should use a different preinstalled remote helper binary from the main
+`RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process and the fixture
+SSH command resolve the same alias. Use `RUSTLE_LIVE_UDP_AGENT_PATH` when the
+UDP smoke should use a different preinstalled remote helper binary from the main
 live smoke.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
