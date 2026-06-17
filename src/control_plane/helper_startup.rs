@@ -3,7 +3,7 @@ use std::future::Future;
 use anyhow::{bail, Context, Result};
 use russh::client::Handle;
 
-use crate::remote_helper::{bootstrap_helper, HelperCommandPlan, HelperKind};
+use crate::remote_helper::{bootstrap_helper, BootstrappedHelper, HelperCommandPlan, HelperKind};
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 
 pub(super) async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
@@ -102,10 +102,9 @@ where
     ConnectFut: Future<Output = Result<T>>,
 {
     ensure_helper_plan_kind(helper_plan, expected)?;
-    let started = bootstrap_helper(prepared, helper_plan).await?;
-    let command = started.helper.command;
-    let remote_path = started.helper.remote_path;
-    let connected = connect(started.handle, command.clone())
+    let started: BootstrappedHelper = bootstrap_helper(prepared, helper_plan).await?;
+    let (handle, command, remote_path) = started.into_connect_parts();
+    let connected = connect(handle, command.clone())
         .await
         .with_context(|| expected.uploaded_start_context(&remote_path))?;
     Ok((connected, command))

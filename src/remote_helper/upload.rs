@@ -15,18 +15,19 @@ use crate::remote_platform::{probe_remote_platform, RemotePlatform};
 use crate::sidecar_store::local_helper_binary_for_platform;
 use crate::ssh_control::Client;
 
-use super::{powershell_quote, shell_quote, HelperKind};
+use super::command::{powershell_quote, shell_quote};
+use super::kind::HelperKind;
 
 pub(crate) const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
 pub(crate) const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $d=$env:TEMP; if ([string]::IsNullOrWhiteSpace($d)) { $d=$env:TMP }; if ([string]::IsNullOrWhiteSpace($d)) { $d=[IO.Path]::GetTempPath() }; $dir=Join-Path -Path $d -ChildPath ('rustle-agent-{0}-{1}' -f $PID,[Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dir -Force | Out-Null; $p=Join-Path -Path $dir -ChildPath 'rustle-agent.exe'; $stdin=[Console]::OpenStandardInput(); try { $out=[IO.File]::Open($p,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); try { $stdin.CopyTo($out) } finally { $out.Dispose(); $stdin.Dispose() } } catch { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; throw }; [Console]::Out.WriteLine($p)\"";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct UploadedHelperCommand {
-    pub(crate) kind: HelperKind,
-    pub(crate) platform: RemotePlatform,
-    pub(crate) local_path: PathBuf,
-    pub(crate) remote_path: String,
-    pub(crate) command: String,
+pub(super) struct UploadedHelperCommand {
+    pub(super) kind: HelperKind,
+    pub(super) platform: RemotePlatform,
+    pub(super) local_path: PathBuf,
+    pub(super) remote_path: String,
+    pub(super) command: String,
 }
 
 impl UploadedHelperCommand {
@@ -36,7 +37,7 @@ impl UploadedHelperCommand {
         local_path: PathBuf,
         remote_path: String,
     ) -> Self {
-        let command = uploaded_helper_command(&remote_path, platform, kind.subcommand());
+        let command = uploaded_helper_command(&remote_path, platform, kind);
         Self {
             kind,
             platform,
@@ -49,14 +50,15 @@ impl UploadedHelperCommand {
 
 #[cfg(test)]
 pub(crate) fn uploaded_agent_command(remote_path: &str, platform: RemotePlatform) -> String {
-    uploaded_helper_command(remote_path, platform, HelperKind::StdioAgent.subcommand())
+    uploaded_helper_command(remote_path, platform, HelperKind::StdioAgent)
 }
 
 pub(crate) fn uploaded_helper_command(
     remote_path: &str,
     platform: RemotePlatform,
-    helper_subcommand: &str,
+    kind: HelperKind,
 ) -> String {
+    let helper_subcommand = kind.subcommand();
     if platform.is_windows() {
         uploaded_windows_helper_command(remote_path, helper_subcommand)
     } else {
@@ -119,7 +121,7 @@ pub(crate) async fn upload_agent_binary(
     Ok(remote_path)
 }
 
-pub(crate) async fn stage_uploaded_helper_command(
+pub(super) async fn stage_uploaded_helper_command(
     handle: &Handle<Client>,
     kind: HelperKind,
 ) -> Result<UploadedHelperCommand> {
@@ -310,11 +312,7 @@ mod tests {
         };
         assert_eq!(
             uploaded_agent_command("/tmp/rustle-agent", posix),
-            uploaded_helper_command(
-                "/tmp/rustle-agent",
-                posix,
-                HelperKind::StdioAgent.subcommand()
-            )
+            uploaded_helper_command("/tmp/rustle-agent", posix, HelperKind::StdioAgent)
         );
 
         let windows = RemotePlatform {
@@ -326,7 +324,7 @@ mod tests {
             uploaded_helper_command(
                 "C:\\Temp\\rustle-agent.exe",
                 windows,
-                HelperKind::StdioAgent.subcommand()
+                HelperKind::StdioAgent
             )
         );
     }
@@ -371,7 +369,7 @@ mod tests {
             (HelperKind::QuicAgent, "quic-agent"),
             (HelperKind::QuicBridgeNative, "quic-bridge-agent"),
         ] {
-            let command = uploaded_helper_command("/tmp/rustle-agent", platform, kind.subcommand());
+            let command = uploaded_helper_command("/tmp/rustle-agent", platform, kind);
 
             assert!(command.contains(&format!("\"$tmp\" {subcommand}")));
         }
@@ -417,8 +415,7 @@ mod tests {
             (HelperKind::QuicAgent, "quic-agent"),
             (HelperKind::QuicBridgeNative, "quic-bridge-agent"),
         ] {
-            let command =
-                uploaded_helper_command("C:\\Temp\\rustle-agent.exe", platform, kind.subcommand());
+            let command = uploaded_helper_command("C:\\Temp\\rustle-agent.exe", platform, kind);
 
             assert!(command.contains(&format!("& $tmp {subcommand}")));
         }
@@ -831,7 +828,7 @@ mod tests {
                     os: "linux",
                     arch: "x86_64",
                 },
-                kind.subcommand(),
+                kind,
             );
             let mut children = ChildGuard {
                 children: (0..2)
