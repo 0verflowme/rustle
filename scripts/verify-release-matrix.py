@@ -25,6 +25,7 @@ LIVE_BENCH_ROWS = REPO / "scripts" / "verify-live-benchmark-rows.py"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
+QUIC_DIAGNOSTIC_SUMMARY = REPO / "scripts" / "summarize-quic-diagnostics.py"
 RELEASE_ARCHIVES = REPO / "scripts" / "verify-release-archives.py"
 BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
 AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
@@ -718,6 +719,8 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "RUSTLE_HOTPATH_TRACE",
     "summarize_hotpath_trace_logs",
     "summarize-hotpath-trace.py",
+    "summarize_quic_diagnostic_logs",
+    "summarize-quic-diagnostics.py",
 ]
 
 REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
@@ -1154,6 +1157,17 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "likely_bottleneck",
     "first_remote_p95_ms",
     "avg_flow_throughput_mib_s",
+    "--self-test",
+    "assert_rejects",
+]
+
+REQUIRED_QUIC_DIAGNOSTIC_SUMMARY_SNIPPETS = [
+    "UDP data plane connected",
+    "failed to establish UDP data plane",
+    "auth_token_sha256_prefix",
+    "server auth",
+    "max_elapsed_ms",
+    "paths",
     "--self-test",
     "assert_rejects",
 ]
@@ -1597,6 +1611,7 @@ def main() -> None:
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
+    quic_diagnostic_summary = QUIC_DIAGNOSTIC_SUMMARY.read_text(encoding="utf-8")
     release_archives = RELEASE_ARCHIVES.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
@@ -1749,6 +1764,17 @@ def main() -> None:
         fail(
             "scripts/summarize-hotpath-trace.py is missing required snippets: "
             f"{missing_hotpath_trace_summary!r}"
+        )
+
+    missing_quic_diagnostic_summary = [
+        snippet
+        for snippet in REQUIRED_QUIC_DIAGNOSTIC_SUMMARY_SNIPPETS
+        if snippet not in quic_diagnostic_summary
+    ]
+    if missing_quic_diagnostic_summary:
+        fail(
+            "scripts/summarize-quic-diagnostics.py is missing required snippets: "
+            f"{missing_quic_diagnostic_summary!r}"
         )
 
     missing_release_archives = [
