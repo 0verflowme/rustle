@@ -128,6 +128,16 @@ impl TunnelEngine {
         self.stats.record_udp_delivery(write);
     }
 
+    pub(crate) fn record_bridge_event_batch(
+        &mut self,
+        handled: usize,
+        elapsed: Duration,
+        paused_by_backlog: bool,
+    ) {
+        self.stats
+            .record_bridge_event_batch(handled, elapsed, paused_by_backlog);
+    }
+
     pub(crate) fn close_udp_association(&mut self, key: UdpFlowKey) {
         self.udp_associations.remove(&key);
         self.udp_admission.complete();
@@ -765,6 +775,7 @@ mod tests {
                 bytes: 96,
                 dropped_packets: 0,
                 dropped_bytes: 0,
+                ..TunWriteStats::default()
             },
         );
         stats.record_dns_delivery(
@@ -774,6 +785,7 @@ mod tests {
                 bytes: 0,
                 dropped_packets: 1,
                 dropped_bytes: 96,
+                ..TunWriteStats::default()
             },
         );
         stats.record_dns_delivery(
@@ -783,6 +795,7 @@ mod tests {
                 bytes: 96,
                 dropped_packets: 0,
                 dropped_bytes: 0,
+                ..TunWriteStats::default()
             },
         );
 
@@ -791,12 +804,14 @@ mod tests {
             bytes: 128,
             dropped_packets: 0,
             dropped_bytes: 0,
+            ..TunWriteStats::default()
         });
         stats.record_udp_delivery(TunWriteStats {
             packets: 0,
             bytes: 0,
             dropped_packets: 1,
             dropped_bytes: 128,
+            ..TunWriteStats::default()
         });
 
         assert_eq!(stats.dns_ok, 1);

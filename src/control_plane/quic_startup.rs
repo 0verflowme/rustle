@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use ring::digest;
 use russh::{
     client::{Handle, Msg},
     ChannelStream,
@@ -26,7 +27,7 @@ use super::{
 };
 
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
-const QUIC_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const QUIC_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 struct QuicHelperBootstrapRole {
@@ -269,11 +270,17 @@ async fn start_quic_helper_ssh_bootstrap(
     let bootstrap =
         read_quic_helper_bootstrap(&mut reader, role, QUIC_AGENT_BOOTSTRAP_TIMEOUT).await?;
     let remote_addrs = resolve_quic_helper_addrs(role.label, remote_host, bootstrap.port)?;
+    let token_prefix = auth_token_sha256_prefix(&bootstrap.auth_token);
     eprintln!(
-        "{} to {} cert_sha256={}",
+        "{} role={} remote_host={} bootstrap_port={} resolved_addrs={} cert_sha256={} cert_der_len={} auth_token_sha256_prefix={}",
         role.connect_log_prefix,
+        role.label,
+        remote_host,
+        bootstrap.port,
         format_socket_addrs(&remote_addrs),
-        bootstrap.cert_sha256
+        bootstrap.cert_sha256,
+        bootstrap.cert_der.len(),
+        token_prefix
     );
 
     Ok(StartedQuicHelperSsh {
@@ -339,6 +346,13 @@ where
     let attempt_count = remote_addrs.len();
     for (index, remote_addr) in remote_addrs.iter().copied().enumerate() {
         let attempt_started = Instant::now();
+        eprintln!(
+            "{label}: UDP data plane attempt {}/{} remote={} attempt_timeout_ms={}",
+            index + 1,
+            attempt_count,
+            remote_addr,
+            attempt_timeout.as_millis()
+        );
         match connect_quic_data_plane_with_timeout(
             label,
             remote_addr,
@@ -427,6 +441,23 @@ fn quic_data_plane_all_addrs_failed_context(
         format_socket_addrs(remote_addrs),
         failures.join(" | ")
     )
+}
+
+fn auth_token_sha256_prefix(auth_token: &[u8]) -> String {
+    lower_hex(digest::digest(&digest::SHA256, auth_token).as_ref())
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 async fn drain_quic_helper_ssh_output<R>(label: &'static str, mut reader: BufReader<R>)

@@ -6,6 +6,8 @@ use ring::rand::SecureRandom;
 use ring::rand::SystemRandom;
 use tokio::io::AsyncWriteExt;
 
+use super::bootstrap::sha256_hex;
+
 pub(super) const QUIC_AUTH_TOKEN_BYTES: usize = 32;
 pub(super) const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub(super) const QUIC_AUTH_FAILED_CODE: u32 = 0x5255_4155;
@@ -109,8 +111,9 @@ fn quic_auth_tokens_match(actual: &[u8; QUIC_AUTH_TOKEN_BYTES], expected: &[u8])
 }
 
 pub(super) async fn write_quic_auth_ok(send: &mut quinn::SendStream) -> Result<()> {
-    send.write_all(&[QUIC_AUTH_STATUS_OK])
+    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.write_all(&[QUIC_AUTH_STATUS_OK]))
         .await
+        .context("timed out writing QUIC helper auth acknowledgement")?
         .context("failed to write QUIC helper auth acknowledgement")
 }
 
@@ -133,6 +136,8 @@ pub(super) async fn authenticate_quic_bridge_connection_on_client(
     connection: &quinn::Connection,
     auth_token: &[u8],
 ) -> Result<()> {
+    let remote = connection.remote_address();
+    let token_prefix = quic_auth_token_sha256_prefix(auth_token);
     let stage_started = Instant::now();
     let (mut send, mut recv) = open_quic_bi_stream_with_timeout(
         connection,
@@ -143,31 +148,64 @@ pub(super) async fn authenticate_quic_bridge_connection_on_client(
     .with_context(|| {
         quic_auth_stage_context("native QUIC bridge auth", "open_stream", stage_started)
     })?;
+    log_quic_bridge_auth_stage(
+        "client",
+        remote,
+        "open_stream",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
     let stage_started = Instant::now();
     write_quic_auth_token(&mut send, auth_token)
         .await
         .with_context(|| {
             quic_auth_stage_context("native QUIC bridge auth", "write_token", stage_started)
         })?;
-    let stage_started = Instant::now();
-    tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown())
-        .await
-        .with_context(|| {
-            format!(
-                "{} timed_out",
-                quic_auth_stage_context("native QUIC bridge auth", "finish_send", stage_started)
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "{} failed",
-                quic_auth_stage_context("native QUIC bridge auth", "finish_send", stage_started)
-            )
-        })?;
+    log_quic_bridge_auth_stage(
+        "client",
+        remote,
+        "write_token",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
     let stage_started = Instant::now();
     read_quic_auth_ok(&mut recv).await.with_context(|| {
         quic_auth_stage_context("native QUIC bridge auth", "read_ack", stage_started)
-    })
+    })?;
+    log_quic_bridge_auth_stage(
+        "client",
+        remote,
+        "read_ack",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
+    let stage_started = Instant::now();
+    match tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown()).await {
+        Ok(Ok(())) => log_quic_bridge_auth_stage(
+            "client",
+            remote,
+            "finish_send",
+            "ok",
+            stage_started,
+            &token_prefix,
+        ),
+        Ok(Err(err)) => eprintln!(
+            "quic-auth: transport=quic-native side=client remote={remote} stage=finish_send result=error elapsed_ms={} timeout_ms={} auth_token_sha256_prefix={} error={err:#}",
+            stage_started.elapsed().as_millis(),
+            QUIC_AUTH_TIMEOUT.as_millis(),
+            token_prefix
+        ),
+        Err(_) => eprintln!(
+            "quic-auth: transport=quic-native side=client remote={remote} stage=finish_send result=timeout elapsed_ms={} timeout_ms={} auth_token_sha256_prefix={}",
+            stage_started.elapsed().as_millis(),
+            QUIC_AUTH_TIMEOUT.as_millis(),
+            token_prefix
+        ),
+    }
+    Ok(())
 }
 
 pub(super) async fn authenticate_quic_bridge_connection_on_server(
@@ -175,6 +213,7 @@ pub(super) async fn authenticate_quic_bridge_connection_on_server(
     expected_token: &[u8],
 ) -> Result<()> {
     let remote = connection.remote_address();
+    let token_prefix = quic_auth_token_sha256_prefix(expected_token);
     let stage_started = Instant::now();
     let (mut send, mut recv) = tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi())
         .await
@@ -200,6 +239,14 @@ pub(super) async fn authenticate_quic_bridge_connection_on_server(
                 )
             )
         })?;
+    log_quic_bridge_auth_stage(
+        "server",
+        remote,
+        "accept_stream",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
     let stage_started = Instant::now();
     verify_quic_auth_token(&mut recv, expected_token)
         .await
@@ -211,6 +258,14 @@ pub(super) async fn authenticate_quic_bridge_connection_on_server(
                 stage_started,
             )
         })?;
+    log_quic_bridge_auth_stage(
+        "server",
+        remote,
+        "read_token",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
     let stage_started = Instant::now();
     write_quic_auth_ok(&mut send).await.with_context(|| {
         quic_auth_peer_stage_context(
@@ -220,8 +275,35 @@ pub(super) async fn authenticate_quic_bridge_connection_on_server(
             stage_started,
         )
     })?;
+    log_quic_bridge_auth_stage(
+        "server",
+        remote,
+        "write_ack",
+        "ok",
+        stage_started,
+        &token_prefix,
+    );
     let _ = send.shutdown().await;
     Ok(())
+}
+
+fn quic_auth_token_sha256_prefix(token: &[u8]) -> String {
+    sha256_hex(token).chars().take(12).collect()
+}
+
+fn log_quic_bridge_auth_stage(
+    side: &'static str,
+    remote: SocketAddr,
+    stage: &'static str,
+    result: &'static str,
+    started_at: Instant,
+    token_prefix: &str,
+) {
+    eprintln!(
+        "quic-auth: transport=quic-native side={side} remote={remote} stage={stage} result={result} elapsed_ms={} timeout_ms={} auth_token_sha256_prefix={token_prefix}",
+        started_at.elapsed().as_millis(),
+        QUIC_AUTH_TIMEOUT.as_millis()
+    );
 }
 
 #[cfg(test)]

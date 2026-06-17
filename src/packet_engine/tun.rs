@@ -28,17 +28,28 @@ pub(crate) struct TunWriteStats {
     pub(crate) bytes: u64,
     pub(crate) dropped_packets: u64,
     pub(crate) dropped_bytes: u64,
+    pub(crate) write_calls: u64,
+    pub(crate) write_elapsed_us: u64,
+    pub(crate) write_max_us: u64,
 }
 
 impl TunWriteStats {
-    pub(crate) fn record_written(&mut self, len: usize) {
+    pub(crate) fn record_written(&mut self, len: usize, elapsed_us: u64) {
         self.packets = self.packets.saturating_add(1);
         self.bytes = self.bytes.saturating_add(len as u64);
+        self.record_write_attempt(elapsed_us);
     }
 
-    pub(crate) fn record_dropped(&mut self, len: usize) {
+    pub(crate) fn record_dropped(&mut self, len: usize, elapsed_us: u64) {
         self.dropped_packets = self.dropped_packets.saturating_add(1);
         self.dropped_bytes = self.dropped_bytes.saturating_add(len as u64);
+        self.record_write_attempt(elapsed_us);
+    }
+
+    fn record_write_attempt(&mut self, elapsed_us: u64) {
+        self.write_calls = self.write_calls.saturating_add(1);
+        self.write_elapsed_us = self.write_elapsed_us.saturating_add(elapsed_us);
+        self.write_max_us = self.write_max_us.max(elapsed_us);
     }
 
     pub(crate) fn combine(&mut self, other: Self) {
@@ -46,6 +57,9 @@ impl TunWriteStats {
         self.bytes = self.bytes.saturating_add(other.bytes);
         self.dropped_packets = self.dropped_packets.saturating_add(other.dropped_packets);
         self.dropped_bytes = self.dropped_bytes.saturating_add(other.dropped_bytes);
+        self.write_calls = self.write_calls.saturating_add(other.write_calls);
+        self.write_elapsed_us = self.write_elapsed_us.saturating_add(other.write_elapsed_us);
+        self.write_max_us = self.write_max_us.max(other.write_max_us);
     }
 
     pub(crate) fn delivered_at_least_one_packet_without_drop(&self) -> bool {

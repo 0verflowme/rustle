@@ -88,6 +88,35 @@ impl std::fmt::Display for QuicBridgeConnectDiagnostics<'_> {
     }
 }
 
+impl QuicBridgeConnectDiagnostics<'_> {
+    fn log_stage(
+        &self,
+        stage: &'static str,
+        result: &'static str,
+        local_udp_addr: Option<SocketAddr>,
+        started_at: Option<Instant>,
+    ) {
+        let elapsed_ms = started_at
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0);
+        let local_udp_addr = local_udp_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        eprintln!(
+            "quic-connect: transport=quic-native remote={} local_udp_addr={} server_name={} stage={} result={} elapsed_ms={} cert_sha256={} cert_der_len={} auth_token_sha256_prefix={}",
+            self.remote,
+            local_udp_addr,
+            QUIC_AGENT_SERVER_NAME,
+            stage,
+            result,
+            elapsed_ms,
+            self.cert_sha256,
+            self.cert_der_len,
+            self.token_sha256_prefix
+        );
+    }
+}
+
 impl QuicBridgeServer {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.endpoint
@@ -154,11 +183,15 @@ pub async fn connect_quic_bridge(
     let diagnostics = QuicBridgeConnectDiagnostics::new(remote, bootstrap);
     let mut endpoint =
         quic_client_endpoint(remote).with_context(|| format!("{diagnostics} stage=client_bind"))?;
+    let local_udp_addr = endpoint.local_addr().ok();
+    diagnostics.log_stage("client_bind", "ok", local_udp_addr, None);
     endpoint.set_default_client_config(
         quic_client_config(bootstrap)
             .with_context(|| format!("{diagnostics} stage=client_config"))?,
     );
+    diagnostics.log_stage("client_config", "ok", local_udp_addr, None);
     let stage_started = Instant::now();
+    diagnostics.log_stage("connect_start", "ok", local_udp_addr, Some(stage_started));
     let connection = endpoint
         .connect(remote, QUIC_AGENT_SERVER_NAME)
         .with_context(|| format!("{diagnostics} stage=connect_start"))?
@@ -169,9 +202,17 @@ pub async fn connect_quic_bridge(
                 stage_started.elapsed().as_millis()
             )
         })?;
+    diagnostics.log_stage(
+        "connect_establish",
+        "ok",
+        local_udp_addr,
+        Some(stage_started),
+    );
+    let stage_started = Instant::now();
     authenticate_quic_bridge_connection_on_client(&connection, &bootstrap.auth_token)
         .await
         .with_context(|| format!("{diagnostics} stage=authenticate"))?;
+    diagnostics.log_stage("authenticate", "ok", local_udp_addr, Some(stage_started));
     Ok(QuicBridgeClient {
         inner: Arc::new(QuicBridgeClientInner {
             _endpoint: endpoint,

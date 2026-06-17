@@ -16,6 +16,9 @@ pub(crate) struct TunnelStats {
     pub(crate) tun_tx_bytes: u64,
     pub(crate) tun_tx_dropped_packets: u64,
     pub(crate) tun_tx_dropped_bytes: u64,
+    pub(crate) tun_tx_write_calls: u64,
+    pub(crate) tun_tx_write_elapsed_us: u64,
+    pub(crate) tun_tx_write_max_us: u64,
     pub(crate) local_to_remote_bytes: u64,
     pub(crate) remote_to_local_bytes: u64,
     pub(crate) ssh_opened: u64,
@@ -38,6 +41,12 @@ pub(crate) struct TunnelStats {
     pub(crate) pruned_flows: u64,
     pub(crate) bridge_backpressure_events: u64,
     pub(crate) bridge_send_failures: u64,
+    pub(crate) bridge_event_batches: u64,
+    pub(crate) bridge_event_batch_events: u64,
+    pub(crate) bridge_event_batch_max: u64,
+    pub(crate) bridge_event_batch_elapsed_us: u64,
+    pub(crate) bridge_event_batch_max_us: u64,
+    pub(crate) bridge_event_batch_pauses: u64,
     pub(crate) remote_backlog_overflows: u64,
     pub(crate) stale_bridge_events: u64,
 }
@@ -52,6 +61,9 @@ impl TunnelStats {
             tun_tx_bytes: 0,
             tun_tx_dropped_packets: 0,
             tun_tx_dropped_bytes: 0,
+            tun_tx_write_calls: 0,
+            tun_tx_write_elapsed_us: 0,
+            tun_tx_write_max_us: 0,
             local_to_remote_bytes: 0,
             remote_to_local_bytes: 0,
             ssh_opened: 0,
@@ -74,6 +86,12 @@ impl TunnelStats {
             pruned_flows: 0,
             bridge_backpressure_events: 0,
             bridge_send_failures: 0,
+            bridge_event_batches: 0,
+            bridge_event_batch_events: 0,
+            bridge_event_batch_max: 0,
+            bridge_event_batch_elapsed_us: 0,
+            bridge_event_batch_max_us: 0,
+            bridge_event_batch_pauses: 0,
             remote_backlog_overflows: 0,
             stale_bridge_events: 0,
         }
@@ -93,6 +111,11 @@ impl TunnelStats {
         self.tun_tx_dropped_bytes = self
             .tun_tx_dropped_bytes
             .saturating_add(write.dropped_bytes);
+        self.tun_tx_write_calls = self.tun_tx_write_calls.saturating_add(write.write_calls);
+        self.tun_tx_write_elapsed_us = self
+            .tun_tx_write_elapsed_us
+            .saturating_add(write.write_elapsed_us);
+        self.tun_tx_write_max_us = self.tun_tx_write_max_us.max(write.write_max_us);
     }
 
     pub(crate) fn record_dns_delivery(&mut self, remote_ok: bool, write: TunWriteStats) {
@@ -153,6 +176,27 @@ impl TunnelStats {
             .saturating_add(stats.deferred_open_limit);
     }
 
+    pub(crate) fn record_bridge_event_batch(
+        &mut self,
+        handled: usize,
+        elapsed: Duration,
+        paused_by_backlog: bool,
+    ) {
+        self.bridge_event_batches = self.bridge_event_batches.saturating_add(1);
+        self.bridge_event_batch_events = self
+            .bridge_event_batch_events
+            .saturating_add(handled as u64);
+        self.bridge_event_batch_max = self.bridge_event_batch_max.max(handled as u64);
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.bridge_event_batch_elapsed_us = self
+            .bridge_event_batch_elapsed_us
+            .saturating_add(elapsed_us);
+        self.bridge_event_batch_max_us = self.bridge_event_batch_max_us.max(elapsed_us);
+        if paused_by_backlog {
+            self.bridge_event_batch_pauses = self.bridge_event_batch_pauses.saturating_add(1);
+        }
+    }
+
     pub(crate) fn record_dns_response(&mut self, remote_ok: bool) {
         if remote_ok {
             self.dns_ok = self.dns_ok.saturating_add(1);
@@ -176,7 +220,7 @@ impl TunnelStats {
             .unwrap_or(0);
 
         format!(
-            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} backlog_overflow:{} stale_bridge:{}",
+            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
             format_duration(self.started_at.elapsed()),
             snapshot.tcp.active_flows,
             snapshot.tcp.ssh_channels,
@@ -188,6 +232,9 @@ impl TunnelStats {
             format_bytes(self.tun_tx_bytes),
             self.tun_tx_dropped_packets,
             format_bytes(self.tun_tx_dropped_bytes),
+            self.tun_tx_write_calls,
+            self.tun_tx_write_elapsed_us,
+            self.tun_tx_write_max_us,
             format_bytes(self.local_to_remote_bytes),
             format_bytes(self.remote_to_local_bytes),
             self.dns_forwarded,
@@ -225,6 +272,12 @@ impl TunnelStats {
             self.pruned_flows,
             self.bridge_backpressure_events,
             self.bridge_send_failures,
+            self.bridge_event_batches,
+            self.bridge_event_batch_events,
+            self.bridge_event_batch_max,
+            self.bridge_event_batch_elapsed_us,
+            self.bridge_event_batch_max_us,
+            self.bridge_event_batch_pauses,
             self.remote_backlog_overflows,
             self.stale_bridge_events,
         )
@@ -318,7 +371,12 @@ mod tests {
             bytes: 2048,
             dropped_packets: 1,
             dropped_bytes: 512,
+            write_calls: 3,
+            write_elapsed_us: 77,
+            write_max_us: 55,
         });
+        stats.record_bridge_event_batch(31, Duration::from_micros(123), false);
+        stats.record_bridge_event_batch(32, Duration::from_micros(456), true);
 
         let line = stats.status_line(TunnelStatusSnapshot {
             tcp: TcpRuntimeSnapshot {
@@ -357,6 +415,7 @@ mod tests {
         assert!(line.contains("active_flows=1 ssh_channels=1 backlog_flows=0"));
         assert!(line.contains("tun_tx=2/2.0KiB"));
         assert!(line.contains("tun_drop=1/512B"));
+        assert!(line.contains("tun_write=calls:3 total_us:77 max_us:55"));
         assert!(line.contains("tcp_l2r=1.0KiB tcp_r2l=6B"));
         assert!(line.contains("dns=fwd:0 ok:0 fail:0 drop:0 inflight:0"));
         assert!(line.contains("udp=fwd:0 ok:0 fail:0 drop:0 active:0"));
@@ -368,5 +427,8 @@ mod tests {
             "agent_lanes=total:4 desired:4 ok:1 fail:1 missing:1 quarantine:1 repairing:1 active:7 max_load:4 max_quarantine_ms:250"
         ));
         assert!(line.contains("bridge_backpressure:4"));
+        assert!(line.contains(
+            "bridge_event_batch=count:2 events:63 max:32 total_us:579 max_us:456 paused:1"
+        ));
     }
 }

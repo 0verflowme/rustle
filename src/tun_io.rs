@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -68,9 +68,10 @@ impl<'a> TunWriter<'a> {
     ) -> Result<TunWriteStats> {
         let len = packet.len();
         let mut stats = TunWriteStats::default();
+        let started_at = Instant::now();
         match tokio::time::timeout(TUN_WRITE_TIMEOUT, self.dev.send(packet)).await {
             Ok(Ok(_)) => {
-                stats.record_written(len);
+                stats.record_written(len, elapsed_us(started_at));
             }
             Ok(Err(err)) => {
                 return Err(err)
@@ -81,11 +82,15 @@ impl<'a> TunWriter<'a> {
                     "tun: dropping {len}-byte {description} after {}ms waiting for TUN write",
                     TUN_WRITE_TIMEOUT.as_millis()
                 );
-                stats.record_dropped(len);
+                stats.record_dropped(len, elapsed_us(started_at));
             }
         }
         Ok(stats)
     }
+}
+
+fn elapsed_us(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn dns_response_packet_for_event(event: DnsResponseEvent) -> Result<Option<Vec<u8>>> {

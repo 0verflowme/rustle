@@ -384,7 +384,9 @@ fn handle_bridge_event_batch(
     first: ssh_bridge::BridgeEvent,
     event_rx: &mut tokio::sync::mpsc::Receiver<ssh_bridge::BridgeEvent>,
 ) -> Result<usize> {
+    let started_at = StdInstant::now();
     let mut handled = 0_usize;
+    let mut paused_by_backlog = false;
     let mut next = Some(first);
     while handled < BRIDGE_EVENT_BATCH_LIMIT {
         let event = if let Some(event) = next.take() {
@@ -399,9 +401,11 @@ fn handle_bridge_event_batch(
         engine.handle_bridge_event(event)?;
         handled += 1;
         if engine.should_pause_bridge_events() {
+            paused_by_backlog = true;
             break;
         }
     }
+    engine.record_bridge_event_batch(handled, started_at.elapsed(), paused_by_backlog);
     Ok(handled)
 }
 

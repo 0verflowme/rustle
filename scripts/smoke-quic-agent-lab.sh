@@ -55,7 +55,7 @@ if [[ "$received_markers" != "$BRIDGE_CONNECTIONS" ]]; then
   smoke_die "QUIC agent bridge-lab smoke received ${received_markers} expected markers, wanted ${BRIDGE_CONNECTIONS}"
 fi
 
-if ! grep -q 'quic-agent: connecting UDP data plane to' "$ERR"; then
+if ! grep -q 'quic-agent: connecting UDP data plane role=quic-agent .*bootstrap_port=.*resolved_addrs=' "$ERR"; then
   sed 's/^/rustle stderr: /' "$ERR" >&2 || true
   sed 's/^/rustle stdout: /' "$OUT" >&2 || true
   smoke_die "QUIC agent smoke did not prove UDP data-plane bootstrap"

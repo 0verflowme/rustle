@@ -569,6 +569,14 @@ include payload bytes.
 `scripts/bench-live-compare.sh` prints the summary to stderr during cleanup when
 traced flow lines exist; set `RUSTLE_BENCH_KEEP_LOGS=1` when you also want to
 keep the raw per-run `rustle.log` files.
+
+The regular `stats:` line also carries live drain counters for untraced runs:
+`tun_write=calls:<n> total_us:<n> max_us:<n>` reports TUN write pressure, and
+`bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
+supervisor bridge-event batch pressure and backlog pauses.
+Use those fields with hotpath `remote_event_wait` and `body_drain` when deciding
+whether a WAN throughput failure is in the data plane, packet engine, smoltcp
+drain, or TUN device writes.
 `scripts/verify-release-candidate.sh` enables `RUSTLE_HOTPATH_TRACE=1` by
 default and writes compact live benchmark artifacts under
 `target/live-evidence/release-candidate-<timestamp>` unless
@@ -634,6 +642,11 @@ SSH-agent UDP path. Set `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` when
 you specifically want to prove that the remote network allows Rustle's
 SSH-bootstrapped UDP/QUIC helper data plane; that run should fail clearly when
 inbound UDP to the helper port is blocked.
+QUIC-native live runs emit structured `quic-connect:` and `quic-auth:` lines
+with stage, result, elapsed time, local UDP bind, certificate fingerprint, and
+auth-token SHA-256 prefix. Summarize them with
+`scripts/summarize-quic-diagnostics.py` to distinguish UDP reachability,
+certificate/bootstrap, and auth-stream failures without exposing raw tokens.
 When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
 alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific
