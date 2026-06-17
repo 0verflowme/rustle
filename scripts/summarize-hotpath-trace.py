@@ -55,10 +55,25 @@ def percentile(values: list[int], percentile_value: float) -> int | None:
     return ordered[index]
 
 
+def percentile_float(values: list[float], percentile_value: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = int((len(ordered) * percentile_value + 99) // 100)
+    index = min(max(rank, 1), len(ordered)) - 1
+    return ordered[index]
+
+
 def format_ms(value_us: int | None) -> str:
     if value_us is None:
         return "-"
     return f"{value_us / 1000:.3f}"
+
+
+def format_float(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
 
 
 def parse_optional_us(value: str) -> int | None:
@@ -89,6 +104,15 @@ def nonnegative_delta(row: dict[str, str], start_field: str, end_field: str) -> 
     if start is None or end is None or end < start:
         return None
     return end - start
+
+
+def flow_throughput_mib_s(row: dict[str, str]) -> float | None:
+    duration_us = parse_optional_us(row["duration_us"])
+    if duration_us is None or duration_us <= 0:
+        return None
+    return (parse_counter(row["remote_bytes"], "remote_bytes") / (1024 * 1024)) / (
+        duration_us / 1_000_000
+    )
 
 
 def parse_trace_line(line: str) -> dict[str, str] | None:
@@ -208,6 +232,10 @@ def summarize(text: str) -> list[dict[str, object]]:
         )[1]
         remote_bytes = sum(int(row["remote_bytes"]) for row in rows)
         local_bytes = sum(int(row["local_bytes"]) for row in rows)
+        remote_byte_values = [parse_counter(row["remote_bytes"], "remote_bytes") for row in rows]
+        flow_throughput_values = [
+            value for row in rows if (value := flow_throughput_mib_s(row)) is not None
+        ]
         ready_wait_total = sum(ready_wait_values)
         local_send_waits = sum(
             parse_counter(row["local_send_waits"], "local_send_waits")
@@ -250,6 +278,8 @@ def summarize(text: str) -> list[dict[str, object]]:
                 - sum(outcomes[outcome] for outcome in SUCCESS_OUTCOMES),
                 "local_bytes": local_bytes,
                 "remote_bytes": remote_bytes,
+                "remote_bytes_min": min(remote_byte_values, default=0),
+                "remote_bytes_p50": percentile(remote_byte_values, 50) or 0,
                 "stream_ready_p50_ms": format_ms(percentile(timing_values["stream_ready_us"], 50)),
                 "opened_p50_ms": format_ms(percentile(timing_values["opened_us"], 50)),
                 "first_local_p50_ms": format_ms(percentile(timing_values["first_local_us"], 50)),
@@ -284,6 +314,15 @@ def summarize(text: str) -> list[dict[str, object]]:
                 "remote_event_waits": remote_event_waits,
                 "duration_p50_ms": format_ms(percentile(duration_values, 50)),
                 "duration_p95_ms": format_ms(percentile(duration_values, 95)),
+                "flow_throughput_min_mib_s": format_float(
+                    min(flow_throughput_values) if flow_throughput_values else None
+                ),
+                "flow_throughput_p50_mib_s": format_float(
+                    percentile_float(flow_throughput_values, 50)
+                ),
+                "flow_throughput_p95_mib_s": format_float(
+                    percentile_float(flow_throughput_values, 95)
+                ),
                 "avg_flow_throughput_mib_s": f"{avg_flow_throughput:.2f}",
                 "likely_bottleneck": likely_bottleneck,
                 "outcomes": ",".join(
@@ -302,6 +341,8 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "failed_flows",
         "local_bytes",
         "remote_bytes",
+        "remote_bytes_min",
+        "remote_bytes_p50",
         "stream_ready_p50_ms",
         "opened_p50_ms",
         "first_local_p50_ms",
@@ -330,6 +371,9 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "remote_event_waits",
         "duration_p50_ms",
         "duration_p95_ms",
+        "flow_throughput_min_mib_s",
+        "flow_throughput_p50_mib_s",
+        "flow_throughput_p95_mib_s",
         "avg_flow_throughput_mib_s",
         "likely_bottleneck",
         "outcomes",
@@ -370,6 +414,8 @@ def self_test() -> None:
     assert agent["ok_flows"] == 2
     assert agent["failed_flows"] == 0
     assert agent["remote_bytes"] == 3072
+    assert agent["remote_bytes_min"] == 1024
+    assert agent["remote_bytes_p50"] == 1024
     assert agent["first_remote_p50_ms"] == "10.000"
     assert agent["first_remote_p95_ms"] == "30.000"
     assert agent["remote_open_wait_p50_ms"] == "1.000"
@@ -392,6 +438,9 @@ def self_test() -> None:
     assert agent["remote_event_wait_p50_ms"] == "5.000"
     assert agent["remote_event_wait_total_ms"] == "14.000"
     assert agent["remote_event_waits"] == 3
+    assert agent["flow_throughput_min_mib_s"] == "0.04"
+    assert agent["flow_throughput_p50_mib_s"] == "0.04"
+    assert agent["flow_throughput_p95_mib_s"] == "0.05"
     assert agent["likely_bottleneck"] == "body_drain"
     assert agent["outcomes"] == "closed:1,remote_eof:1"
     native = next(summary for summary in summaries if summary["transport"] == "quic-native")

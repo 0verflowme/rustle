@@ -1255,6 +1255,7 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
 REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "rustle_hotpath_tcp",
     "paths",
+    "remote_bytes_min",
     "remote_open_wait_p50_ms",
     "ready_wait_p50_ms",
     "payload_queue_wait_p50_ms",
@@ -1266,6 +1267,7 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "agent_send_outbound_wait_p50_ms",
     "remote_event_wait_p50_ms",
     "likely_bottleneck",
+    "flow_throughput_min_mib_s",
     "first_remote_p95_ms",
     "avg_flow_throughput_mib_s",
     "--self-test",

@@ -562,16 +562,17 @@ RUSTLE_HOTPATH_TRACE=1 scripts/bench-live-fixture.sh
 
 The summary groups flows by transport and reports `stream_ready`, `opened`,
 first local payload, first local payload sent, first remote byte, duration,
-bytes, and outcomes. It also derives `remote_open_wait`, `ready_wait`,
-`payload_queue_wait`, `first_byte_wait`, `body_drain`, cumulative `local_send_wait`,
-`local_queue_wait`, framed-agent `agent_send_credit_wait` and
+bytes, per-flow byte distribution, per-flow throughput distribution, and
+outcomes. It also derives `remote_open_wait`, `ready_wait`,
+`payload_queue_wait`, `first_byte_wait`, `body_drain`, cumulative
+`local_send_wait`, `local_queue_wait`, framed-agent `agent_send_credit_wait` and
 `agent_send_outbound_wait`, `remote_event_wait`, and a `likely_bottleneck`
 label. Use those derived terms to decide which fix comes first: remote open
 latency, packet-engine bridge admission delay, delayed first payload forwarding,
 local bridge queueing, remote first-byte delay, flow duration/windowing,
-framed-agent flow-control credit, framed-agent outbound queue pressure,
-supervisor event pressure, or failed/reset flows. The trace is deliberately
-opt-in and does not include payload bytes.
+per-flow starvation, framed-agent flow-control credit, framed-agent outbound
+queue pressure, supervisor event pressure, or failed/reset flows. The trace is
+deliberately opt-in and does not include payload bytes.
 `scripts/bench-live-compare.sh` prints the summary to stderr during cleanup when
 traced flow lines exist; set `RUSTLE_BENCH_KEEP_LOGS=1` when you also want to
 keep the raw per-run `rustle.log` files.
