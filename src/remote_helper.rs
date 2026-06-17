@@ -5,11 +5,13 @@ use std::process::Command;
 #[cfg(test)]
 use std::time::{Duration, Instant as StdInstant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use ring::digest;
 use russh::client::Handle;
 use tokio::io::AsyncReadExt;
 
+use crate::remote_exec::run_remote_command_collect;
+use crate::remote_platform::{probe_remote_platform, RemotePlatform};
 use crate::sidecar_store::local_helper_binary_for_platform;
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 use crate::transport_model::BridgeTransportKind;
@@ -17,9 +19,6 @@ use crate::transport_model::BridgeTransportKind;
 pub(crate) const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
 pub(crate) const DEFAULT_QUIC_AGENT_COMMAND: &str = "rustle quic-agent";
 pub(crate) const DEFAULT_QUIC_BRIDGE_AGENT_COMMAND: &str = "rustle quic-bridge-agent";
-pub(crate) const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str =
-    "uname -s 2>/dev/null; uname -m 2>/dev/null";
-pub(crate) const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
 pub(crate) const POSIX_REMOTE_AGENT_UPLOAD_COMMAND: &str = "set -eu; umask 077; base=${TMPDIR:-/tmp}; dir=; cleanup() { [ -n \"$dir\" ] && rm -rf \"$dir\"; }; trap cleanup EXIT HUP INT TERM; dir=$(mktemp -d \"$base/rustle-agent.XXXXXX\"); chmod 700 \"$dir\"; p=\"$dir/rustle-agent\"; cat > \"$p\"; chmod 700 \"$p\"; trap - EXIT HUP INT TERM; printf '%s\\n' \"$p\"";
 pub(crate) const WINDOWS_REMOTE_AGENT_UPLOAD_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Stop'; $d=$env:TEMP; if ([string]::IsNullOrWhiteSpace($d)) { $d=$env:TMP }; if ([string]::IsNullOrWhiteSpace($d)) { $d=[IO.Path]::GetTempPath() }; $dir=Join-Path -Path $d -ChildPath ('rustle-agent-{0}-{1}' -f $PID,[Guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $dir -Force | Out-Null; $p=Join-Path -Path $dir -ChildPath 'rustle-agent.exe'; $stdin=[Console]::OpenStandardInput(); try { $out=[IO.File]::Open($p,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None); try { $stdin.CopyTo($out) } finally { $out.Dispose(); $stdin.Dispose() } } catch { Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue; throw }; [Console]::Out.WriteLine($p)\"";
 
@@ -199,34 +198,6 @@ impl BootstrapPolicy {
 pub(crate) struct BootstrappedHelper {
     pub(crate) handle: Handle<Client>,
     pub(crate) helper: UploadedHelperCommand,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RemotePlatform {
-    pub(crate) os: &'static str,
-    pub(crate) arch: &'static str,
-}
-
-impl RemotePlatform {
-    pub(crate) fn local() -> Result<Self> {
-        let os = normalize_local_os(env::consts::OS)
-            .ok_or_else(|| anyhow!("local OS {} is not supported for upload", env::consts::OS))?;
-        let arch = normalize_local_arch(env::consts::ARCH).ok_or_else(|| {
-            anyhow!(
-                "local architecture {} is not supported for upload",
-                env::consts::ARCH
-            )
-        })?;
-        Ok(Self { os, arch })
-    }
-
-    pub(crate) fn is_windows(self) -> bool {
-        self.os == "windows"
-    }
-
-    pub(crate) fn label(self) -> String {
-        format!("{}/{}", self.os, self.arch)
-    }
 }
 
 #[cfg(test)]
@@ -467,107 +438,6 @@ fn lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-pub(crate) async fn probe_remote_platform(handle: &Handle<Client>) -> Result<RemotePlatform> {
-    match run_remote_command_collect(handle, POSIX_REMOTE_PLATFORM_PROBE_COMMAND, None).await {
-        Ok(output) if output.exit_status == Some(0) => {
-            if let Ok(platform) = parse_remote_platform_probe(&output.stdout) {
-                return Ok(platform);
-            }
-        }
-        _ => {}
-    }
-
-    let output = run_remote_command_collect(handle, WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND, None)
-        .await
-        .context("failed to probe remote platform")?;
-    output.ensure_success("remote platform probe")?;
-    parse_remote_platform_probe(&output.stdout)
-}
-
-pub(crate) fn parse_remote_platform_probe(stdout: &[u8]) -> Result<RemotePlatform> {
-    let stdout =
-        String::from_utf8(stdout.to_vec()).context("remote platform probe was not valid UTF-8")?;
-    let mut lines = stdout.lines();
-    let remote_os = lines
-        .next()
-        .and_then(normalize_remote_os)
-        .ok_or_else(|| anyhow!("remote OS probe did not return a supported OS"))?;
-    let remote_arch = lines
-        .next()
-        .and_then(normalize_remote_arch)
-        .ok_or_else(|| anyhow!("remote architecture probe did not return a supported arch"))?;
-
-    Ok(RemotePlatform {
-        os: remote_os,
-        arch: remote_arch,
-    })
-}
-
-pub(crate) struct RemoteCommandOutput {
-    pub(crate) stdout: Vec<u8>,
-    pub(crate) stderr: Vec<u8>,
-    pub(crate) exit_status: Option<u32>,
-}
-
-impl RemoteCommandOutput {
-    pub(crate) fn ensure_success(&self, context: &str) -> Result<()> {
-        if self.exit_status == Some(0) {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&self.stderr);
-        bail!(
-            "{context} failed with exit status {:?}: {}",
-            self.exit_status,
-            stderr.trim()
-        );
-    }
-}
-
-pub(crate) async fn run_remote_command_collect(
-    handle: &Handle<Client>,
-    command: &str,
-    input: Option<tokio::fs::File>,
-) -> Result<RemoteCommandOutput> {
-    let mut channel = handle
-        .channel_open_session()
-        .await
-        .context("failed to open SSH session channel")?;
-    channel
-        .exec(true, command.as_bytes().to_vec())
-        .await
-        .with_context(|| format!("failed to exec remote command: {command}"))?;
-
-    if let Some(file) = input {
-        channel
-            .data(file)
-            .await
-            .context("failed to write remote command stdin")?;
-    }
-    channel
-        .eof()
-        .await
-        .context("failed to close remote command stdin")?;
-
-    let mut output = RemoteCommandOutput {
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        exit_status: None,
-    };
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            russh::ChannelMsg::Data { data } => output.stdout.extend_from_slice(&data),
-            russh::ChannelMsg::ExtendedData { data, .. } => {
-                output.stderr.extend_from_slice(&data);
-            }
-            russh::ChannelMsg::ExitStatus { exit_status } => {
-                output.exit_status = Some(exit_status);
-            }
-            _ => {}
-        }
-    }
-    Ok(output)
-}
-
 pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -642,49 +512,6 @@ fn remote_helper_command_plan(
 
 pub(crate) fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
-}
-
-fn normalize_local_os(value: &str) -> Option<&'static str> {
-    match value {
-        "linux" => Some("linux"),
-        "macos" => Some("macos"),
-        "windows" => Some("windows"),
-        _ => None,
-    }
-}
-
-pub(crate) fn normalize_remote_os(value: &str) -> Option<&'static str> {
-    let value = value.trim();
-    match value {
-        "Linux" => Some("linux"),
-        "Darwin" => Some("macos"),
-        "Windows" => Some("windows"),
-        _ if value.starts_with("MINGW64_NT")
-            || value.starts_with("MINGW32_NT")
-            || value.starts_with("MSYS_NT")
-            || value.starts_with("CYGWIN_NT") =>
-        {
-            Some("windows")
-        }
-        _ => None,
-    }
-}
-
-fn normalize_local_arch(value: &str) -> Option<&'static str> {
-    match value {
-        "x86_64" => Some("x86_64"),
-        "aarch64" => Some("aarch64"),
-        _ => None,
-    }
-}
-
-pub(crate) fn normalize_remote_arch(value: &str) -> Option<&'static str> {
-    let value = value.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "x86_64" | "amd64" => Some("x86_64"),
-        "aarch64" | "arm64" => Some("aarch64"),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1555,39 +1382,5 @@ mod tests {
         ] {
             assert_refcounted_cleanup_for_kind(kind);
         }
-    }
-
-    #[test]
-    fn platform_probe_normalizes_common_uname_values() {
-        assert_eq!(normalize_remote_os("Linux"), Some("linux"));
-        assert_eq!(normalize_remote_os("Darwin"), Some("macos"));
-        assert_eq!(normalize_remote_os("Windows"), Some("windows"));
-        assert_eq!(normalize_remote_os("MINGW64_NT-10.0"), Some("windows"));
-        assert_eq!(normalize_remote_arch("x86_64"), Some("x86_64"));
-        assert_eq!(normalize_remote_arch("amd64"), Some("x86_64"));
-        assert_eq!(normalize_remote_arch("AMD64"), Some("x86_64"));
-        assert_eq!(normalize_remote_arch("arm64"), Some("aarch64"));
-        assert_eq!(normalize_remote_arch("ARM64"), Some("aarch64"));
-        assert_eq!(normalize_remote_arch("aarch64"), Some("aarch64"));
-        assert_eq!(normalize_remote_os("Plan9"), None);
-        assert_eq!(normalize_remote_arch("riscv64"), None);
-    }
-
-    #[test]
-    fn platform_probe_parser_accepts_unix_and_windows_outputs() {
-        assert_eq!(
-            parse_remote_platform_probe(b"Linux\nx86_64\n").unwrap(),
-            RemotePlatform {
-                os: "linux",
-                arch: "x86_64",
-            }
-        );
-        assert_eq!(
-            parse_remote_platform_probe(b"Windows\r\nAMD64\r\n").unwrap(),
-            RemotePlatform {
-                os: "windows",
-                arch: "x86_64",
-            }
-        );
     }
 }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 
-use crate::remote_helper::RemotePlatform;
+use crate::remote_platform::RemotePlatform;
 
 pub(crate) const RUSTLE_AGENT_DIR_ENV: &str = "RUSTLE_AGENT_DIR";
 
