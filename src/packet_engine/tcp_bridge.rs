@@ -28,6 +28,9 @@ pub(crate) struct LocalDrainStats {
     pub(crate) bytes_to_bridge: u64,
     pub(crate) bridge_backpressure_events: u64,
     pub(crate) bridge_send_failures: u64,
+    pub(crate) tcp_recv_queue_wait_us: u64,
+    pub(crate) tcp_recv_queue_wait_max_us: u64,
+    pub(crate) tcp_recv_queue_waits: u64,
 }
 
 #[cfg(test)]
@@ -158,6 +161,7 @@ pub(crate) fn drain_local_bytes_to_bridges(
     flow_manager: &mut tcp_core::FlowManager,
     bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
     flow_keys: &mut Vec<tcp_core::FlowKey>,
+    now: SmolInstant,
 ) -> Result<LocalDrainStats> {
     let mut stats = LocalDrainStats::default();
     flow_manager.flow_keys_into(flow_keys);
@@ -189,15 +193,27 @@ pub(crate) fn drain_local_bytes_to_bridges(
             continue;
         }
 
-        let bytes = flow_manager.recv_flow_bytes(flow, remaining_bridge_bytes.min(16 * 1024))?;
+        let flow_bytes = flow_manager.recv_flow_bytes_with_metrics(
+            flow,
+            remaining_bridge_bytes.min(16 * 1024),
+            now,
+        )?;
+        let bytes = flow_bytes.bytes;
         if bytes.is_empty() {
             continue;
         }
 
         let len = bytes.len() as u64;
-        match bridge.try_send_local_data(bytes) {
+        match bridge.try_send_local_data_with_metrics(bytes, flow_bytes.tcp_recv_queue_wait_us) {
             Ok(true) => {
                 stats.bytes_to_bridge = stats.bytes_to_bridge.saturating_add(len);
+                if let Some(wait_us) = flow_bytes.tcp_recv_queue_wait_us {
+                    stats.tcp_recv_queue_wait_us =
+                        stats.tcp_recv_queue_wait_us.saturating_add(wait_us);
+                    stats.tcp_recv_queue_wait_max_us =
+                        stats.tcp_recv_queue_wait_max_us.max(wait_us);
+                    stats.tcp_recv_queue_waits = stats.tcp_recv_queue_waits.saturating_add(1);
+                }
             }
             Ok(false) => {
                 eprintln!(
@@ -407,7 +423,7 @@ mod tests {
     use bytes::Bytes;
     use smoltcp::socket::tcp;
     use smoltcp::time::Instant as SmolInstant;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::super::backlog::REMOTE_BACKLOG_BYTES_PER_FLOW;
     use super::*;
@@ -1203,7 +1219,7 @@ mod tests {
 
         let mut bridges = HashMap::new();
         let mut flow_keys = Vec::new();
-        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys)
+        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys, now)
             .expect("drain local bytes");
 
         assert_eq!(stats.bytes_to_bridge, 0);
@@ -1211,6 +1227,120 @@ mod tests {
         assert!(manager.snapshots().iter().any(|snapshot| {
             snapshot.key == flow && snapshot.state == tcp_core::FlowState::Reset
         }));
+    }
+
+    #[tokio::test]
+    async fn local_drain_records_tcp_recv_queue_wait() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let (iface, device, sockets, handle) = synthetic_lab_client(
+            client_ip,
+            DEFAULT_TUN_IP,
+            destination_ip,
+            destination_port,
+            client_port,
+        )
+        .expect("synthetic client");
+        let mut clients = vec![BridgeLabClient {
+            flow,
+            client_ip,
+            client_port,
+            iface,
+            device,
+            sockets,
+            handle,
+            sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
+            saw_bridge_close: false,
+            response: Vec::new(),
+        }];
+        let mut now = SmolInstant::from_millis(0);
+
+        for _ in 0..256 {
+            let packets = {
+                let client = &mut clients[0];
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+                drain_lab_client_to_manager(now, client, &mut manager).expect("drain client")
+            };
+            route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+                .expect("route packets");
+            pump_lab_manager_to_clients(now, &mut manager, &mut clients).expect("pump manager");
+
+            if manager.snapshots().iter().any(|snapshot| {
+                snapshot.key == flow && snapshot.state == tcp_core::FlowState::TcpEstablished
+            }) {
+                break;
+            }
+            now += smoltcp::time::Duration::from_millis(1);
+        }
+
+        let request = b"GET /queued HTTP/1.1\r\n\r\n";
+        {
+            let client = &mut clients[0];
+            let socket = client.sockets.get_mut::<tcp::Socket>(client.handle);
+            socket.send_slice(request).expect("client send");
+        }
+        let packets = {
+            let client = &mut clients[0];
+            client
+                .iface
+                .poll(now, &mut client.device, &mut client.sockets);
+            drain_lab_client_to_manager(now, client, &mut manager).expect("drain request")
+        };
+        route_lab_packets_to_clients(now, packets, &mut clients, &mut manager)
+            .expect("route request packets");
+        assert_eq!(
+            manager.recv_queue_len(flow).expect("queued local bytes"),
+            request.len()
+        );
+
+        let id = manager.flow_id(flow).expect("flow id");
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (received_tx, received_rx) = oneshot::channel();
+        let bridge = ssh_bridge::spawn_bridge_task(
+            id,
+            event_tx,
+            move |_id, mut local_rx, _event_tx| async move {
+                let local = local_rx
+                    .recv_with_metrics()
+                    .await
+                    .expect("queued local data");
+                received_tx
+                    .send((local.bytes, local.tcp_recv_queue_wait_us))
+                    .expect("report local data");
+                std::future::pending::<()>().await;
+            },
+        );
+        let mut bridges = HashMap::from([(flow, bridge)]);
+        let mut flow_keys = Vec::new();
+        now += smoltcp::time::Duration::from_millis(7);
+
+        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys, now)
+            .expect("drain local bytes");
+
+        assert_eq!(stats.bytes_to_bridge, request.len() as u64);
+        assert_eq!(stats.tcp_recv_queue_wait_us, 7_000);
+        assert_eq!(stats.tcp_recv_queue_wait_max_us, 7_000);
+        assert_eq!(stats.tcp_recv_queue_waits, 1);
+        let (bytes, wait_us) = tokio::time::timeout(std::time::Duration::from_secs(1), received_rx)
+            .await
+            .expect("bridge should receive local data")
+            .expect("bridge should report local data");
+        assert_eq!(bytes, Bytes::copy_from_slice(request));
+        assert_eq!(wait_us, Some(7_000));
     }
 
     #[tokio::test]
@@ -1293,7 +1423,7 @@ mod tests {
         let before = manager.recv_queue_len(flow).expect("queued local bytes");
         assert!(before > 0);
 
-        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys)
+        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys, now)
             .expect("drain local bytes");
 
         assert_eq!(stats.bytes_to_bridge, 0);
@@ -1408,7 +1538,7 @@ mod tests {
         let before = manager.recv_queue_len(flow).expect("queued local bytes");
         assert!(before > 0);
 
-        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys)
+        let stats = drain_local_bytes_to_bridges(&mut manager, &mut bridges, &mut flow_keys, now)
             .expect("drain should not block or fail");
 
         assert_eq!(stats.bytes_to_bridge, 0);

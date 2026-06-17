@@ -42,12 +42,22 @@ impl FlowBridge {
         self.queued_local_bytes.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub fn try_send_local_data(&self, bytes: impl Into<Bytes>) -> Result<bool> {
+        self.try_send_local_data_with_metrics(bytes, None)
+    }
+
+    pub fn try_send_local_data_with_metrics(
+        &self,
+        bytes: impl Into<Bytes>,
+        tcp_recv_queue_wait_us: Option<u64>,
+    ) -> Result<bool> {
         let bytes = bytes.into();
         let queued = match QueuedLocalData::try_new(
             bytes,
             Arc::clone(&self.queued_local_bytes),
             self.max_local_queue_bytes,
+            tcp_recv_queue_wait_us,
         ) {
             Some(queued) => queued,
             None => return Ok(false),
@@ -125,6 +135,7 @@ pub struct LocalDataReceiver {
 pub struct ReceivedLocalData {
     pub bytes: Bytes,
     pub queue_wait_us: u128,
+    pub tcp_recv_queue_wait_us: Option<u64>,
 }
 
 impl LocalDataReceiver {
@@ -136,10 +147,12 @@ impl LocalDataReceiver {
     pub async fn recv_with_metrics(&mut self) -> Option<ReceivedLocalData> {
         let mut queued = self.rx.recv().await?;
         let queue_wait_us = queued.enqueued_at.elapsed().as_micros();
+        let tcp_recv_queue_wait_us = queued.tcp_recv_queue_wait_us;
         let bytes = queued.bytes.take()?;
         Some(ReceivedLocalData {
             bytes,
             queue_wait_us,
+            tcp_recv_queue_wait_us,
         })
     }
 }
@@ -149,6 +162,7 @@ struct QueuedLocalData {
     bytes: Option<Bytes>,
     len: usize,
     enqueued_at: Instant,
+    tcp_recv_queue_wait_us: Option<u64>,
     queued_bytes: Arc<AtomicUsize>,
 }
 
@@ -157,6 +171,7 @@ impl QueuedLocalData {
         bytes: Bytes,
         queued_bytes: Arc<AtomicUsize>,
         max_queue_bytes: usize,
+        tcp_recv_queue_wait_us: Option<u64>,
     ) -> Option<Self> {
         let len = bytes.len();
         let mut current = queued_bytes.load(Ordering::Relaxed);
@@ -176,6 +191,7 @@ impl QueuedLocalData {
                         bytes: Some(bytes),
                         len,
                         enqueued_at: Instant::now(),
+                        tcp_recv_queue_wait_us,
                         queued_bytes,
                     });
                 }
@@ -557,6 +573,42 @@ mod tests {
         }
 
         panic!("bridge did not release queued byte accounting after recv");
+    }
+
+    #[tokio::test]
+    async fn flow_bridge_carries_tcp_recv_queue_wait_metric() {
+        let flow = crate::tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(172, 16, 0, 9),
+            443,
+        );
+        let id = FlowId::new(flow, 1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (received_tx, received_rx) = oneshot::channel();
+        let bridge = spawn_bridge_task(
+            id,
+            event_tx,
+            move |_id, mut local_rx, _event_tx| async move {
+                let received = local_rx
+                    .recv_with_metrics()
+                    .await
+                    .expect("queued local data");
+                received_tx.send(received).expect("report local data");
+                std::future::pending::<()>().await;
+            },
+        );
+
+        assert!(bridge
+            .try_send_local_data_with_metrics(Bytes::from_static(b"request"), Some(12_345))
+            .expect("queue local bytes"));
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), received_rx)
+            .await
+            .expect("local data should be received")
+            .expect("local data report should succeed");
+        assert_eq!(received.bytes, Bytes::from_static(b"request"));
+        assert_eq!(received.tcp_recv_queue_wait_us, Some(12_345));
     }
 
     #[tokio::test]

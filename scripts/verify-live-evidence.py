@@ -21,6 +21,9 @@ HOTPATH_COLUMNS = {
     "remote_bytes_min",
     "ready_wait_p50_ms",
     "flow_throughput_min_mib_s",
+    "tcp_recv_queue_wait_p50_ms",
+    "tcp_recv_queue_wait_max_ms",
+    "tcp_recv_queue_wait_avg_ms",
     "local_queue_wait_p50_ms",
     "local_queue_wait_max_ms",
     "local_queue_wait_avg_ms",
@@ -217,6 +220,9 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "body_drain_p50_ms\tlocal_send_wait_p50_ms\t"
                     "local_send_wait_total_ms\tlocal_send_wait_max_ms\t"
                     "local_send_wait_avg_ms\tlocal_send_waits\t"
+                    "tcp_recv_queue_wait_p50_ms\ttcp_recv_queue_wait_total_ms\t"
+                    "tcp_recv_queue_wait_max_ms\ttcp_recv_queue_wait_avg_ms\t"
+                    "tcp_recv_queue_waits\t"
                     "local_queue_wait_p50_ms\tlocal_queue_wait_total_ms\t"
                     "local_queue_wait_max_ms\tlocal_queue_wait_avg_ms\t"
                     "local_queue_waits\t"
@@ -236,6 +242,7 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "agent\t2\t2\t0\t512\t4096\t2048\t2048\t0.100\t0.200\t0.300\t"
                     "0.400\t0.500\t0.700\t0.100\t0.050\t0.100\t0.100\t"
                     "0.100\t0.200\t"
+                    "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t-\t0\t"
                     "0.000\t0.000\t0.000\t0.000\t"

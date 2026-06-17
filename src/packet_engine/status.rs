@@ -47,6 +47,9 @@ pub(crate) struct TunnelStats {
     pub(crate) bridge_event_batch_elapsed_us: u64,
     pub(crate) bridge_event_batch_max_us: u64,
     pub(crate) bridge_event_batch_pauses: u64,
+    pub(crate) tcp_recv_queue_wait_us: u64,
+    pub(crate) tcp_recv_queue_wait_max_us: u64,
+    pub(crate) tcp_recv_queue_waits: u64,
     pub(crate) remote_backlog_overflows: u64,
     pub(crate) stale_bridge_events: u64,
 }
@@ -92,6 +95,9 @@ impl TunnelStats {
             bridge_event_batch_elapsed_us: 0,
             bridge_event_batch_max_us: 0,
             bridge_event_batch_pauses: 0,
+            tcp_recv_queue_wait_us: 0,
+            tcp_recv_queue_wait_max_us: 0,
+            tcp_recv_queue_waits: 0,
             remote_backlog_overflows: 0,
             stale_bridge_events: 0,
         }
@@ -165,6 +171,15 @@ impl TunnelStats {
         self.bridge_send_failures = self
             .bridge_send_failures
             .saturating_add(stats.bridge_send_failures);
+        self.tcp_recv_queue_wait_us = self
+            .tcp_recv_queue_wait_us
+            .saturating_add(stats.tcp_recv_queue_wait_us);
+        self.tcp_recv_queue_wait_max_us = self
+            .tcp_recv_queue_wait_max_us
+            .max(stats.tcp_recv_queue_wait_max_us);
+        self.tcp_recv_queue_waits = self
+            .tcp_recv_queue_waits
+            .saturating_add(stats.tcp_recv_queue_waits);
     }
 
     pub(crate) fn record_bridge_admission(&mut self, stats: BridgeAdmissionStats) {
@@ -220,7 +235,7 @@ impl TunnelStats {
             .unwrap_or(0);
 
         format!(
-            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
+            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
             format_duration(self.started_at.elapsed()),
             snapshot.tcp.active_flows,
             snapshot.tcp.ssh_channels,
@@ -272,6 +287,9 @@ impl TunnelStats {
             self.pruned_flows,
             self.bridge_backpressure_events,
             self.bridge_send_failures,
+            self.tcp_recv_queue_waits,
+            self.tcp_recv_queue_wait_us,
+            self.tcp_recv_queue_wait_max_us,
             self.bridge_event_batches,
             self.bridge_event_batch_events,
             self.bridge_event_batch_max,
@@ -365,6 +383,9 @@ mod tests {
             bytes_to_bridge: 1024,
             bridge_backpressure_events: 4,
             bridge_send_failures: 0,
+            tcp_recv_queue_wait_us: 11,
+            tcp_recv_queue_wait_max_us: 7,
+            tcp_recv_queue_waits: 2,
         });
         stats.record_tun_write(TunWriteStats {
             packets: 2,
@@ -427,6 +448,7 @@ mod tests {
             "agent_lanes=total:4 desired:4 ok:1 fail:1 missing:1 quarantine:1 repairing:1 active:7 max_load:4 max_quarantine_ms:250"
         ));
         assert!(line.contains("bridge_backpressure:4"));
+        assert!(line.contains("tcp_recv_queue_wait=count:2 total_us:11 max_us:7"));
         assert!(line.contains(
             "bridge_event_batch=count:2 events:63 max:32 total_us:579 max_us:456 paused:1"
         ));

@@ -179,10 +179,12 @@ impl TunnelEngine {
     }
 
     pub(crate) fn drain_local_bytes_to_bridges(&mut self) -> Result<LocalDrainStats> {
+        let now = self.now();
         let drain_stats = drain_local_bytes_to_bridges(
             &mut self.flow_manager,
             &mut self.bridges,
             &mut self.flow_keys,
+            now,
         )?;
         self.stats.record_local_drain(drain_stats);
         Ok(drain_stats)

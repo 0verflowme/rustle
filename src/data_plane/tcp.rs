@@ -311,6 +311,7 @@ where
                     match local {
                         Some(local) => {
                             let bytes = local.bytes;
+                            trace.tcp_recv_queue_wait(local.tcp_recv_queue_wait_us);
                             trace.local_queue_wait(local.queue_wait_us);
                             trace.local_bytes(bytes.len());
                             if !open_reported {

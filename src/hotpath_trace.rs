@@ -21,6 +21,9 @@ pub(crate) struct TcpFlowTrace {
     local_send_wait_us: u128,
     local_send_wait_max_us: u128,
     local_send_waits: u64,
+    tcp_recv_queue_wait_us: u128,
+    tcp_recv_queue_wait_max_us: u128,
+    tcp_recv_queue_waits: u64,
     local_queue_wait_us: u128,
     local_queue_wait_max_us: u128,
     local_queue_waits: u64,
@@ -50,6 +53,9 @@ struct TcpFlowTraceSummary {
     local_send_wait_us: u128,
     local_send_wait_max_us: u128,
     local_send_waits: u64,
+    tcp_recv_queue_wait_us: u128,
+    tcp_recv_queue_wait_max_us: u128,
+    tcp_recv_queue_waits: u64,
     local_queue_wait_us: u128,
     local_queue_wait_max_us: u128,
     local_queue_waits: u64,
@@ -83,6 +89,9 @@ impl TcpFlowTrace {
             local_send_wait_us: 0,
             local_send_wait_max_us: 0,
             local_send_waits: 0,
+            tcp_recv_queue_wait_us: 0,
+            tcp_recv_queue_wait_max_us: 0,
+            tcp_recv_queue_waits: 0,
             local_queue_wait_us: 0,
             local_queue_wait_max_us: 0,
             local_queue_waits: 0,
@@ -131,6 +140,19 @@ impl TcpFlowTrace {
         self.local_send_wait_us = self.local_send_wait_us.saturating_add(elapsed_us);
         self.local_send_wait_max_us = self.local_send_wait_max_us.max(elapsed_us);
         self.local_send_waits = self.local_send_waits.saturating_add(1);
+    }
+
+    pub(crate) fn tcp_recv_queue_wait(&mut self, queue_wait_us: Option<u64>) {
+        if !self.enabled {
+            return;
+        }
+        let Some(queue_wait_us) = queue_wait_us else {
+            return;
+        };
+        let queue_wait_us = u128::from(queue_wait_us);
+        self.tcp_recv_queue_wait_us = self.tcp_recv_queue_wait_us.saturating_add(queue_wait_us);
+        self.tcp_recv_queue_wait_max_us = self.tcp_recv_queue_wait_max_us.max(queue_wait_us);
+        self.tcp_recv_queue_waits = self.tcp_recv_queue_waits.saturating_add(1);
     }
 
     pub(crate) fn local_queue_wait(&mut self, queue_wait_us: u128) {
@@ -242,6 +264,9 @@ impl TcpFlowTrace {
                 local_send_wait_us: self.local_send_wait_us,
                 local_send_wait_max_us: self.local_send_wait_max_us,
                 local_send_waits: self.local_send_waits,
+                tcp_recv_queue_wait_us: self.tcp_recv_queue_wait_us,
+                tcp_recv_queue_wait_max_us: self.tcp_recv_queue_wait_max_us,
+                tcp_recv_queue_waits: self.tcp_recv_queue_waits,
                 local_queue_wait_us: self.local_queue_wait_us,
                 local_queue_wait_max_us: self.local_queue_wait_max_us,
                 local_queue_waits: self.local_queue_waits,
@@ -288,7 +313,7 @@ fn hotpath_trace_enabled() -> bool {
 fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
     let key = summary.id.key;
     format!(
-        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
+        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\ttcp_recv_queue_wait_us={}\ttcp_recv_queue_wait_max_us={}\ttcp_recv_queue_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
         summary.transport,
         key.src_ip,
         key.src_port,
@@ -307,6 +332,9 @@ fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
         summary.local_send_wait_us,
         summary.local_send_wait_max_us,
         summary.local_send_waits,
+        summary.tcp_recv_queue_wait_us,
+        summary.tcp_recv_queue_wait_max_us,
+        summary.tcp_recv_queue_waits,
         summary.local_queue_wait_us,
         summary.local_queue_wait_max_us,
         summary.local_queue_waits,
@@ -355,6 +383,9 @@ mod tests {
             local_send_wait_us: 9,
             local_send_wait_max_us: 8,
             local_send_waits: 2,
+            tcp_recv_queue_wait_us: 14,
+            tcp_recv_queue_wait_max_us: 10,
+            tcp_recv_queue_waits: 3,
             local_queue_wait_us: 7,
             local_queue_wait_max_us: 6,
             local_queue_waits: 1,
@@ -374,7 +405,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\ttcp_recv_queue_wait_us=14\ttcp_recv_queue_wait_max_us=10\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
         );
         assert!(!line.contains("payload"));
     }

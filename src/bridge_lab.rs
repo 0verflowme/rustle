@@ -299,7 +299,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 route_lab_packets_to_clients(now, packets, &mut clients, &mut flow_manager)? > 0;
         }
         let drain_stats =
-            drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys)?;
+            drain_local_bytes_to_bridges(&mut flow_manager, &mut bridges, &mut flow_keys, now)?;
         made_progress |= drain_stats.bytes_to_bridge > 0;
 
         let mut processed_bridge_events = 0_usize;

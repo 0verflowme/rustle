@@ -161,6 +161,12 @@ pub struct FlowSnapshot {
     pub remote_to_local_bytes: u64,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FlowBytes {
+    pub bytes: Bytes,
+    pub tcp_recv_queue_wait_us: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowPolicy {
     pub max_active_flows: usize,
@@ -190,6 +196,7 @@ struct FlowEntry {
     last_activity: Instant,
     local_to_remote_bytes: u64,
     remote_to_local_bytes: u64,
+    local_payload_buffered_since: Option<Instant>,
 }
 
 pub struct FlowManager {
@@ -309,16 +316,40 @@ impl FlowManager {
     pub fn poll_into(&mut self, now: Instant, outbound: &mut Vec<PacketBuf>) {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.refresh_flow_states(now);
+        self.refresh_local_payload_buffer_markers(now);
         self.device.drain_tx_into(outbound);
     }
 
     pub fn recv_flow_bytes(&mut self, flow: FlowKey, max_len: usize) -> Result<Bytes> {
+        Ok(self.recv_flow_bytes_inner(flow, max_len, None)?.bytes)
+    }
+
+    pub fn recv_flow_bytes_with_metrics(
+        &mut self,
+        flow: FlowKey,
+        max_len: usize,
+        now: Instant,
+    ) -> Result<FlowBytes> {
+        self.recv_flow_bytes_inner(flow, max_len, Some(now))
+    }
+
+    fn recv_flow_bytes_inner(
+        &mut self,
+        flow: FlowKey,
+        max_len: usize,
+        now: Option<Instant>,
+    ) -> Result<FlowBytes> {
         let Some(entry) = self.flows.get(&flow) else {
             bail!("flow {flow:?} does not exist");
         };
-        let socket = self.sockets.get_mut::<tcp::Socket>(entry.handle);
+        let handle = entry.handle;
+        let buffered_since = entry.local_payload_buffered_since;
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
         if max_len == 0 || !socket.can_recv() {
-            return Ok(Bytes::new());
+            return Ok(FlowBytes {
+                bytes: Bytes::new(),
+                tcp_recv_queue_wait_us: None,
+            });
         }
 
         let bytes = socket
@@ -327,14 +358,33 @@ impl FlowManager {
                 (len, Bytes::copy_from_slice(&data[..len]))
             })
             .context("failed to receive flow bytes")?;
+        let remaining = socket.recv_queue();
+        let tcp_recv_queue_wait_us = if bytes.is_empty() {
+            None
+        } else {
+            now.and_then(|now| {
+                buffered_since.map(|since| {
+                    let elapsed = now - since;
+                    elapsed.total_micros()
+                })
+            })
+        };
         if !bytes.is_empty() {
             if let Some(entry) = self.flows.get_mut(&flow) {
                 entry.local_to_remote_bytes = entry
                     .local_to_remote_bytes
                     .saturating_add(bytes.len() as u64);
+                if remaining == 0 {
+                    entry.local_payload_buffered_since = None;
+                } else if entry.local_payload_buffered_since.is_none() {
+                    entry.local_payload_buffered_since = now;
+                }
             }
         }
-        Ok(bytes)
+        Ok(FlowBytes {
+            bytes,
+            tcp_recv_queue_wait_us,
+        })
     }
 
     pub fn send_flow_bytes(&mut self, flow: FlowKey, bytes: &[u8]) -> Result<usize> {
@@ -690,6 +740,7 @@ impl FlowManager {
                 last_activity: now,
                 local_to_remote_bytes: 0,
                 remote_to_local_bytes: 0,
+                local_payload_buffered_since: None,
             },
         );
         Ok(())
@@ -717,6 +768,17 @@ impl FlowManager {
                 entry.last_activity = now;
             }
             entry.remote_to_local_bytes = entry.remote_to_local_bytes.saturating_add(len as u64);
+        }
+    }
+
+    fn refresh_local_payload_buffer_markers(&mut self, now: Instant) {
+        for entry in self.flows.values_mut() {
+            let recv_queue = self.sockets.get::<tcp::Socket>(entry.handle).recv_queue();
+            if recv_queue == 0 {
+                entry.local_payload_buffered_since = None;
+            } else if entry.local_payload_buffered_since.is_none() {
+                entry.local_payload_buffered_since = Some(now);
+            }
         }
     }
 }
@@ -1519,6 +1581,7 @@ mod tests {
         let mut manager_received = Vec::new();
         let mut manager_replied = false;
         let mut client_received = Vec::new();
+        let mut observed_recv_queue_wait = false;
 
         for _ in 0..512 {
             client_iface.poll(now, &mut client_device, &mut client_sockets);
@@ -1541,10 +1604,13 @@ mod tests {
 
             pump_client_to_manager(now, &mut client_device, &mut manager);
 
-            let chunk = manager
-                .recv_flow_bytes(flow, 128)
+            let flow_bytes = manager
+                .recv_flow_bytes_with_metrics(flow, 128, now + Duration::from_millis(5))
                 .expect("manager receive flow bytes");
+            let chunk = flow_bytes.bytes;
             if !chunk.is_empty() {
+                assert_eq!(flow_bytes.tcp_recv_queue_wait_us, Some(5_000));
+                observed_recv_queue_wait = true;
                 assert_eq!(chunk.len(), request.len());
                 manager_received.extend_from_slice(&chunk);
             }
@@ -1566,6 +1632,7 @@ mod tests {
         }
 
         assert!(client_sent, "client never became writable");
+        assert!(observed_recv_queue_wait);
         assert_eq!(manager_received, request);
         assert_eq!(client_received, response);
 
