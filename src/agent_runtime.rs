@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
@@ -11,10 +11,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
+use crate::agent_io::AgentFrameBurstWriter;
 use crate::agent_proto::{
-    encode_frame_into, encoded_frame_len, encoded_frames_len, try_decode_frame, AgentFrame,
-    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_CARRIER_READ_BUFFER_BYTES,
-    AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
+    try_decode_frame, AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4,
+    AGENT_CARRIER_READ_BUFFER_BYTES, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -25,8 +25,6 @@ const AGENT_TCP_READ_CHUNK: usize = AGENT_MAX_FRAME_PAYLOAD;
 const AGENT_UDP_READ_CHUNK: usize = 64 * 1024;
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const AGENT_FRAME_WRITE_BURST: usize = 64;
-const AGENT_FRAME_WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
 const AGENT_OUTPUT_PRODUCER_YIELD_FRAMES: usize = 8;
 
 const _: () = assert!(
@@ -170,107 +168,16 @@ async fn write_agent_frames<W>(mut writer: W, mut out_rx: mpsc::Receiver<AgentFr
 where
     W: AsyncWrite + Unpin,
 {
-    let mut frames = Vec::with_capacity(AGENT_FRAME_WRITE_BURST);
-    let mut encoded = BytesMut::new();
+    let mut burst_writer = AgentFrameBurstWriter::new();
     while let Some(frame) = out_rx.recv().await {
-        write_agent_frame_burst(&mut writer, frame, &mut out_rx, &mut frames, &mut encoded).await?;
+        burst_writer
+            .write_burst(&mut writer, frame, &mut out_rx)
+            .await?;
     }
     writer
         .shutdown()
         .await
         .context("failed to shut down agent writer")
-}
-
-async fn write_agent_frame_burst<W>(
-    writer: &mut W,
-    first: AgentFrame,
-    out_rx: &mut mpsc::Receiver<AgentFrame>,
-    frames: &mut Vec<AgentFrame>,
-    encoded: &mut BytesMut,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    frames.clear();
-    frames.push(first);
-    let mut burst_bytes = encoded_frame_len(frames.first().expect("burst has first frame"))?;
-    for _ in 1..AGENT_FRAME_WRITE_BURST {
-        if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
-            break;
-        }
-        match out_rx.try_recv() {
-            Ok(frame) => {
-                burst_bytes = burst_bytes.saturating_add(encoded_frame_len(&frame)?);
-                frames.push(frame);
-            }
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                break;
-            }
-        }
-    }
-    write_agent_frame_burst_ordered(writer, frames, encoded).await?;
-    writer.flush().await.context("failed to flush agent frame")
-}
-
-async fn write_agent_frame_burst_ordered<W>(
-    writer: &mut W,
-    frames: &[AgentFrame],
-    encoded: &mut BytesMut,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    encoded.clear();
-    encoded.reserve(encoded_frames_len(frames)?);
-
-    if frames
-        .first()
-        .is_some_and(|frame| frame.kind == AgentFrameKind::Hello)
-    {
-        for frame in frames {
-            encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
-        }
-    } else {
-        for frame in frames.iter().filter(|frame| is_priority_control(frame)) {
-            encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
-        }
-        encode_non_priority_frames_fairly(frames, encoded)?;
-    }
-
-    writer
-        .write_all(encoded)
-        .await
-        .context("failed to write agent frame")
-}
-
-fn encode_non_priority_frames_fairly(frames: &[AgentFrame], encoded: &mut BytesMut) -> Result<()> {
-    let mut queues: Vec<(u64, VecDeque<&AgentFrame>)> = Vec::new();
-    let mut queued = 0_usize;
-    for frame in frames.iter().filter(|frame| !is_priority_control(frame)) {
-        queued = queued.saturating_add(1);
-        if let Some((_, queue)) = queues
-            .iter_mut()
-            .find(|(stream_id, _)| *stream_id == frame.stream_id)
-        {
-            queue.push_back(frame);
-        } else {
-            queues.push((frame.stream_id, VecDeque::from([frame])));
-        }
-    }
-
-    while queued > 0 {
-        for (_, queue) in &mut queues {
-            if let Some(frame) = queue.pop_front() {
-                encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
-                queued -= 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_priority_control(frame: &AgentFrame) -> bool {
-    frame.kind.is_priority_control()
 }
 
 async fn read_agent_frames<R>(
@@ -1036,6 +943,7 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
+    use crate::agent_io::{AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES};
     use crate::agent_proto::{
         encode_frame, try_decode_frame, AgentHello, AgentOpenIpv4, AGENT_FRAME_HEADER_LEN,
     };

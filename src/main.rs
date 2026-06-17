@@ -4,6 +4,7 @@ use clap::Parser;
 mod agent_bridge;
 #[cfg(test)]
 mod agent_client;
+mod agent_io;
 mod agent_lab;
 #[allow(dead_code)]
 mod agent_proto;
