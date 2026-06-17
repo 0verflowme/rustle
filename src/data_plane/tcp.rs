@@ -15,6 +15,12 @@ use super::stream::AgentIoStream;
 
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
+enum BridgeInput {
+    OpenTimeout,
+    Remote(Result<Option<agent_proto::AgentFrame>>),
+    Local(Option<ssh_bridge::ReceivedLocalData>),
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_agent_tcp_bridge(
     id: tcp_core::FlowId,
@@ -66,13 +72,29 @@ where
         let mut open_reported = false;
         let mut pre_open_local = VecDeque::<Bytes>::new();
         let mut pre_open_retries = 0_usize;
+        let mut prefer_local_after_remote = false;
         let open_timeout = tokio::time::sleep(ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT);
         tokio::pin!(open_timeout);
 
         loop {
-            tokio::select! {
-                biased;
-                _ = &mut open_timeout, if !open_reported => {
+            let input = if prefer_local_after_remote {
+                tokio::select! {
+                    biased;
+                    _ = &mut open_timeout, if !open_reported => BridgeInput::OpenTimeout,
+                    local = local_rx.recv_with_metrics() => BridgeInput::Local(local),
+                    remote = stream.recv() => BridgeInput::Remote(remote),
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = &mut open_timeout, if !open_reported => BridgeInput::OpenTimeout,
+                    remote = stream.recv() => BridgeInput::Remote(remote),
+                    local = local_rx.recv_with_metrics() => BridgeInput::Local(local),
+                }
+            };
+
+            match input {
+                BridgeInput::OpenTimeout => {
                     trace.finish("open_timeout");
                     let _ = ssh_bridge::send_bridge_event(
                         &event_tx,
@@ -88,13 +110,16 @@ where
                     .await;
                     break;
                 }
-                remote = stream.recv() => {
+                BridgeInput::Remote(remote) => {
+                    prefer_local_after_remote = true;
                     match remote {
                         Ok(Some(frame)) => match frame.kind {
                             agent_proto::AgentFrameKind::Opened => {
                                 if !open_reported {
                                     trace.opened();
-                                    if !report_agent_stream_opened(&event_tx, id, open_started_at).await {
+                                    if !report_agent_stream_opened(&event_tx, id, open_started_at)
+                                        .await
+                                    {
                                         trace.finish("event_channel_closed");
                                         let _ = stream.close().await;
                                         return;
@@ -106,7 +131,9 @@ where
                             agent_proto::AgentFrameKind::Data => {
                                 if !open_reported {
                                     trace.opened();
-                                    if !report_agent_stream_opened(&event_tx, id, open_started_at).await {
+                                    if !report_agent_stream_opened(&event_tx, id, open_started_at)
+                                        .await
+                                    {
                                         trace.finish("event_channel_closed");
                                         let _ = stream.close().await;
                                         return;
@@ -150,7 +177,9 @@ where
                                             open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             Ok(replacement) => {
                                                 stream = replacement;
                                                 open_timeout.as_mut().reset(
@@ -202,7 +231,9 @@ where
                                         open.into_agent_open(),
                                         stream,
                                         &pre_open_local,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         Ok(replacement) => {
                                             stream = replacement;
                                             open_timeout.as_mut().reset(
@@ -239,7 +270,9 @@ where
                                     ssh_bridge::BridgeEvent::Failed {
                                         id,
                                         phase,
-                                message: format!("{transport_label} stream reset: {message}"),
+                                        message: format!(
+                                            "{transport_label} stream reset: {message}"
+                                        ),
                                     },
                                 )
                                 .await;
@@ -258,7 +291,9 @@ where
                                     open.into_agent_open(),
                                     stream,
                                     &pre_open_local,
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(replacement) => {
                                         stream = replacement;
                                         open_timeout.as_mut().reset(
@@ -286,7 +321,7 @@ where
                             }
                             trace.outcome("remote_stream_closed");
                             break;
-                        },
+                        }
                         Err(err) => {
                             let phase = if open_reported {
                                 ssh_bridge::BridgeFailurePhase::Write
@@ -299,7 +334,9 @@ where
                                 ssh_bridge::BridgeEvent::Failed {
                                     id,
                                     phase,
-                                    message: format!("failed to read {transport_label} stream: {err:#}"),
+                                    message: format!(
+                                        "failed to read {transport_label} stream: {err:#}"
+                                    ),
                                 },
                             )
                             .await;
@@ -307,7 +344,8 @@ where
                         }
                     }
                 }
-                local = local_rx.recv_with_metrics() => {
+                BridgeInput::Local(local) => {
+                    prefer_local_after_remote = false;
                     match local {
                         Some(local) => {
                             let bytes = local.bytes;
@@ -344,7 +382,9 @@ where
                                             open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             Ok(replacement) => {
                                                 stream = replacement;
                                                 open_timeout.as_mut().reset(
@@ -799,7 +839,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_tcp_bridge_delivers_ready_remote_data_before_more_local_data() {
+    async fn agent_tcp_bridge_gives_queued_local_data_a_turn_after_remote_event() {
         let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
         let (remote_written_tx, remote_written_rx) = tokio::sync::oneshot::channel();
         let (local_seen_tx, local_seen_rx) = tokio::sync::oneshot::channel();
@@ -897,26 +937,24 @@ mod tests {
             matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
         );
 
-        tokio::pin!(local_seen_rx);
-        tokio::select! {
-            biased;
-            event = event_rx.recv() => {
-                match event.expect("remote data event") {
-                    ssh_bridge::BridgeEvent::RemoteData { id: event_id, bytes } => {
-                        assert_eq!(event_id, id);
-                        assert_eq!(&bytes[..], b"remote-first");
-                    }
-                    other => panic!("expected remote data before local send, got {other:?}"),
-                }
-            }
-            _ = &mut local_seen_rx => {
-                panic!("bridge sent additional local data before delivering ready remote data");
-            }
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(1), &mut local_seen_rx)
+        tokio::time::timeout(std::time::Duration::from_secs(1), local_seen_rx)
             .await
-            .expect("local data should be sent after remote delivery")
+            .expect("local data should not starve behind ready remote data")
             .expect("local data seen notification");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("remote data event")
+            .expect("bridge event");
+        match event {
+            ssh_bridge::BridgeEvent::RemoteData {
+                id: event_id,
+                bytes,
+            } => {
+                assert_eq!(event_id, id);
+                assert_eq!(&bytes[..], b"remote-first");
+            }
+            other => panic!("expected remote data after local send, got {other:?}"),
+        }
 
         drop(bridge);
         fake_agent.await.expect("fake agent join");
