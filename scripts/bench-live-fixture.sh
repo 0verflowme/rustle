@@ -21,6 +21,7 @@ FIXTURE_LISTEN_BACKLOG="${RUSTLE_FIXTURE_LISTEN_BACKLOG:-256}"
 FIXTURE_TTL_SECONDS="${RUSTLE_FIXTURE_TTL_SECONDS:-3600}"
 TARGET_CIDR="${RUSTLE_FIXTURE_TARGET_CIDR:-${RUSTLE_BENCH_TARGET_CIDR:-}}"
 ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
+ALLOW_CONTROL_HOST="${RUSTLE_FIXTURE_ALLOW_CONTROL_HOST:-0}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_FIXTURE_REMOTE or RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$FIXTURE_HOST" ]] || smoke_die "set RUSTLE_FIXTURE_HOST to the remote IP reachable through Rustle, for example 192.168.190.45"
@@ -42,6 +43,10 @@ fi
 if [[ "$FIXTURE_TTL_SECONDS" -lt 1 ]]; then
   smoke_die "RUSTLE_FIXTURE_TTL_SECONDS must be at least 1"
 fi
+case "$ALLOW_CONTROL_HOST" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_FIXTURE_ALLOW_CONTROL_HOST must be 0 or 1" ;;
+esac
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-fixture.XXXXXX")"
 FIXTURE_PID=""
@@ -120,6 +125,67 @@ if [[ -n "$SSH_PASSWORD_VALUE" ]]; then
   )
 fi
 SSH_CMD+=("$SSH_REMOTE")
+
+ssh_config_hostname() {
+  local remote="$1"
+  local ssh_g_args=(ssh -G)
+  if [[ -n "$FIXTURE_SSH_CONFIG" ]]; then
+    ssh_g_args+=(-F "$FIXTURE_SSH_CONFIG")
+  fi
+  "${ssh_g_args[@]}" "$remote" 2>/dev/null | awk 'tolower($1) == "hostname" { print $2; exit }'
+}
+
+resolve_ipv4s() {
+  "$(smoke_python)" - "$1" <<'PY'
+import ipaddress
+import socket
+import sys
+
+host = sys.argv[1]
+try:
+    print(ipaddress.IPv4Address(host))
+    raise SystemExit(0)
+except ValueError:
+    pass
+
+seen = set()
+try:
+    infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+except socket.gaierror:
+    raise SystemExit(0)
+for info in infos:
+    ip = info[4][0]
+    if ip not in seen:
+        seen.add(ip)
+        print(ip)
+PY
+}
+
+reject_fixture_control_host() {
+  [[ "$ALLOW_CONTROL_HOST" == "0" ]] || return 0
+
+  local control_host
+  control_host="$(ssh_config_hostname "$SSH_REMOTE")"
+  [[ -n "$control_host" ]] || control_host="$SSH_REMOTE"
+
+  local control_ips
+  local fixture_ips
+  control_ips="$(resolve_ipv4s "$control_host")"
+  fixture_ips="$(resolve_ipv4s "$FIXTURE_HOST")"
+  [[ -n "$control_ips" && -n "$fixture_ips" ]] || return 0
+
+  local control_ip
+  local fixture_ip
+  while IFS= read -r control_ip; do
+    [[ -n "$control_ip" ]] || continue
+    while IFS= read -r fixture_ip; do
+      [[ -n "$fixture_ip" ]] || continue
+      if [[ "$fixture_ip" == "$control_ip" ]]; then
+        smoke_die "RUSTLE_FIXTURE_HOST resolves to SSH control host ${control_ip}; use a separate routed fixture IP or set RUSTLE_FIXTURE_ALLOW_CONTROL_HOST=1 for an intentionally non-tunnel proof"
+      fi
+    done <<<"$fixture_ips"
+  done <<<"$control_ips"
+}
 
 BENCH_ENV=()
 if [[ -n "$SSH_PASSWORD_VALUE" && -z "${RUSTLE_BENCH_PASSWORD_VALUE:-}" && -z "${RUSTLE_LIVE_PASSWORD_VALUE:-}" ]]; then
@@ -262,6 +328,8 @@ stop_fixture() {
     FIXTURE_PID=""
   fi
 }
+
+reject_fixture_control_host
 
 verify_fixture_benchmark_rows() {
   local results_file="$1"

@@ -560,6 +560,13 @@ hotpath trace and summarize Rustle's stderr/log output:
 RUSTLE_HOTPATH_TRACE=1 scripts/bench-live-fixture.sh
 ```
 
+Use a fixture host address that is distinct from the SSH control host. The live
+fixture wrapper rejects a fixture IP that resolves to the same address as the
+SSH target because Rustle installs a control-route guard for the SSH host, and
+benchmark traffic to that same IP can bypass the tunnel. Set
+`RUSTLE_FIXTURE_ALLOW_CONTROL_HOST=1` only for an explicitly non-tunnel control
+experiment.
+
 The summary groups flows by transport and reports `stream_ready`, `opened`,
 first local payload, first local payload sent, first remote byte, duration,
 bytes, per-flow byte distribution, per-flow throughput distribution, and
