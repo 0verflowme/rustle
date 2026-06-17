@@ -21,6 +21,7 @@ mod events;
 mod prepare;
 #[cfg(test)]
 mod prepare_tests;
+mod tun;
 
 pub(crate) use prepare::run_tunnel;
 
@@ -171,7 +172,7 @@ impl TunnelSupervisor {
                     engine
                         .ingest_tcp_packet(packet)
                         .context("failed to feed packet into userspace TCP engine")?;
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.plan_bridge_starts(
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,
@@ -185,7 +186,7 @@ impl TunnelSupervisor {
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.expire_and_prune()?;
                 }
                 event = dns_rx.recv() => {
@@ -228,9 +229,9 @@ impl TunnelSupervisor {
                         &bridge_event_accounting,
                     )?;
                     engine.poll_tcp();
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.expire_and_prune()?;
                 }
                 _ = stats_tick.tick() => {
@@ -244,9 +245,9 @@ impl TunnelSupervisor {
                 }
                 _ = tick.tick() => {
                     engine.poll_tcp();
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.flush_remote_backlogs()?;
-                    tun.write_engine_packets(engine).await?;
+                    tun::write_engine_packets(&tun, engine).await?;
                     engine.plan_bridge_starts(
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,

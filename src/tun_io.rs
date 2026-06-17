@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 
-use crate::packet_engine::{TunWriteStats, TunnelEngine};
+use crate::packet_engine::TunWriteStats;
 use crate::transport_model::{DnsResponseEvent, UdpFlowKey};
 use crate::{dns, tcp_core};
 
@@ -23,12 +23,6 @@ impl<'a> TunWriter<'a> {
             .recv(buf)
             .await
             .context("failed to read packet from TUN device")
-    }
-
-    pub(crate) async fn write_engine_packets(&self, engine: &mut TunnelEngine) -> Result<()> {
-        let tun_write = self.write_packets(engine.outbound_packets_mut()).await?;
-        engine.record_tun_write(tun_write);
-        Ok(())
     }
 
     pub(crate) async fn write_dns_event(&self, event: DnsResponseEvent) -> Result<TunWriteStats> {
