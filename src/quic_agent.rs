@@ -95,6 +95,35 @@ pub struct QuicAgentSession {
     connection: Connection,
 }
 
+struct QuicAgentConnectDiagnostics<'a> {
+    remote: SocketAddr,
+    cert_sha256: &'a str,
+    cert_der_len: usize,
+    token_sha256_prefix: String,
+}
+
+impl<'a> QuicAgentConnectDiagnostics<'a> {
+    fn new(remote: SocketAddr, bootstrap: &'a QuicAgentBootstrap) -> Self {
+        let token_hash = sha256_hex(&bootstrap.auth_token);
+        Self {
+            remote,
+            cert_sha256: &bootstrap.cert_sha256,
+            cert_der_len: bootstrap.cert_der.len(),
+            token_sha256_prefix: token_hash.chars().take(12).collect(),
+        }
+    }
+}
+
+impl std::fmt::Display for QuicAgentConnectDiagnostics<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "QUIC agent remote={} cert_sha256={} cert_der_len={} auth_token_sha256_prefix={}",
+            self.remote, self.cert_sha256, self.cert_der_len, self.token_sha256_prefix
+        )
+    }
+}
+
 impl QuicAgentSession {
     pub(crate) fn close(&self, code: u32, reason: &[u8]) {
         self.connection.close(code.into(), reason);
@@ -126,30 +155,50 @@ pub async fn connect_quic_agent_stream(
     remote: SocketAddr,
     bootstrap: &QuicAgentBootstrap,
 ) -> Result<(quinn::RecvStream, quinn::SendStream, QuicAgentSession)> {
-    let mut endpoint = quic_client_endpoint(remote).context("failed to bind QUIC client")?;
-    endpoint.set_default_client_config(quic_client_config(bootstrap)?);
+    let diagnostics = QuicAgentConnectDiagnostics::new(remote, bootstrap);
+    let mut endpoint =
+        quic_client_endpoint(remote).with_context(|| format!("{diagnostics} stage=client_bind"))?;
+    endpoint.set_default_client_config(
+        quic_client_config(bootstrap)
+            .with_context(|| format!("{diagnostics} stage=client_config"))?,
+    );
+    let stage_started = Instant::now();
     let connection = endpoint
         .connect(remote, QUIC_AGENT_SERVER_NAME)
-        .context("failed to start QUIC agent connection")?
+        .with_context(|| format!("{diagnostics} stage=connect_start"))?
         .await
-        .context("failed to establish QUIC agent connection")?;
+        .with_context(|| {
+            format!(
+                "{diagnostics} stage=connect_establish elapsed_ms={}",
+                stage_started.elapsed().as_millis()
+            )
+        })?;
     let stage_started = Instant::now();
     let (mut send, mut recv) =
         open_quic_bi_stream_with_timeout(&connection, QUIC_AUTH_TIMEOUT, "QUIC agent auth stream")
             .await
             .with_context(|| {
-                quic_auth_stage_context("QUIC agent auth", "open_stream", stage_started)
+                format!(
+                    "{diagnostics} {}",
+                    quic_auth_stage_context("QUIC agent auth", "open_stream", stage_started)
+                )
             })?;
     let stage_started = Instant::now();
     write_quic_auth_token(&mut send, &bootstrap.auth_token)
         .await
         .with_context(|| {
-            quic_auth_stage_context("QUIC agent auth", "write_token", stage_started)
+            format!(
+                "{diagnostics} {}",
+                quic_auth_stage_context("QUIC agent auth", "write_token", stage_started)
+            )
         })?;
     let stage_started = Instant::now();
-    read_quic_auth_ok(&mut recv)
-        .await
-        .with_context(|| quic_auth_stage_context("QUIC agent auth", "read_ack", stage_started))?;
+    read_quic_auth_ok(&mut recv).await.with_context(|| {
+        format!(
+            "{diagnostics} {}",
+            quic_auth_stage_context("QUIC agent auth", "read_ack", stage_started)
+        )
+    })?;
     Ok((
         recv,
         send,
@@ -190,14 +239,31 @@ mod tests {
         });
 
         let bad_bootstrap = tampered_bootstrap_token(&bootstrap);
+        let bad_token_hash = sha256_hex(&bad_bootstrap.auth_token);
+        let raw_bad_token_hex = bad_bootstrap
+            .auth_token
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let bad = connect_quic_agent_stream(quic_addr, &bad_bootstrap).await;
         let bad_err = match bad {
             Ok(_) => panic!("bad token unexpectedly authenticated"),
             Err(err) => err,
         };
         let bad_detail = format!("{bad_err:#}");
+        assert!(bad_detail.contains(&format!("remote={quic_addr}")));
+        assert!(bad_detail.contains(&format!("cert_sha256={}", bad_bootstrap.cert_sha256)));
+        assert!(bad_detail.contains(&format!("cert_der_len={}", bad_bootstrap.cert_der.len())));
+        assert!(bad_detail.contains(&format!(
+            "auth_token_sha256_prefix={}",
+            &bad_token_hash[..12]
+        )));
         assert!(bad_detail.contains("QUIC agent auth stage=read_ack"));
         assert!(bad_detail.contains("elapsed_ms="));
+        assert!(
+            !bad_detail.contains(&raw_bad_token_hex),
+            "diagnostics must not expose raw auth token bytes"
+        );
 
         let (_recv, _send, session) = connect_quic_agent_stream(quic_addr, &bootstrap)
             .await
