@@ -27,7 +27,7 @@ It writes:
 
 The analyzer builds a directed graph with these node types:
 
-- Rust items parsed from `src/*.rs` and `agent-bootstrap/src/*.rs`.
+- Rust items parsed from `src/**/*.rs` and `agent-bootstrap/src/**/*.rs`.
 - Verification/lab scripts from `scripts/`.
 - File summaries that aggregate item-level evidence.
 

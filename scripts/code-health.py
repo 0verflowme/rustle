@@ -268,8 +268,16 @@ def tracked_files(root: Path) -> list[Path]:
     return sorted(files)
 
 
+def rust_child_module_candidates(path: Path, module: str) -> list[Path]:
+    if path.name in {"main.rs", "lib.rs", "mod.rs"}:
+        module_root = path.parent
+    else:
+        module_root = path.parent / path.stem
+    return [module_root / f"{module}.rs", module_root / module / "mod.rs"]
+
+
 def test_only_rust_paths(root: Path, paths: list[Path]) -> set[str]:
-    declared_modules = {path.stem: rel(root, path) for path in paths}
+    declared_paths = {path.resolve(): rel(root, path) for path in paths}
     test_only: set[str] = set()
     for path in paths:
         attrs: list[str] = []
@@ -281,8 +289,10 @@ def test_only_rust_paths(root: Path, paths: list[Path]) -> set[str]:
             match = MOD_RE.match(line)
             if match and any(attr_marks_test(item) for item in attrs):
                 module = match.group(1)
-                if module in declared_modules:
-                    test_only.add(declared_modules[module])
+                for candidate in rust_child_module_candidates(path, module):
+                    declared = declared_paths.get(candidate.resolve())
+                    if declared is not None:
+                        test_only.add(declared)
             if line.strip() and not line.lstrip().startswith("//"):
                 attrs = []
     return test_only

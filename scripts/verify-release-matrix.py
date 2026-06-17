@@ -1553,9 +1553,9 @@ def main() -> None:
         snippet for snippet in REQUIRED_MAIN_SOURCE_SNIPPETS if snippet not in rust_sources
     ]
     if missing_main:
-        fail(f"src/*.rs is missing required transport snippets: {missing_main!r}")
+        fail(f"src/**/*.rs is missing required transport snippets: {missing_main!r}")
     if rust_sources.count('default_value = "agent"') < 3:
-        fail("src/*.rs must keep compact, tunnel, and bridge-lab defaulting to agent")
+        fail("src/**/*.rs must keep compact, tunnel, and bridge-lab defaulting to agent")
 
     ci_os = parse_ci_os_matrix(ci_workflow)
     if ci_os != EXPECTED_CI_OS:
