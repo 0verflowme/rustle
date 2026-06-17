@@ -264,6 +264,9 @@ CMD=(
 if [[ -n "${RUSTLE_LIVE_IDENTITY:-}" ]]; then
   CMD+=(-i "$RUSTLE_LIVE_IDENTITY")
 fi
+if [[ -n "${RUSTLE_LIVE_SSH_CONFIG:-}" ]]; then
+  CMD+=(--ssh-config "$RUSTLE_LIVE_SSH_CONFIG")
+fi
 if [[ -n "${RUSTLE_LIVE_KNOWN_HOSTS:-}" ]]; then
   CMD+=(--known-hosts "$RUSTLE_LIVE_KNOWN_HOSTS")
 fi

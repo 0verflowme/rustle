@@ -1136,6 +1136,8 @@ REQUIRED_LIVE_BENCHMARK_ROW_SNIPPETS = [
 
 REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "smoke_wait_for_rustle_target_route_logs",
+    "RUSTLE_LIVE_SSH_CONFIG",
+    "--ssh-config",
     "--password-file",
     'CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
 ]
@@ -1146,6 +1148,8 @@ REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
     "RUSTLE_LIVE_UDP_IDLE_TIMEOUT_MS",
     "RUSTLE_LIVE_UDP_IDLE_GRACE_MS",
     "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT",
+    "RUSTLE_LIVE_UDP_SSH_CONFIG",
+    "RUSTLE_LIVE_SSH_CONFIG",
     "agent|quic-agent|quic-native",
     "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS",
     "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES",
@@ -1157,6 +1161,7 @@ REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
     "awk '/^READY / { print $3 }'",
     "smoke_wait_for_rustle_target_route_logs",
     'CMD_ENV+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
+    "--ssh-config",
     "--password-file",
     "udp: forwarding datagram .* -> ${FIXTURE_HOST}:${ACTUAL_PORT} over ",
     "waiting for UDP association idle cleanup",

@@ -473,7 +473,10 @@ Required before tagging a release:
   with final `udp=... active:0` stats and route cleanup. Re-run the same smoke
   with `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` before counting native
   QUIC UDP as release evidence on that remote; a failure there is UDP
-  reachability evidence, not an agent-product regression.
+  reachability evidence, not an agent-product regression. For OpenSSH `Host`
+  aliases under `sudo`, pass `RUSTLE_LIVE_SSH_CONFIG` or
+  `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the
+  same alias as the fixture SSH command.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. The release workflow runs
   this smoke against the packaged Windows binary with embedded Wintun before

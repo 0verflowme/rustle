@@ -560,6 +560,11 @@ SSH-agent UDP path. Set `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` when
 you specifically want to prove that the remote network allows Rustle's
 SSH-bootstrapped UDP/QUIC helper data plane; that run should fail clearly when
 inbound UDP to the helper port is blocked.
+When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
+alias and the smoke runs Rustle through `sudo`, set
+`RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific
+`RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process resolves the same
+alias as the fixture SSH command.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 
