@@ -19,6 +19,12 @@ TIMING_FIELDS = (
     "first_remote_us",
     "duration_us",
 )
+OPTIONAL_COUNTER_FIELDS = (
+    "local_send_wait_us",
+    "local_send_waits",
+    "remote_event_wait_us",
+    "remote_event_waits",
+)
 DERIVED_LATENCIES = (
     ("remote_open_wait_us", "stream_ready_us", "opened_us"),
     ("payload_queue_wait_us", "first_local_us", "first_local_sent_us"),
@@ -61,6 +67,16 @@ def parse_optional_us(value: str) -> int | None:
     return parsed
 
 
+def parse_counter(value: str, field: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"invalid hotpath {field} value {value!r}") from exc
+    if parsed < 0:
+        raise SystemExit(f"invalid negative hotpath {field} value {value!r}")
+    return parsed
+
+
 def nonnegative_delta(row: dict[str, str], start_field: str, end_field: str) -> int | None:
     start = parse_optional_us(row[start_field])
     end = parse_optional_us(row[end_field])
@@ -87,13 +103,11 @@ def parse_trace_line(line: str) -> dict[str, str] | None:
         if field not in fields:
             raise SystemExit(f"hotpath trace line missing {field}: {line!r}")
         parse_optional_us(fields[field])
+    for field in OPTIONAL_COUNTER_FIELDS:
+        if field in fields:
+            parse_counter(fields[field], field)
     for field in ("local_bytes", "remote_bytes"):
-        try:
-            value = int(fields[field])
-        except ValueError as exc:
-            raise SystemExit(f"invalid hotpath byte count {fields[field]!r}") from exc
-        if value < 0:
-            raise SystemExit(f"invalid negative hotpath byte count {fields[field]!r}")
+        parse_counter(fields[field], "byte count")
     return fields
 
 
@@ -140,16 +154,42 @@ def summarize(text: str) -> list[dict[str, object]]:
         derived_p50 = {
             name: percentile(values, 50) for name, values in derived_values.items()
         }
+        local_send_wait_values = [
+            parse_counter(row["local_send_wait_us"], "local_send_wait_us")
+            for row in rows
+            if "local_send_wait_us" in row
+        ]
+        remote_event_wait_values = [
+            parse_counter(row["remote_event_wait_us"], "remote_event_wait_us")
+            for row in rows
+            if "remote_event_wait_us" in row
+        ]
+        wait_p50 = {
+            "local_send_wait_us": percentile(local_send_wait_values, 50),
+            "remote_event_wait_us": percentile(remote_event_wait_values, 50),
+        }
         likely_bottleneck = max(
             (
                 (value, name.removesuffix("_us"))
-                for name, value in derived_p50.items()
+                for name, value in (derived_p50 | wait_p50).items()
                 if value is not None
             ),
             default=(None, "-"),
         )[1]
         remote_bytes = sum(int(row["remote_bytes"]) for row in rows)
         local_bytes = sum(int(row["local_bytes"]) for row in rows)
+        local_send_waits = sum(
+            parse_counter(row["local_send_waits"], "local_send_waits")
+            for row in rows
+            if "local_send_waits" in row
+        )
+        local_send_wait_total = sum(local_send_wait_values)
+        remote_event_waits = sum(
+            parse_counter(row["remote_event_waits"], "remote_event_waits")
+            for row in rows
+            if "remote_event_waits" in row
+        )
+        remote_event_wait_total = sum(remote_event_wait_values)
         duration_values = timing_values["duration_us"]
         total_duration_us = sum(duration_values)
         avg_flow_throughput = (
@@ -178,6 +218,12 @@ def summarize(text: str) -> list[dict[str, object]]:
                 "payload_queue_wait_p50_ms": format_ms(derived_p50["payload_queue_wait_us"]),
                 "first_byte_wait_p50_ms": format_ms(derived_p50["first_byte_wait_us"]),
                 "body_drain_p50_ms": format_ms(derived_p50["body_drain_us"]),
+                "local_send_wait_p50_ms": format_ms(wait_p50["local_send_wait_us"]),
+                "local_send_wait_total_ms": format_ms(local_send_wait_total),
+                "local_send_waits": local_send_waits,
+                "remote_event_wait_p50_ms": format_ms(wait_p50["remote_event_wait_us"]),
+                "remote_event_wait_total_ms": format_ms(remote_event_wait_total),
+                "remote_event_waits": remote_event_waits,
                 "duration_p50_ms": format_ms(percentile(duration_values, 50)),
                 "duration_p95_ms": format_ms(percentile(duration_values, 95)),
                 "avg_flow_throughput_mib_s": f"{avg_flow_throughput:.2f}",
@@ -208,6 +254,12 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "payload_queue_wait_p50_ms",
         "first_byte_wait_p50_ms",
         "body_drain_p50_ms",
+        "local_send_wait_p50_ms",
+        "local_send_wait_total_ms",
+        "local_send_waits",
+        "remote_event_wait_p50_ms",
+        "remote_event_wait_total_ms",
+        "remote_event_waits",
         "duration_p50_ms",
         "duration_p95_ms",
         "avg_flow_throughput_mib_s",
@@ -238,8 +290,8 @@ def self_test() -> None:
     sample = "\n".join(
         [
             "unrelated log line",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\toutcome=remote_eof",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\toutcome=closed",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\tlocal_send_wait_us=7000\tlocal_send_waits=2\tremote_event_wait_us=5000\tremote_event_waits=1\toutcome=remote_eof",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\tlocal_send_wait_us=11000\tlocal_send_waits=3\tremote_event_wait_us=9000\tremote_event_waits=2\toutcome=closed",
             "rustle_hotpath_tcp\ttransport=quic-native\tflow=10.0.0.3:49154->198.18.77.77:80\tgeneration=1\tstream_ready_us=500\topened_us=1500\tfirst_local_us=-\tfirst_local_sent_us=-\tfirst_remote_us=-\tduration_us=2500\tlocal_bytes=0\tremote_bytes=0\toutcome=open_timeout",
         ]
     )
@@ -256,12 +308,19 @@ def self_test() -> None:
     assert agent["payload_queue_wait_p50_ms"] == "1.000"
     assert agent["first_byte_wait_p50_ms"] == "6.000"
     assert agent["body_drain_p50_ms"] == "10.000"
+    assert agent["local_send_wait_p50_ms"] == "7.000"
+    assert agent["local_send_wait_total_ms"] == "18.000"
+    assert agent["local_send_waits"] == 5
+    assert agent["remote_event_wait_p50_ms"] == "5.000"
+    assert agent["remote_event_wait_total_ms"] == "14.000"
+    assert agent["remote_event_waits"] == 3
     assert agent["likely_bottleneck"] == "body_drain"
     assert agent["outcomes"] == "closed:1,remote_eof:1"
     native = next(summary for summary in summaries if summary["transport"] == "quic-native")
     assert native["failed_flows"] == 1
     assert native["first_remote_p50_ms"] == "-"
     assert native["first_byte_wait_p50_ms"] == "-"
+    assert native["local_send_wait_p50_ms"] == "-"
     assert native["likely_bottleneck"] == "remote_open_wait"
     assert native["outcomes"] == "open_timeout:1"
 
@@ -272,6 +331,13 @@ def self_test() -> None:
         "first_local_sent_us=-\tfirst_remote_us=-\tduration_us=1\t"
         "local_bytes=0\tremote_bytes=0\toutcome=closed\n",
         "invalid trace duration",
+    )
+    assert_rejects(
+        "rustle_hotpath_tcp\ttransport=agent\tflow=f\tgeneration=1\t"
+        "stream_ready_us=-\topened_us=-\tfirst_local_us=-\t"
+        "first_local_sent_us=-\tfirst_remote_us=-\tduration_us=1\t"
+        "local_bytes=0\tremote_bytes=0\tlocal_send_waits=-1\toutcome=closed\n",
+        "invalid negative hotpath local_send_waits",
     )
 
 

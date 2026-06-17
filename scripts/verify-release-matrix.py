@@ -1115,6 +1115,8 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "payload_queue_wait_p50_ms",
     "first_byte_wait_p50_ms",
     "body_drain_p50_ms",
+    "local_send_wait_p50_ms",
+    "remote_event_wait_p50_ms",
     "likely_bottleneck",
     "first_remote_p95_ms",
     "avg_flow_throughput_mib_s",

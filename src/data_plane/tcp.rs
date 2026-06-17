@@ -121,12 +121,14 @@ where
                             if !open_reported {
                                 pre_open_local.push_back(bytes.clone());
                             }
-                            match tokio::time::timeout(
+                            let send_started_at = StdInstant::now();
+                            let send_result = tokio::time::timeout(
                                 ssh_bridge::BRIDGE_WRITE_TIMEOUT,
                                 stream.send_data(bytes.clone()),
                             )
-                            .await
-                            {
+                            .await;
+                            trace.local_send_wait(send_started_at);
+                            match send_result {
                                 Ok(Ok(())) => {
                                     trace.local_sent();
                                 }
@@ -238,15 +240,17 @@ where
                                     pre_open_local.clear();
                                 }
                                 trace.remote_bytes(frame.payload.len());
-                                if !ssh_bridge::send_bridge_event(
+                                let event_started_at = StdInstant::now();
+                                let event_sent = ssh_bridge::send_bridge_event(
                                     &event_tx,
                                     ssh_bridge::BridgeEvent::RemoteData {
                                         id,
                                         bytes: frame.payload,
                                     },
                                 )
-                                .await
-                                {
+                                .await;
+                                trace.remote_event_wait(event_started_at);
+                                if !event_sent {
                                     trace.finish("event_channel_closed");
                                     break;
                                 }
@@ -474,12 +478,14 @@ pub(super) fn spawn_quic_native_tcp_bridge(
                         match local {
                             Some(bytes) => {
                                 trace.local_bytes(bytes.len());
-                                match tokio::time::timeout(
+                                let send_started_at = StdInstant::now();
+                                let send_result = tokio::time::timeout(
                                     ssh_bridge::BRIDGE_WRITE_TIMEOUT,
                                     stream.send_data(bytes),
                                 )
-                                .await
-                                {
+                                .await;
+                                trace.local_send_wait(send_started_at);
+                                match send_result {
                                     Ok(Ok(())) => {
                                         trace.local_sent();
                                     }
@@ -556,12 +562,14 @@ pub(super) fn spawn_quic_native_tcp_bridge(
                     match local {
                         Some(bytes) => {
                             trace.local_bytes(bytes.len());
-                            match tokio::time::timeout(
+                            let send_started_at = StdInstant::now();
+                            let send_result = tokio::time::timeout(
                                 ssh_bridge::BRIDGE_WRITE_TIMEOUT,
                                 stream.send_data(bytes),
                             )
-                            .await
-                            {
+                            .await;
+                            trace.local_send_wait(send_started_at);
+                            match send_result {
                                 Ok(Ok(())) => {
                                     trace.local_sent();
                                 }
@@ -607,12 +615,14 @@ pub(super) fn spawn_quic_native_tcp_bridge(
                     match remote {
                         Ok(Some(bytes)) => {
                             trace.remote_bytes(bytes.len());
-                            if !ssh_bridge::send_bridge_event(
+                            let event_started_at = StdInstant::now();
+                            let event_sent = ssh_bridge::send_bridge_event(
                                 &event_tx,
                                 ssh_bridge::BridgeEvent::RemoteData { id, bytes },
                             )
-                            .await
-                            {
+                            .await;
+                            trace.remote_event_wait(event_started_at);
+                            if !event_sent {
                                 trace.finish("event_channel_closed");
                                 break;
                             }
