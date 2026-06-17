@@ -233,6 +233,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
     let mut bridge_event_closed_flows = Vec::new();
     let mut expired_flows = Vec::new();
     let mut removable_flows = Vec::new();
+    let mut remote_backlog_overflows = 0_u64;
     let started_at = StdInstant::now();
     let deadline_secs = 30_u64.max(args.connections as u64);
     let deadline = tokio::time::Instant::now()
@@ -317,13 +318,15 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 }
                 _ => {}
             }
-            let _ = handle_bridge_event_into(
+            let bridge_event_stats = handle_bridge_event_into(
                 event,
                 &mut flow_manager,
                 &mut remote_backlogs,
                 now,
                 &mut bridge_event_closed_flows,
             )?;
+            remote_backlog_overflows = remote_backlog_overflows
+                .saturating_add(bridge_event_stats.remote_backlog_overflows);
             for closed_flow in bridge_event_closed_flows.drain(..) {
                 bridges.remove(&closed_flow);
             }
@@ -408,6 +411,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             closed_flows: &mut closed_flows,
             bridge_event_closed_flows: &mut bridge_event_closed_flows,
             removable_flows: &mut removable_flows,
+            remote_backlog_overflows: &mut remote_backlog_overflows,
         },
     )
     .await?;
@@ -422,7 +426,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             .filter(|client| bridge_lab_client_complete(client))
             .count();
         println!(
-            "bridge_lab_summary connections={} completed={} response_bytes={} elapsed_ms={} p50_us={} p95_us={} max_us={} active_flows={} active_bridges={} backlog_flows={} backlog_bytes={} cleanup_iterations={}",
+            "bridge_lab_summary connections={} completed={} response_bytes={} elapsed_ms={} p50_us={} p95_us={} max_us={} active_flows={} active_bridges={} backlog_flows={} backlog_bytes={} backlog_overflow={} cleanup_iterations={}",
             clients.len(),
             completed,
             response_bytes,
@@ -434,6 +438,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             bridges.len(),
             remote_backlogs.active_flow_count(),
             remote_backlogs.total_bytes(),
+            remote_backlog_overflows,
             cleanup_iterations,
         );
     } else {
@@ -454,6 +459,7 @@ struct BridgeLabCleanupScratch<'a> {
     closed_flows: &'a mut Vec<tcp_core::FlowKey>,
     bridge_event_closed_flows: &'a mut Vec<tcp_core::FlowKey>,
     removable_flows: &'a mut Vec<tcp_core::FlowKey>,
+    remote_backlog_overflows: &'a mut u64,
 }
 
 async fn settle_bridge_lab_cleanup(
@@ -489,13 +495,15 @@ async fn settle_bridge_lab_cleanup(
                 break;
             };
             processed_bridge_events += 1;
-            let _ = handle_bridge_event_into(
+            let bridge_event_stats = handle_bridge_event_into(
                 event,
                 flow_manager,
                 remote_backlogs,
                 now,
                 scratch.bridge_event_closed_flows,
             )?;
+            *scratch.remote_backlog_overflows = (*scratch.remote_backlog_overflows)
+                .saturating_add(bridge_event_stats.remote_backlog_overflows);
             for closed_flow in scratch.bridge_event_closed_flows.drain(..) {
                 bridges.remove(&closed_flow);
             }

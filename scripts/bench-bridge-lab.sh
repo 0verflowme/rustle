@@ -208,8 +208,9 @@ for body_bytes in $BODY_BYTES; do
         active_bridges="$(printf '%s\n' "$summary" | sed -n 's/.* active_bridges=\([0-9][0-9]*\).*/\1/p')"
         backlog_flows="$(printf '%s\n' "$summary" | sed -n 's/.* backlog_flows=\([0-9][0-9]*\).*/\1/p')"
         backlog_bytes="$(printf '%s\n' "$summary" | sed -n 's/.* backlog_bytes=\([0-9][0-9]*\).*/\1/p')"
+        backlog_overflow="$(printf '%s\n' "$summary" | sed -n 's/.* backlog_overflow=\([0-9][0-9]*\).*/\1/p')"
         cleanup_iterations="$(printf '%s\n' "$summary" | sed -n 's/.* cleanup_iterations=\([0-9][0-9]*\).*/\1/p')"
-        if [[ -z "$summary_completed" || -z "$response_bytes" || -z "$elapsed_ms" || -z "$p50_us" || -z "$p95_us" || -z "$max_us" || -z "$active_flows" || -z "$active_bridges" || -z "$backlog_flows" || -z "$backlog_bytes" || -z "$cleanup_iterations" ]]; then
+        if [[ -z "$summary_completed" || -z "$response_bytes" || -z "$elapsed_ms" || -z "$p50_us" || -z "$p95_us" || -z "$max_us" || -z "$active_flows" || -z "$active_bridges" || -z "$backlog_flows" || -z "$backlog_bytes" || -z "$backlog_overflow" || -z "$cleanup_iterations" ]]; then
           sed 's/^/rustle stdout: /' "$out" >&2 || true
           smoke_die "could not parse bridge benchmark summary for transport ${transport}"
         fi
@@ -226,6 +227,10 @@ for body_bytes in $BODY_BYTES; do
         if [[ "$active_flows" -ne 0 || "$active_bridges" -ne 0 || "$backlog_flows" -ne 0 || "$backlog_bytes" -ne 0 ]]; then
           sed 's/^/rustle stdout: /' "$out" >&2 || true
           smoke_die "bridge benchmark leaked lifecycle state: active_flows=${active_flows} active_bridges=${active_bridges} backlog_flows=${backlog_flows} backlog_bytes=${backlog_bytes}"
+        fi
+        if [[ "$backlog_overflow" -ne 0 ]]; then
+          sed 's/^/rustle stdout: /' "$out" >&2 || true
+          smoke_die "bridge benchmark observed remote backlog overflow: backlog_overflow=${backlog_overflow}"
         fi
         if [[ "$run" -le "$WARMUP_RUNS" ]]; then
           continue
