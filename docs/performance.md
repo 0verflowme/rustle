@@ -554,8 +554,12 @@ smoke matrix when debugging one transport. Add `RUSTLE_VERIFY_LIVE_FIXTURE=1`
 to include the controlled large-response fixture in the live verifier run.
 Set `RUSTLE_VERIFY_LIVE_UDP=1` to include the generic UDP live fixture; it
 starts a remote UDP responder over SSH, sends multiple datagrams through the
-TUN route with agent `OpenUdp`, waits for idle cleanup, and requires final
-`udp=... active:0` stats.
+TUN route, waits for idle cleanup, and requires final `udp=... active:0`
+stats. The default `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=agent` proves the product
+SSH-agent UDP path. Set `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` when
+you specifically want to prove that the remote network allows Rustle's
+SSH-bootstrapped UDP/QUIC helper data plane; that run should fail clearly when
+inbound UDP to the helper port is blocked.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 
@@ -619,8 +623,12 @@ mode on the same machines:
   shortens `--udp-idle-timeout-ms`, waits for idle cleanup, and requires final
   UDP stats to report zero active associations
 - `scripts/smoke-live-udp.sh` passes against a real remote `sshd` and UDP
-  fixture, proving generic UDP datagrams traverse route -> TUN -> agent
-  `OpenUdp` -> remote UDP socket -> synthesized return packet without leaks
+  fixture with the default `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=agent`, proving
+  generic UDP datagrams traverse route -> TUN -> agent `OpenUdp` -> remote UDP
+  socket -> synthesized return packet without leaks. Re-run it with
+  `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` before treating native QUIC
+  UDP as field-ready on that remote; failure there means the local host cannot
+  reach the SSH-bootstrapped QUIC helper over UDP.
 - intercepted DNS in agent mode keeps IPv4 resolver traffic on `OpenUdp`; only
   direct-tcpip compatibility and hostname DNS remotes use DNS-over-TCP
 - macOS system resolver takeover uses a bounded loopback DNS proxy because

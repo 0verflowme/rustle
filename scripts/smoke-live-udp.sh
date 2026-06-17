@@ -63,8 +63,8 @@ if [[ "$FIXTURE_TTL_SECONDS" -lt 1 ]]; then
   smoke_die "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS must be at least 1"
 fi
 case "$BRIDGE_TRANSPORT" in
-  agent) ;;
-  *) smoke_die "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT currently supports only agent" ;;
+  agent|quic-agent|quic-native) ;;
+  *) smoke_die "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT must be agent, quic-agent, or quic-native" ;;
 esac
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-udp-smoke.XXXXXX")"

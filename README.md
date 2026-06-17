@@ -161,6 +161,9 @@ scripts/verify-release-candidate.sh
 
 This fails on privileged/live skips, includes DNS takeover and live UDP, runs
 the controlled 1 MiB / 10 MiB / 100 MiB fixture benchmarks, and compares `rustle-agent` p50 latency against sshuttle.
+Live UDP uses the default SSH-agent path; set
+`RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` for a separate opt-in proof that
+the target allows Rustle's SSH-bootstrapped UDP/QUIC helper data plane.
 
 Run the rootless DNS latency benchmark:
 

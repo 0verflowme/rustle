@@ -467,10 +467,13 @@ Required before tagging a release:
   this smoke when the runner supports the required namespace and TUN operations;
   a skip is not release evidence by itself.
 - `scripts/smoke-live-udp.sh` passes against a real remote `sshd` and UDP
-  fixture, proving live generic UDP behavior through the framed agent transport:
-  route -> TUN -> agent `OpenUdp` association -> remote UDP socket ->
-  synthesized TUN response, with final `udp=... active:0` stats and route
-  cleanup.
+  fixture with the default `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=agent`, proving
+  live generic UDP behavior through the framed agent transport: route -> TUN ->
+  agent `OpenUdp` association -> remote UDP socket -> synthesized TUN response,
+  with final `udp=... active:0` stats and route cleanup. Re-run the same smoke
+  with `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` before counting native
+  QUIC UDP as release evidence on that remote; a failure there is UDP
+  reachability evidence, not an agent-product regression.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. The release workflow runs
   this smoke against the packaged Windows binary with embedded Wintun before
