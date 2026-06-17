@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::net::Ipv4Addr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -29,7 +30,7 @@ mod udp;
 
 pub(crate) use dns::spawn_dns_query_on_data_plane;
 use stream::AgentIoStream;
-use tcp::{spawn_data_plane_tcp_bridge_with_open, spawn_direct_tcpip_bridge};
+use tcp::spawn_data_plane_tcp_bridge_with_open;
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
@@ -45,12 +46,6 @@ pub(crate) trait DataPlane: Send + Sync {
     fn caps(&self) -> DataPlaneCaps;
     fn admission_limits(&self) -> BridgeAdmissionLimits;
     fn snapshot(&self) -> DataPlaneSnapshotFuture<'_>;
-    fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        ready_wait_ms: u64,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge;
     fn query_dns(
         &self,
         remote: Destination,
@@ -63,6 +58,44 @@ pub(crate) trait DataPlane: Send + Sync {
         mode: DataPlaneTcpOpenMode,
     ) -> OpenTcpFuture<'static>;
     fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static>;
+}
+
+pub(crate) fn spawn_tcp_bridge_on_data_plane(
+    data_plane: Arc<dyn DataPlane>,
+    id: tcp_core::FlowId,
+    ready_wait_ms: u64,
+    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+) -> ssh_bridge::FlowBridge {
+    let flow = id.key;
+    let label = data_plane.udp_label().unwrap_or_else(|| data_plane.label());
+    if data_plane.caps().udp_associations {
+        eprintln!(
+            "{label}: opening stream {}:{} for local {}:{} generation={}",
+            flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
+        );
+    } else {
+        eprintln!(
+            "ssh: opening direct-tcpip {}:{} for local {}:{} generation={}",
+            flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
+        );
+    }
+    let open = DataPlaneIpv4Open {
+        destination_ip: flow.dst_ip,
+        destination_port: flow.dst_port,
+        originator_ip: flow.src_ip,
+        originator_port: flow.src_port,
+        flow_generation: Some(id.generation),
+    };
+    spawn_data_plane_tcp_bridge_with_open(
+        id,
+        event_tx,
+        ready_wait_ms,
+        label,
+        data_plane.open_tcp(
+            DataPlaneTcpOpen::Ipv4(open),
+            DataPlaneTcpOpenMode::Optimistic,
+        ),
+    )
 }
 
 pub(crate) fn spawn_udp_association(
@@ -172,15 +205,6 @@ impl DataPlane for DirectTcpipDataPlane {
         Box::pin(async { DataPlaneRuntimeSnapshot::default() })
     }
 
-    fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        ready_wait_ms: u64,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge {
-        spawn_direct_tcpip_bridge(id, ready_wait_ms, event_tx, self.ssh.clone())
-    }
-
     fn query_dns(
         &self,
         remote: Destination,
@@ -198,41 +222,68 @@ impl DataPlane for DirectTcpipDataPlane {
         let ssh = self.ssh.clone();
         Box::pin(async move {
             let destination_label = open.destination_label();
-            let (destination_host, destination_port, originator_ip, originator_port) = match open {
-                DataPlaneTcpOpen::Ipv4(open) => (
-                    open.destination_ip.to_string(),
-                    u32::from(open.destination_port),
-                    open.originator_ip.to_string(),
-                    u32::from(open.originator_port),
-                ),
+            let channel = match open {
+                DataPlaneTcpOpen::Ipv4(open) if open.flow_generation.is_some() => {
+                    let flow = tcp_core::FlowKey::tcp(
+                        open.originator_ip,
+                        open.originator_port,
+                        open.destination_ip,
+                        open.destination_port,
+                    );
+                    let id = tcp_core::FlowId::new(
+                        flow,
+                        open.flow_generation.expect("checked flow generation"),
+                    );
+                    tokio::time::timeout(
+                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                        ssh.open_direct_tcpip_for_flow(id),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                            ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                        )
+                    })??
+                }
+                DataPlaneTcpOpen::Ipv4(open) => tokio::time::timeout(
+                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                    ssh.open_background_direct_tcpip(
+                        open.destination_ip.to_string(),
+                        u32::from(open.destination_port),
+                        open.originator_ip.to_string(),
+                        u32::from(open.originator_port),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                    )
+                })??,
                 DataPlaneTcpOpen::Host {
                     destination_host,
                     destination_port,
                     originator_ip,
                     originator_port,
-                } => (
-                    destination_host,
-                    u32::from(destination_port),
-                    originator_ip.to_string(),
-                    u32::from(originator_port),
-                ),
-            };
-            let channel = tokio::time::timeout(
-                ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
-                ssh.open_background_direct_tcpip(
-                    destination_host,
-                    destination_port,
-                    originator_ip,
-                    originator_port,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                } => tokio::time::timeout(
+                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                    ssh.open_background_direct_tcpip(
+                        destination_host,
+                        u32::from(destination_port),
+                        originator_ip.to_string(),
+                        u32::from(originator_port),
+                    ),
                 )
-            })??;
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                    )
+                })??,
+            };
             Ok(AgentIoStream::direct_tcpip(channel))
         })
     }
@@ -272,36 +323,6 @@ impl DataPlane for FramedAgentDataPlane {
         Box::pin(async move { data_plane_runtime_snapshot_from_agent(agent.snapshot().await) })
     }
 
-    fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        ready_wait_ms: u64,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge {
-        let flow = id.key;
-        eprintln!(
-            "agent: opening stream {}:{} for local {}:{} generation={}",
-            flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
-        );
-        let open = DataPlaneIpv4Open {
-            destination_ip: flow.dst_ip,
-            destination_port: flow.dst_port,
-            originator_ip: flow.src_ip,
-            originator_port: flow.src_port,
-        };
-        spawn_data_plane_tcp_bridge_with_open(
-            id,
-            event_tx,
-            ready_wait_ms,
-            "agent",
-            Some(self.agent.clone()),
-            self.open_tcp(
-                DataPlaneTcpOpen::Ipv4(open),
-                DataPlaneTcpOpenMode::Optimistic,
-            ),
-        )
-    }
-
     fn query_dns(
         &self,
         remote: Destination,
@@ -319,31 +340,38 @@ impl DataPlane for FramedAgentDataPlane {
         let agent = self.agent.clone();
         Box::pin(async move {
             match open {
-                DataPlaneTcpOpen::Ipv4(open) => match mode {
-                    DataPlaneTcpOpenMode::Strict => {
-                        agent.open_tcp_ipv4(open.into_agent_open()).await
-                    }
-                    DataPlaneTcpOpenMode::Optimistic => {
-                        agent.open_tcp_ipv4_optimistic(open.into_agent_open()).await
-                    }
-                },
+                DataPlaneTcpOpen::Ipv4(open) => {
+                    let stream = match mode {
+                        DataPlaneTcpOpenMode::Strict => {
+                            agent.open_tcp_ipv4(open.into_agent_open()).await?
+                        }
+                        DataPlaneTcpOpenMode::Optimistic => {
+                            agent
+                                .open_tcp_ipv4_optimistic(open.into_agent_open())
+                                .await?
+                        }
+                    };
+                    let retry_agent =
+                        (mode == DataPlaneTcpOpenMode::Optimistic).then(|| agent.clone());
+                    Ok(AgentIoStream::agent_bridge_with_retry(stream, retry_agent))
+                }
                 DataPlaneTcpOpen::Host {
                     destination_host,
                     destination_port,
                     originator_ip,
                     originator_port,
                 } => {
-                    agent
+                    let stream = agent
                         .open_tcp_host(crate::agent_proto::AgentOpenHost {
                             destination_host,
                             destination_port,
                             originator_ip,
                             originator_port,
                         })
-                        .await
+                        .await?;
+                    Ok(AgentIoStream::agent_bridge(stream))
                 }
             }
-            .map(AgentIoStream::Bridge)
         })
     }
 
@@ -374,36 +402,6 @@ impl DataPlane for QuicNativeDataPlane {
     fn snapshot(&self) -> DataPlaneSnapshotFuture<'_> {
         let bridge = self.bridge.clone();
         Box::pin(async move { data_plane_runtime_snapshot_from_quic_native(bridge.snapshot()) })
-    }
-
-    fn spawn_tcp_bridge(
-        &self,
-        id: tcp_core::FlowId,
-        ready_wait_ms: u64,
-        event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ) -> ssh_bridge::FlowBridge {
-        let flow = id.key;
-        eprintln!(
-            "quic-native: opening stream {}:{} for local {}:{} generation={}",
-            flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
-        );
-        let open = DataPlaneIpv4Open {
-            destination_ip: flow.dst_ip,
-            destination_port: flow.dst_port,
-            originator_ip: flow.src_ip,
-            originator_port: flow.src_port,
-        };
-        spawn_data_plane_tcp_bridge_with_open(
-            id,
-            event_tx,
-            ready_wait_ms,
-            "quic-native",
-            None,
-            self.open_tcp(
-                DataPlaneTcpOpen::Ipv4(open),
-                DataPlaneTcpOpenMode::Optimistic,
-            ),
-        )
     }
 
     fn query_dns(
@@ -565,6 +563,7 @@ mod tests {
             destination_port: destination.port(),
             originator_ip: Ipv4Addr::new(10, 255, 255, 1),
             originator_port: 49152,
+            flow_generation: None,
         }
     }
 
@@ -960,7 +959,7 @@ mod tests {
             1,
         );
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let flow = data_plane.spawn_tcp_bridge(id, 0, event_tx);
+        let flow = spawn_tcp_bridge_on_data_plane(Arc::new(data_plane.clone()), id, 0, event_tx);
 
         assert!(
             flow.try_send_local_data(Bytes::from_static(b"bridge-tcp"))

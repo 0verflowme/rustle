@@ -88,6 +88,7 @@ pub(crate) struct DataPlaneIpv4Open {
     pub(crate) destination_port: u16,
     pub(crate) originator_ip: Ipv4Addr,
     pub(crate) originator_port: u16,
+    pub(crate) flow_generation: Option<u64>,
 }
 
 impl DataPlaneIpv4Open {
@@ -174,6 +175,7 @@ impl UdpFlowKey {
             destination_port: self.dst_port,
             originator_ip: self.src_ip,
             originator_port: self.src_port,
+            flow_generation: None,
         }
     }
 

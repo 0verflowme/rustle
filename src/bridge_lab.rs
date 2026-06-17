@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::cli::BridgeLabArgs;
 use crate::control_plane::connect_tunnel_runtime;
+use crate::data_plane::spawn_tcp_bridge_on_data_plane;
 use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_PREFIX};
 use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
@@ -262,7 +263,14 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             &mut flow_manager,
             &mut bridges,
             data_plane.admission_limits(),
-            |start, event_tx| data_plane.spawn_tcp_bridge(start.id, start.ready_wait_ms, event_tx),
+            |start, event_tx| {
+                spawn_tcp_bridge_on_data_plane(
+                    data_plane.clone(),
+                    start.id,
+                    start.ready_wait_ms,
+                    event_tx,
+                )
+            },
             event_tx.clone(),
             &mut ready_flow_ids,
             now,

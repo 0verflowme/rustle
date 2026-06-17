@@ -159,6 +159,7 @@ where
                 destination_port: remote.port,
                 originator_ip,
                 originator_port: 0,
+                flow_generation: None,
             })
             .await
             .with_context(|| {

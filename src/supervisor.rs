@@ -4,7 +4,9 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::control_plane::{connect_tunnel_runtime, validate_agent_session_request_count};
-use crate::data_plane::{spawn_dns_query_on_data_plane, spawn_udp_association, DataPlane};
+use crate::data_plane::{
+    spawn_dns_query_on_data_plane, spawn_tcp_bridge_on_data_plane, spawn_udp_association, DataPlane,
+};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, tun_ipv4_packet,
@@ -355,7 +357,12 @@ fn execute_tcp_bridge_starts(
     event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
 ) -> Result<()> {
     for start in starts.drain(..) {
-        let bridge = data_plane.spawn_tcp_bridge(start.id, start.ready_wait_ms, event_tx.clone());
+        let bridge = spawn_tcp_bridge_on_data_plane(
+            Arc::clone(data_plane),
+            start.id,
+            start.ready_wait_ms,
+            event_tx.clone(),
+        );
         engine.register_tcp_bridge(start, bridge)?;
     }
     Ok(())

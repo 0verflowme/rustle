@@ -3,7 +3,7 @@ use bytes::Bytes;
 
 use crate::agent_proto;
 
-use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream};
+use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream, ReconnectingAgentBridge};
 #[cfg(test)]
 use crate::agent_transport;
 use crate::ssh_bridge::DirectTcpipChannel;
@@ -26,7 +26,10 @@ impl From<crate::agent_transport::AgentStreamSendMetrics> for StreamSendMetrics 
 }
 
 pub(crate) enum AgentIoStream {
-    Bridge(AgentBridgeStream),
+    Bridge {
+        stream: AgentBridgeStream,
+        pre_open_retry_agent: Option<ReconnectingAgentBridge>,
+    },
     DirectTcpip {
         channel: DirectTcpipChannel,
         opened_reported: bool,
@@ -41,6 +44,20 @@ pub(crate) enum AgentIoStream {
 }
 
 impl AgentIoStream {
+    pub(crate) fn agent_bridge(stream: AgentBridgeStream) -> Self {
+        Self::agent_bridge_with_retry(stream, None)
+    }
+
+    pub(crate) fn agent_bridge_with_retry(
+        stream: AgentBridgeStream,
+        pre_open_retry_agent: Option<ReconnectingAgentBridge>,
+    ) -> Self {
+        Self::Bridge {
+            stream,
+            pre_open_retry_agent,
+        }
+    }
+
     pub(crate) fn direct_tcpip(channel: DirectTcpipChannel) -> Self {
         Self::DirectTcpip {
             channel,
@@ -66,6 +83,16 @@ impl AgentIoStream {
         }
     }
 
+    pub(crate) fn pre_open_retry_agent(&self) -> Option<ReconnectingAgentBridge> {
+        match self {
+            Self::Bridge {
+                pre_open_retry_agent,
+                ..
+            } => pre_open_retry_agent.clone(),
+            _ => None,
+        }
+    }
+
     pub(crate) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
         self.send_data_with_metrics(bytes).await.map(|_| ())
     }
@@ -75,7 +102,9 @@ impl AgentIoStream {
         bytes: impl Into<Bytes>,
     ) -> Result<StreamSendMetrics> {
         match self {
-            Self::Bridge(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
+            Self::Bridge { stream, .. } => {
+                stream.send_data_with_metrics(bytes).await.map(Into::into)
+            }
             Self::DirectTcpip { channel, .. } => {
                 channel.data_bytes(bytes.into()).await?;
                 Ok(StreamSendMetrics::default())
@@ -95,7 +124,7 @@ impl AgentIoStream {
 
     pub(crate) async fn send_eof(&mut self) -> Result<()> {
         match self {
-            Self::Bridge(stream) => stream.send_eof().await,
+            Self::Bridge { stream, .. } => stream.send_eof().await,
             Self::DirectTcpip { channel, .. } => channel
                 .eof()
                 .await
@@ -109,7 +138,7 @@ impl AgentIoStream {
 
     pub(crate) async fn recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
         match self {
-            Self::Bridge(stream) => Ok(stream.recv().await),
+            Self::Bridge { stream, .. } => Ok(stream.recv().await),
             Self::DirectTcpip {
                 channel,
                 opened_reported,
@@ -196,7 +225,7 @@ impl AgentIoStream {
 
     pub(crate) async fn close(self) -> Result<()> {
         match self {
-            Self::Bridge(stream) => stream.close().await,
+            Self::Bridge { stream, .. } => stream.close().await,
             Self::DirectTcpip { channel, .. } => channel
                 .close()
                 .await

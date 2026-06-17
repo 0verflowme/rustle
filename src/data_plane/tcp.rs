@@ -8,40 +8,12 @@ use tokio::sync::mpsc;
 
 use crate::agent_bridge::ReconnectingAgentBridge;
 use crate::hotpath_trace::TcpFlowTrace;
-use crate::ssh_control::SshSessionPool;
 use crate::transport_model::DataPlaneIpv4Open;
 use crate::{agent_proto, ssh_bridge, tcp_core};
 
 use super::stream::AgentIoStream;
 
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
-
-pub(super) fn spawn_direct_tcpip_bridge(
-    id: tcp_core::FlowId,
-    ready_wait_ms: u64,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    ssh: SshSessionPool,
-) -> ssh_bridge::FlowBridge {
-    let flow = id.key;
-    eprintln!(
-        "ssh: opening direct-tcpip {}:{} for local {}:{} generation={}",
-        flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
-    );
-    spawn_data_plane_tcp_bridge_with_open(id, event_tx, ready_wait_ms, "SSH", None, async move {
-        let channel = tokio::time::timeout(
-            ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
-            ssh.open_direct_tcpip_for_flow(id),
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "timed out after {}ms opening direct-tcpip stream",
-                ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
-            )
-        })??;
-        Ok(AgentIoStream::direct_tcpip(channel))
-    })
-}
 
 #[cfg(test)]
 pub(crate) fn spawn_agent_tcp_bridge(
@@ -55,7 +27,6 @@ pub(crate) fn spawn_agent_tcp_bridge(
         event_tx,
         0,
         "agent",
-        Some(agent.clone()),
         open_agent_tcp_stream(agent, open),
     )
 }
@@ -65,7 +36,6 @@ pub(super) fn spawn_data_plane_tcp_bridge_with_open<Fut>(
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     ready_wait_ms: u64,
     transport_label: &'static str,
-    retry_agent: Option<ReconnectingAgentBridge>,
     open_stream: Fut,
 ) -> ssh_bridge::FlowBridge
 where
@@ -92,6 +62,7 @@ where
             }
         };
         trace.stream_ready();
+        let retry_agent = stream.pre_open_retry_agent();
         let mut open_reported = false;
         let mut pre_open_local = VecDeque::<Bytes>::new();
         let mut pre_open_retries = 0_usize;
@@ -461,6 +432,7 @@ fn tcp_open_request(id: tcp_core::FlowId) -> DataPlaneIpv4Open {
         destination_port: id.key.dst_port,
         originator_ip: id.key.src_ip,
         originator_port: id.key.src_port,
+        flow_generation: Some(id.generation),
     }
 }
 
@@ -469,10 +441,11 @@ async fn open_agent_tcp_stream(
     agent: ReconnectingAgentBridge,
     open: DataPlaneIpv4Open,
 ) -> Result<AgentIoStream> {
+    let retry_agent = agent.clone();
     agent
         .open_tcp_ipv4_optimistic(open.into_agent_open())
         .await
-        .map(AgentIoStream::Bridge)
+        .map(|stream| AgentIoStream::agent_bridge_with_retry(stream, Some(retry_agent)))
 }
 
 async fn retry_agent_pre_open_stream(
@@ -489,7 +462,7 @@ async fn retry_agent_pre_open_stream(
         .open_tcp_ipv4_optimistic(open)
         .await
         .context("failed to reopen optimistic agent stream")?;
-    let mut stream = AgentIoStream::Bridge(stream);
+    let mut stream = AgentIoStream::agent_bridge_with_retry(stream, Some(agent.clone()));
     for bytes in replay {
         stream
             .send_data(bytes.clone())
@@ -658,6 +631,170 @@ mod tests {
 
         drop(bridge);
         fake_agent.await.expect("fake agent join");
+    }
+
+    #[tokio::test]
+    async fn agent_tcp_bridge_retries_pre_open_close_and_replays_local_data() {
+        let (first_client_io, first_agent_io) = tokio::io::duplex(256 * 1024);
+        let (replacement_client_io, replacement_agent_io) = tokio::io::duplex(256 * 1024);
+        let (first_data_seen_tx, first_data_seen_rx) = tokio::sync::oneshot::channel();
+        let (replacement_data_seen_tx, replacement_data_seen_rx) = tokio::sync::oneshot::channel();
+        let (replacement_finish_tx, replacement_finish_rx) = tokio::sync::oneshot::channel();
+
+        let first_fake_agent = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(first_agent_io);
+            let mut inbound = BytesMut::new();
+
+            let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Hello,
+                    0,
+                    agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
+                )
+                .expect("test hello frame"),
+            )
+            .await;
+
+            let open = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(open.kind, agent_proto::AgentFrameKind::OpenTcp);
+
+            let window = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(window.kind, agent_proto::AgentFrameKind::Window);
+            assert_eq!(window.stream_id, open.stream_id);
+
+            let data = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(data.kind, agent_proto::AgentFrameKind::Data);
+            assert_eq!(data.stream_id, open.stream_id);
+            assert_eq!(&data.payload[..], b"retry-me");
+            first_data_seen_tx.send(()).expect("report first data");
+        });
+
+        let replacement_fake_agent = tokio::spawn(async move {
+            let (mut reader, mut writer) = tokio::io::split(replacement_agent_io);
+            let mut inbound = BytesMut::new();
+
+            let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Hello,
+                    0,
+                    agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
+                )
+                .expect("replacement hello frame"),
+            )
+            .await;
+
+            let open = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(open.kind, agent_proto::AgentFrameKind::OpenTcp);
+
+            let window = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(window.kind, agent_proto::AgentFrameKind::Window);
+            assert_eq!(window.stream_id, open.stream_id);
+
+            let data = read_test_agent_frame(&mut reader, &mut inbound).await;
+            assert_eq!(data.kind, agent_proto::AgentFrameKind::Data);
+            assert_eq!(data.stream_id, open.stream_id);
+            assert_eq!(&data.payload[..], b"retry-me");
+            replacement_data_seen_tx
+                .send(())
+                .expect("report replacement data");
+
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Opened,
+                    open.stream_id,
+                    Bytes::new(),
+                )
+                .expect("replacement opened frame")
+                .with_credit((1024 * 1024) as u32),
+            )
+            .await;
+            write_test_agent_frame(
+                &mut writer,
+                agent_proto::AgentFrame::new(
+                    agent_proto::AgentFrameKind::Eof,
+                    open.stream_id,
+                    Bytes::new(),
+                )
+                .expect("replacement EOF frame"),
+            )
+            .await;
+            let _ = replacement_finish_rx.await;
+        });
+
+        let (first_client_reader, first_client_writer) = tokio::io::split(first_client_io);
+        let first_transport = agent_transport::AgentTransport::connect(
+            first_client_reader,
+            first_client_writer,
+            DEFAULT_MTU,
+        )
+        .await
+        .expect("connect first fake agent transport");
+        let (replacement_client_reader, replacement_client_writer) =
+            tokio::io::split(replacement_client_io);
+        let replacement_transport = agent_transport::AgentTransport::connect(
+            replacement_client_reader,
+            replacement_client_writer,
+            DEFAULT_MTU,
+        )
+        .await
+        .expect("connect replacement fake agent transport");
+        let connector = QueuedAgentConnector::new(
+            "rustle agent",
+            vec![detached_bridge_transport(replacement_transport)],
+            Vec::new(),
+        );
+        let agent = ReconnectingAgentBridge::new(
+            connector,
+            vec![detached_bridge_transport(first_transport)],
+        );
+        let id = test_flow_id();
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let bridge = spawn_agent_tcp_bridge(id, event_tx, agent);
+
+        assert!(
+            bridge
+                .try_send_local_data(Bytes::from_static(b"retry-me"))
+                .expect("queue local data"),
+            "bridge should accept first local payload"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_data_seen_rx)
+            .await
+            .expect("first agent sees optimistic data")
+            .expect("first data seen notification");
+        tokio::time::timeout(std::time::Duration::from_secs(1), replacement_data_seen_rx)
+            .await
+            .expect("replacement agent sees replayed data")
+            .expect("replacement data seen notification");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("opened event after retry")
+            .expect("bridge event");
+        assert!(
+            matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id),
+            "expected opened event after retry, got {event:?}"
+        );
+        if let Ok(Some(ssh_bridge::BridgeEvent::Failed { message, .. })) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await
+        {
+            panic!("bridge emitted failure after successful retry: {message}");
+        }
+
+        drop(bridge);
+        replacement_finish_tx
+            .send(())
+            .expect("release replacement fake agent");
+        first_fake_agent.await.expect("first fake agent join");
+        replacement_fake_agent
+            .await
+            .expect("replacement fake agent join");
     }
 
     #[tokio::test]

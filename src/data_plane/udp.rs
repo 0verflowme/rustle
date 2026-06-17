@@ -62,7 +62,7 @@ pub(super) async fn open_agent_udp_association(
     agent
         .open_udp_ipv4(open.into_agent_open())
         .await
-        .map(AgentIoStream::Bridge)
+        .map(AgentIoStream::agent_bridge)
         .with_context(|| {
             format!(
                 "failed to open agent UDP association to {}:{}",
