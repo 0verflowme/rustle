@@ -12,8 +12,11 @@ use crate::{dns, ssh_bridge, tcp_core};
 
 mod admission;
 mod backlog;
+mod clock;
+mod dns_ingress;
 mod status;
 mod tcp_bridge;
+mod tun;
 mod udp;
 
 pub(crate) use admission::AdmissionCounter;
@@ -22,6 +25,8 @@ pub(crate) use backlog::{
     RemoteBacklogPush, REMOTE_BACKLOG_BYTES_TOTAL, REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW,
 };
 pub(crate) use backlog::{RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW};
+pub(crate) use clock::smol_now;
+pub(crate) use dns_ingress::{parse_dns_request_for_tunnel, MAX_IN_FLIGHT_DNS_QUERIES};
 pub(crate) use status::{TcpRuntimeSnapshot, TunnelStats, TunnelStatusSnapshot};
 pub(crate) use tcp_bridge::{
     drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
@@ -30,6 +35,7 @@ pub(crate) use tcp_bridge::{
 };
 #[cfg(test)]
 pub(crate) use tcp_bridge::{handle_bridge_event, should_log_stale_bridge_event};
+pub(crate) use tun::{tun_ipv4_packet, TunWriteStats, PACKET_BUF_SIZE};
 pub(crate) use udp::{
     apply_udp_ingress_action, parse_udp_request_for_agent_tunnel, plan_udp_datagram_actions,
     UdpAssociationStart, UdpAssociationTransportPlan, UdpIngressAction,
@@ -37,77 +43,6 @@ pub(crate) use udp::{
 };
 #[cfg(test)]
 pub(crate) use udp::{apply_udp_ingress_actions, drop_unsupported_direct_udp, UdpDropReason};
-
-pub(crate) const PACKET_BUF_SIZE: usize = 2048;
-pub(crate) const MAX_IN_FLIGHT_DNS_QUERIES: usize = 128;
-
-pub(crate) fn smol_now(started_at: StdInstant) -> SmolInstant {
-    let millis = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
-    SmolInstant::from_millis(millis)
-}
-
-pub(crate) fn parse_dns_request_for_tunnel(packet: &[u8]) -> Option<dns::UdpDnsRequest> {
-    match dns::parse_udp_dns_request(packet) {
-        Ok(request) => request,
-        Err(err) => {
-            eprintln!("dns: packet parse failed: {err}");
-            None
-        }
-    }
-}
-
-pub(crate) fn tun_ipv4_packet(packet: &[u8]) -> Option<&[u8]> {
-    const LINUX_PI_IPV4: [u8; 4] = [0x00, 0x00, 0x08, 0x00];
-    const LINUX_PI_IPV6: [u8; 4] = [0x00, 0x00, 0x86, 0xdd];
-
-    match packet.first().map(|byte| byte >> 4) {
-        Some(4) => Some(packet),
-        Some(6) => None,
-        _ if packet.len() >= LINUX_PI_IPV4.len()
-            && packet[..LINUX_PI_IPV4.len()] == LINUX_PI_IPV4
-            && packet[LINUX_PI_IPV4.len()] >> 4 == 4 =>
-        {
-            Some(&packet[LINUX_PI_IPV4.len()..])
-        }
-        _ if packet.len() >= LINUX_PI_IPV6.len()
-            && packet[..LINUX_PI_IPV6.len()] == LINUX_PI_IPV6 =>
-        {
-            None
-        }
-        _ => None,
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
-pub(crate) struct TunWriteStats {
-    pub(crate) packets: u64,
-    pub(crate) bytes: u64,
-    pub(crate) dropped_packets: u64,
-    pub(crate) dropped_bytes: u64,
-}
-
-impl TunWriteStats {
-    pub(crate) fn record_written(&mut self, len: usize) {
-        self.packets = self.packets.saturating_add(1);
-        self.bytes = self.bytes.saturating_add(len as u64);
-    }
-
-    pub(crate) fn record_dropped(&mut self, len: usize) {
-        self.dropped_packets = self.dropped_packets.saturating_add(1);
-        self.dropped_bytes = self.dropped_bytes.saturating_add(len as u64);
-    }
-
-    pub(crate) fn combine(&mut self, other: Self) {
-        self.packets = self.packets.saturating_add(other.packets);
-        self.bytes = self.bytes.saturating_add(other.bytes);
-        self.dropped_packets = self.dropped_packets.saturating_add(other.dropped_packets);
-        self.dropped_bytes = self.dropped_bytes.saturating_add(other.dropped_bytes);
-    }
-
-    pub(crate) fn delivered_at_least_one_packet_without_drop(&self) -> bool {
-        self.packets > 0 && self.dropped_packets == 0
-    }
-}
 
 pub(crate) struct TunnelEngine {
     flow_manager: tcp_core::FlowManager,
@@ -870,33 +805,6 @@ mod tests {
         assert_eq!(stats.udp_failed, 1);
         assert_eq!(stats.tun_tx_packets, 3);
         assert_eq!(stats.tun_tx_dropped_packets, 2);
-    }
-
-    #[test]
-    fn tun_ipv4_packet_accepts_raw_ipv4() {
-        let packet = [
-            0x45, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2,
-        ];
-
-        assert_eq!(tun_ipv4_packet(&packet), Some(packet.as_slice()));
-    }
-
-    #[test]
-    fn tun_ipv4_packet_strips_linux_pi_ipv4_header() {
-        let packet = [
-            0x00, 0x00, 0x08, 0x00, 0x45, 0x00, 0x00, 0x14, 0, 0, 0, 0, 64, 6, 0, 0, 10, 0, 0, 1,
-            10, 0, 0, 2,
-        ];
-
-        assert_eq!(tun_ipv4_packet(&packet), Some(&packet[4..]));
-    }
-
-    #[test]
-    fn tun_ipv4_packet_ignores_non_ipv4() {
-        assert_eq!(tun_ipv4_packet(&[0x60, 0, 0, 0]), None);
-        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x86, 0xdd, 0x60]), None);
-        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x08, 0x00, 0x60]), None);
-        assert_eq!(tun_ipv4_packet(&[]), None);
     }
 
     #[test]
