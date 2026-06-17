@@ -119,6 +119,19 @@ fn data_plane_runtime_snapshot_from_agent(
     }
 }
 
+fn data_plane_runtime_snapshot_from_quic_native(
+    snapshot: crate::agent_bridge::QuicNativeBridgeSnapshot,
+) -> DataPlaneRuntimeSnapshot {
+    DataPlaneRuntimeSnapshot {
+        lanes_total: 1,
+        lanes_desired: 1,
+        lanes_available: 1,
+        active_streams: snapshot.active_streams,
+        max_lane_load: snapshot.active_streams,
+        ..DataPlaneRuntimeSnapshot::default()
+    }
+}
+
 impl DataPlane for DirectTcpipDataPlane {
     fn label(&self) -> &'static str {
         "SSH"
@@ -256,7 +269,8 @@ impl DataPlane for QuicNativeDataPlane {
     }
 
     fn snapshot(&self) -> DataPlaneSnapshotFuture<'_> {
-        Box::pin(async { DataPlaneRuntimeSnapshot::default() })
+        let bridge = self.bridge.clone();
+        Box::pin(async move { data_plane_runtime_snapshot_from_quic_native(bridge.snapshot()) })
     }
 
     fn spawn_tcp_bridge(
@@ -523,7 +537,12 @@ mod tests {
         );
         assert_eq!(
             data_plane.snapshot().await,
-            DataPlaneRuntimeSnapshot::default()
+            DataPlaneRuntimeSnapshot {
+                lanes_total: 1,
+                lanes_desired: 1,
+                lanes_available: 1,
+                ..DataPlaneRuntimeSnapshot::default()
+            }
         );
 
         bridge.close_for_test("test complete");
@@ -574,6 +593,7 @@ mod tests {
             events,
             std::time::Duration::from_secs(30),
         );
+        eventually_assert_quic_native_active_streams(&data_plane, 1).await;
         to_remote
             .send(Bytes::from_static(b"one"))
             .await
@@ -615,9 +635,32 @@ mod tests {
             .expect("close event");
         assert_eq!(closed.key, key);
         assert!(closed.error.is_none());
+        eventually_assert_quic_native_active_streams(&data_plane, 0).await;
 
         bridge.close_for_test("test complete");
         bridge_task.await.expect("native bridge task");
         udp_server.await.expect("UDP server join");
+    }
+
+    async fn eventually_assert_quic_native_active_streams(
+        data_plane: &QuicNativeDataPlane,
+        expected: usize,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let snapshot = data_plane.snapshot().await;
+            if snapshot.active_streams == expected {
+                assert_eq!(snapshot.lanes_total, 1);
+                assert_eq!(snapshot.lanes_desired, 1);
+                assert_eq!(snapshot.lanes_available, 1);
+                assert_eq!(snapshot.max_lane_load, expected);
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for quic-native active_streams={expected}, last snapshot={snapshot:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 }

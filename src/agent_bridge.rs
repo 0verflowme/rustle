@@ -26,7 +26,9 @@ pub(crate) use affinity::{
 pub(crate) use affinity::{agent_lane_backoff_duration, agent_lane_bit};
 #[cfg(test)]
 pub(crate) use carrier::AgentBridgeCarrier;
-pub(crate) use carrier::{AgentBridgeTransport, QuicNativeBridge};
+pub(crate) use carrier::{
+    AgentBridgeTransport, QuicNativeBridge, QuicNativeBridgeSnapshot, QuicNativeBridgeStream,
+};
 
 const AGENT_BACKGROUND_REPAIR_RETRY_ROUNDS: usize = 3;
 

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -9,7 +10,18 @@ use crate::{agent_proto, agent_transport, quic_agent};
 #[derive(Clone)]
 pub(crate) struct QuicNativeBridge {
     client: quic_agent::QuicBridgeClient,
+    active_streams: Arc<AtomicUsize>,
     _carrier: Option<Arc<QuicNativeCarrier>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct QuicNativeBridgeSnapshot {
+    pub(crate) active_streams: usize,
+}
+
+pub(crate) struct QuicNativeBridgeStream {
+    inner: Option<quic_agent::QuicBridgeStream>,
+    active_streams: Arc<AtomicUsize>,
 }
 
 struct QuicNativeCarrier {
@@ -28,6 +40,7 @@ impl QuicNativeBridge {
     pub(crate) fn detached(client: quic_agent::QuicBridgeClient) -> Self {
         Self {
             client,
+            active_streams: Arc::new(AtomicUsize::new(0)),
             _carrier: None,
         }
     }
@@ -39,6 +52,7 @@ impl QuicNativeBridge {
     ) -> Self {
         Self {
             client,
+            active_streams: Arc::new(AtomicUsize::new(0)),
             _carrier: Some(Arc::new(QuicNativeCarrier {
                 _handle: handle,
                 drain_task,
@@ -49,27 +63,81 @@ impl QuicNativeBridge {
     pub(crate) async fn open_tcp_ipv4_optimistic(
         &self,
         open: agent_proto::AgentOpenIpv4,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_tcp_ipv4_optimistic(open).await
+    ) -> Result<QuicNativeBridgeStream> {
+        self.wrap_stream(self.client.open_tcp_ipv4_optimistic(open).await?)
     }
 
     pub(crate) async fn open_udp_ipv4(
         &self,
         open: agent_proto::AgentOpenIpv4,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_udp_ipv4(open).await
+    ) -> Result<QuicNativeBridgeStream> {
+        self.wrap_stream(self.client.open_udp_ipv4(open).await?)
     }
 
     pub(crate) async fn open_tcp_host(
         &self,
         open: agent_proto::AgentOpenHost,
-    ) -> Result<quic_agent::QuicBridgeStream> {
-        self.client.open_tcp_host(open).await
+    ) -> Result<QuicNativeBridgeStream> {
+        self.wrap_stream(self.client.open_tcp_host(open).await?)
+    }
+
+    pub(crate) fn snapshot(&self) -> QuicNativeBridgeSnapshot {
+        QuicNativeBridgeSnapshot {
+            active_streams: self.active_streams.load(Ordering::Acquire),
+        }
+    }
+
+    fn wrap_stream(&self, inner: quic_agent::QuicBridgeStream) -> Result<QuicNativeBridgeStream> {
+        self.active_streams.fetch_add(1, Ordering::AcqRel);
+        Ok(QuicNativeBridgeStream {
+            inner: Some(inner),
+            active_streams: Arc::clone(&self.active_streams),
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn close_for_test(&self, reason: &str) {
         self.client.close(reason);
+    }
+}
+
+impl QuicNativeBridgeStream {
+    pub(crate) async fn wait_opened(&mut self) -> Result<()> {
+        self.inner_mut()?.wait_opened().await
+    }
+
+    pub(crate) async fn send_data(&mut self, bytes: bytes::Bytes) -> Result<()> {
+        self.inner_mut()?.send_data(bytes).await
+    }
+
+    pub(crate) async fn send_datagram(&mut self, bytes: bytes::Bytes) -> Result<()> {
+        self.inner_mut()?.send_datagram(bytes).await
+    }
+
+    pub(crate) async fn send_eof(&mut self) -> Result<()> {
+        self.inner_mut()?.send_eof().await
+    }
+
+    pub(crate) async fn recv_chunk(&mut self, max_len: usize) -> Result<Option<bytes::Bytes>> {
+        self.inner_mut()?.recv_chunk(max_len).await
+    }
+
+    pub(crate) async fn recv_datagram(&mut self) -> Result<Option<bytes::Bytes>> {
+        self.inner_mut()?.recv_datagram().await
+    }
+
+    fn inner_mut(&mut self) -> Result<&mut quic_agent::QuicBridgeStream> {
+        self.inner
+            .as_mut()
+            .context("native QUIC bridge stream is already closed")
+    }
+}
+
+impl Drop for QuicNativeBridgeStream {
+    fn drop(&mut self) {
+        if self.inner.take().is_some() {
+            self.active_streams.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 

@@ -1,16 +1,16 @@
 use anyhow::Result;
 use bytes::Bytes;
 
-use crate::{agent_proto, quic_agent};
+use crate::agent_proto;
 
-use crate::agent_bridge::AgentBridgeStream;
+use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream};
 #[cfg(test)]
 use crate::agent_transport;
 
 pub(super) enum AgentIoStream {
     Bridge(AgentBridgeStream),
-    QuicNativeTcp(quic_agent::QuicBridgeStream),
-    QuicNativeUdp(quic_agent::QuicBridgeStream),
+    QuicNativeTcp(QuicNativeBridgeStream),
+    QuicNativeUdp(QuicNativeBridgeStream),
     #[cfg(test)]
     Raw(agent_transport::AgentStream),
 }
