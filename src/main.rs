@@ -18,6 +18,7 @@ mod data_plane;
 mod defaults;
 mod dns;
 mod helper_runtime;
+mod hotpath_trace;
 mod known_hosts;
 mod lab_support;
 mod packet_engine;
