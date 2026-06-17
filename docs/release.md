@@ -186,12 +186,13 @@ Required before tagging a release:
 - Ubuntu CI runs the deterministic release-mode rootless benchmark gates:
   `scripts/verify-live-benchmark-rows.py --self-test`,
   `scripts/verify-live-evidence.py --self-test`, the tiny-response
-  `bench-bridge-lab.sh` p50 gate, the 100 MiB `agent` throughput gate, the
-  100 MiB `quic-agent` throughput gate, and DNS p50 gates for both `agent` and
-  `quic-agent`, plus the native `quic-native` DNS p50 gate when the local
-  verifier runs. This makes PR CI cover the same rootless latency, throughput,
-  DNS, and optional QUIC data-plane regressions that `scripts/verify-local.sh`
-  enforces locally.
+  `bench-bridge-lab.sh` p50 gate, the 8 MiB chunked-response `agent` throughput gate,
+  the 100 MiB `agent` throughput gate, the 100 MiB `quic-agent` throughput gate,
+  and DNS p50 gates for both `agent` and `quic-agent`, plus
+  the native `quic-native` DNS p50 gate when the local
+  verifier runs. This makes PR CI cover the same rootless latency, shaped
+  response throughput, DNS, and optional QUIC data-plane regressions that
+  `scripts/verify-local.sh` enforces locally.
 - SSH host-key UX checks pass:
   `host_key_verifier_accept_new_records_missing_host_key`,
   `host_key_verifier_accept_new_rejects_changed_known_host`, and
@@ -408,7 +409,10 @@ Required before tagging a release:
   remains covered by compatibility smoke and throughput gates rather than the
   tiny-response latency target, because it pays per-flow SSH channel setup. It
   also runs a 1 MiB gate with
-  `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, and a hard
+  `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=5`, an 8 MiB chunked-response `agent`
+  throughput gate with `RUSTLE_BENCH_HTTP_CHUNK_BYTES=262144`,
+  `RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS=5`, and
+  `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=20`, and a hard
   100 MiB single-flow `agent` throughput gate. The 100 MiB local gate includes
   `quic-native` with `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` so the native
   data plane must meet or beat the primary agent path on the same-host fixture. The same 100 MiB throughput gate

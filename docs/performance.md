@@ -89,8 +89,11 @@ tiny-response p50 against `agent`.
 with both elapsed and median measured `p50_us` ceilings across the fast-path
 transports, `agent` and `quic-native`, runs a 1 MiB / 1-flow gate that keeps
 `direct-tcpip` under compatibility throughput coverage, runs a delayed 1 KiB
-agent gate with `RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS=25`, and runs a
-100 MiB single-flow throughput gate through both the primary `agent` transport and `quic-native`
+agent gate with `RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS=25`, runs an 8 MiB
+chunked-response `agent` gate with `RUSTLE_BENCH_HTTP_CHUNK_BYTES=262144`,
+`RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS=5`, and
+`RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=20`, and runs a 100 MiB single-flow throughput gate
+through both the primary `agent` transport and `quic-native`
 (`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
 proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
 release-mode code. Together these guard against a debug binary, multi-second
@@ -102,8 +105,8 @@ throughput to meet or beat `agent`, while tiny-response latency is bounded by an
 absolute p50 ceiling. The v2 faster-data-plane claim still requires the same ratios on live
 remote matrices, with the p50 ratio tightened to `1.00` before release.
 Ubuntu CI also runs the deterministic release-mode subset: tiny-response p50,
-100 MiB `agent`, 100 MiB `quic-agent`, and DNS p50 for `agent`, `quic-agent`,
-and `quic-native`.
+8 MiB chunked-response `agent`, 100 MiB `agent`, 100 MiB `quic-agent`, and DNS
+p50 for `agent`, `quic-agent`, and `quic-native`.
 
 Those checks are intentionally coarse guardrails, not release claims. They
 catch obvious agent-path and single-flow regressions while leaving detailed
