@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -158,11 +158,17 @@ pub async fn connect_quic_bridge(
         quic_client_config(bootstrap)
             .with_context(|| format!("{diagnostics} stage=client_config"))?,
     );
+    let stage_started = Instant::now();
     let connection = endpoint
         .connect(remote, QUIC_AGENT_SERVER_NAME)
         .with_context(|| format!("{diagnostics} stage=connect_start"))?
         .await
-        .with_context(|| format!("{diagnostics} stage=connect_establish"))?;
+        .with_context(|| {
+            format!(
+                "{diagnostics} stage=connect_establish elapsed_ms={}",
+                stage_started.elapsed().as_millis()
+            )
+        })?;
     authenticate_quic_bridge_connection_on_client(&connection, &bootstrap.auth_token)
         .await
         .with_context(|| format!("{diagnostics} stage=authenticate"))?;

@@ -1165,6 +1165,7 @@ REQUIRED_QUIC_DIAGNOSTIC_SUMMARY_SNIPPETS = [
     "UDP data plane connected",
     "failed to establish UDP data plane",
     "auth_token_sha256_prefix",
+    "stage=connect_establish",
     "server auth",
     "max_elapsed_ms",
     "paths",

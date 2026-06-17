@@ -18,6 +18,10 @@ DATA_PLANE_CONNECTED_RE = re.compile(
 DATA_PLANE_ATTEMPT_RE = re.compile(
     r"attempt (?P<attempt>\d+/\d+) (?P<remote>\S+) after (?P<elapsed>\d+)ms"
 )
+CONNECT_RE = re.compile(
+    r"(?P<label>QUIC agent|native QUIC bridge) remote=(?P<remote>\S+).*?"
+    r"stage=(?P<stage>connect_establish).*?elapsed_ms=(?P<elapsed>\d+)"
+)
 AUTH_RE = re.compile(
     r"(?P<label>QUIC agent|native QUIC bridge)(?P<server> server)? auth"
     r"(?: remote=(?P<remote>\S+))?.*?stage=(?P<stage>[a-z_]+)"
@@ -27,6 +31,7 @@ QUIC_DIAGNOSTIC_HINTS = (
     "UDP data plane connected",
     "failed to establish UDP data plane",
     "auth_token_sha256_prefix",
+    "stage=connect_establish",
     "QUIC agent auth",
     "native QUIC bridge auth",
     "QUIC agent server auth",
@@ -60,6 +65,20 @@ def parse_line(line: str, path: str) -> list[dict[str, object]]:
     if not any(hint in line for hint in QUIC_DIAGNOSTIC_HINTS):
         return events
 
+    connect = CONNECT_RE.search(line)
+    if connect:
+        transport = "quic-agent" if connect.group("label") == "QUIC agent" else "quic-native"
+        events.append(
+            {
+                "category": f"{transport}/connect",
+                "status": event_status(line),
+                "elapsed_ms": int(connect.group("elapsed")),
+                "stage": connect.group("stage"),
+                "remote": connect.group("remote"),
+                "path": path,
+            }
+        )
+
     connected = DATA_PLANE_CONNECTED_RE.search(line)
     if connected:
         events.append(
@@ -87,7 +106,6 @@ def parse_line(line: str, path: str) -> list[dict[str, object]]:
                     "path": path,
                 }
             )
-        return events
 
     auth = AUTH_RE.search(line)
     if auth:
@@ -160,6 +178,7 @@ def self_test() -> None:
         [
             "quic-agent: UDP data plane connected to 203.0.113.9:4433 on attempt 1/2 after 42ms",
             "quic-native: failed to establish UDP data plane to any resolved address after SSH bootstrap; tried=[203.0.113.10:4444]; failures=[attempt 1/1 203.0.113.10:4444 after 8001ms: quic-native: timed out after 8000ms establishing UDP data plane]",
+            "quic-native: failed to establish UDP data plane to any resolved address after SSH bootstrap; tried=[203.0.113.11:4444]; failures=[attempt 1/1 203.0.113.11:4444 after 77ms: quic-native: failed to establish UDP data plane: native QUIC bridge remote=203.0.113.11:4444 cert_sha256=abc cert_der_len=256 auth_token_sha256_prefix=abcdef123456 stage=connect_establish elapsed_ms=77: connection failed]",
             "QUIC agent remote=203.0.113.9:4433 cert_sha256=abc cert_der_len=256 auth_token_sha256_prefix=123456789abc QUIC agent auth stage=read_ack elapsed_ms=5: failed to confirm QUIC agent auth",
             "quic-bridge-agent: rejected unauthenticated connection: native QUIC bridge server auth remote=198.51.100.7:5353 stage=read_token elapsed_ms=1: invalid QUIC helper auth token",
         ]
@@ -174,8 +193,11 @@ def self_test() -> None:
 
     assert summaries["quic-agent/data-plane"]["events"] == 1
     assert summaries["quic-agent/data-plane"]["max_elapsed_ms"] == 42
-    assert summaries["quic-native/data-plane"]["failures"] == 1
+    assert summaries["quic-native/data-plane"]["failures"] == 2
     assert summaries["quic-native/data-plane"]["max_elapsed_ms"] == 8001
+    assert summaries["quic-native/connect"]["failures"] == 1
+    assert summaries["quic-native/connect"]["max_elapsed_ms"] == 77
+    assert summaries["quic-native/connect"]["stages"] == "connect_establish"
     assert summaries["quic-agent/client-auth"]["failures"] == 1
     assert summaries["quic-agent/client-auth"]["stages"] == "read_ack"
     assert summaries["quic-native/server-auth"]["failures"] == 1
