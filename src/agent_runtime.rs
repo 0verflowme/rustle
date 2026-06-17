@@ -15,7 +15,7 @@ use crate::agent_proto::{
     encode_frame_into, encoded_frames_len, try_decode_frame, AgentFrame, AgentFrameKind,
     AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
-use crate::agent_window::AgentCreditWindow;
+use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
 const AGENT_OUTBOUND_FRAMES: usize = 512;
 const AGENT_LOCAL_INPUT_FRAMES_PER_STREAM: usize = 128;
@@ -25,6 +25,10 @@ const AGENT_UDP_READ_CHUNK: usize = 64 * 1024;
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_FRAME_WRITE_BURST: usize = 64;
+
+const _: () = assert!(
+    AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_LOCAL_INPUT_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
+);
 
 #[derive(Clone, Copy, Debug)]
 pub struct AgentRuntimeConfig {
@@ -194,16 +198,10 @@ where
             encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
         }
     } else {
-        for frame in frames
-            .iter()
-            .filter(|frame| is_zero_stream_heartbeat(frame))
-        {
+        for frame in frames.iter().filter(|frame| is_priority_control(frame)) {
             encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
         }
-        for frame in frames
-            .iter()
-            .filter(|frame| !is_zero_stream_heartbeat(frame))
-        {
+        for frame in frames.iter().filter(|frame| !is_priority_control(frame)) {
             encode_frame_into(frame, &mut *encoded).context("failed to encode agent frame")?;
         }
     }
@@ -214,8 +212,8 @@ where
         .context("failed to write agent frame")
 }
 
-fn is_zero_stream_heartbeat(frame: &AgentFrame) -> bool {
-    frame.stream_id == 0 && matches!(frame.kind, AgentFrameKind::Ping | AgentFrameKind::Pong)
+fn is_priority_control(frame: &AgentFrame) -> bool {
+    frame.kind.is_priority_control()
 }
 
 async fn read_agent_frames<R>(
@@ -613,7 +611,18 @@ async fn run_tcp_connected_stream(
     output_credit: Arc<Semaphore>,
 ) {
     let stream = match stream {
-        Ok(stream) => stream,
+        Ok(stream) => {
+            if let Err(err) = stream.set_nodelay(true) {
+                let _ = send_reset(
+                    &out_tx,
+                    stream_id,
+                    &format!("failed to configure remote TCP stream: {err}"),
+                )
+                .await;
+                return;
+            }
+            stream
+        }
         Err(err) => {
             let _ = send_reset(
                 &out_tx,
@@ -1084,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_writer_prioritizes_heartbeat_frames_inside_burst() {
+    async fn agent_writer_prioritizes_control_frames_inside_burst() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
         let (out_tx, out_rx) = mpsc::channel(8);
@@ -1092,9 +1101,13 @@ mod tests {
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one"))
                 .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
+                .expect("window frame")
+                .with_credit(32),
             AgentFrame::new(AgentFrameKind::Pong, 0, Bytes::new()).expect("pong frame"),
             AgentFrame::new(AgentFrameKind::Data, 3, Bytes::from_static(b"two"))
                 .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Opened, 4, Bytes::new()).expect("opened frame"),
         ] {
             out_tx.send(frame).await.expect("queue frame");
         }
@@ -1112,9 +1125,48 @@ mod tests {
         assert_eq!(
             decoded,
             vec![
+                (AgentFrameKind::Window, 1),
                 (AgentFrameKind::Pong, 0),
+                (AgentFrameKind::Opened, 4),
                 (AgentFrameKind::Data, 1),
                 (AgentFrameKind::Data, 3),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_writer_keeps_eof_after_preceding_data_inside_burst() {
+        let writer = CountingWriter::default();
+        let bytes = Arc::clone(&writer.bytes);
+        let (out_tx, out_rx) = mpsc::channel(8);
+
+        for frame in [
+            AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"response"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Eof, 1, Bytes::new()).expect("eof frame"),
+            AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
+                .expect("window frame")
+                .with_credit(32),
+        ] {
+            out_tx.send(frame).await.expect("queue frame");
+        }
+        drop(out_tx);
+
+        write_agent_frames(writer, out_rx)
+            .await
+            .expect("write queued burst");
+
+        let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
+        let mut decoded = Vec::new();
+        while let Some(frame) = try_decode_frame(&mut encoded).expect("decode written frame") {
+            decoded.push((frame.kind, frame.stream_id));
+        }
+        assert_eq!(
+            decoded,
+            vec![
+                (AgentFrameKind::Window, 1),
+                (AgentFrameKind::Data, 1),
+                (AgentFrameKind::Eof, 1),
             ]
         );
     }

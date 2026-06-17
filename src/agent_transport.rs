@@ -13,7 +13,7 @@ use crate::agent_proto::{
     AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD, AGENT_PROTOCOL_VERSION,
     CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
 };
-use crate::agent_window::AgentCreditWindow;
+use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
@@ -23,6 +23,10 @@ const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_FRAME_WRITE_BURST: usize = 64;
+
+const _: () = assert!(
+    AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_INBOUND_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
+);
 
 type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
 type FailureState = Arc<Mutex<Option<String>>>;
@@ -644,16 +648,10 @@ where
             encode_frame_into(frame, &mut *encoded)?;
         }
     } else {
-        for frame in frames
-            .iter()
-            .filter(|frame| is_zero_stream_heartbeat(frame))
-        {
+        for frame in frames.iter().filter(|frame| is_priority_control(frame)) {
             encode_frame_into(frame, &mut *encoded)?;
         }
-        for frame in frames
-            .iter()
-            .filter(|frame| !is_zero_stream_heartbeat(frame))
-        {
+        for frame in frames.iter().filter(|frame| !is_priority_control(frame)) {
             encode_frame_into(frame, &mut *encoded)?;
         }
     }
@@ -664,8 +662,8 @@ where
         .context("failed to write agent frame")
 }
 
-fn is_zero_stream_heartbeat(frame: &AgentFrame) -> bool {
-    frame.stream_id == 0 && matches!(frame.kind, AgentFrameKind::Ping | AgentFrameKind::Pong)
+fn is_priority_control(frame: &AgentFrame) -> bool {
+    frame.kind.is_priority_control()
 }
 
 async fn write_agent_frame<W>(writer: &mut W, frame: &AgentFrame) -> Result<()>
@@ -1064,7 +1062,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_writer_prioritizes_heartbeat_frames_inside_burst() {
+    async fn transport_writer_prioritizes_control_frames_inside_burst() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
         let (outbound, outbound_rx) = mpsc::channel(8);
@@ -1074,9 +1072,13 @@ mod tests {
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one"))
                 .expect("data frame"),
-            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).expect("ping frame"),
+            AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
+                .expect("window frame")
+                .with_credit(32),
             AgentFrame::new(AgentFrameKind::Data, 3, Bytes::from_static(b"two"))
                 .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).expect("ping frame"),
+            AgentFrame::new(AgentFrameKind::Opened, 4, Bytes::new()).expect("opened frame"),
             AgentFrame::new(AgentFrameKind::Pong, 0, Bytes::new()).expect("pong frame"),
         ] {
             outbound.send(frame).await.expect("queue frame");
@@ -1093,10 +1095,50 @@ mod tests {
         assert_eq!(
             decoded,
             vec![
+                (AgentFrameKind::Window, 1),
                 (AgentFrameKind::Ping, 0),
+                (AgentFrameKind::Opened, 4),
                 (AgentFrameKind::Pong, 0),
                 (AgentFrameKind::Data, 1),
                 (AgentFrameKind::Data, 3),
+            ]
+        );
+        assert!(failure.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_writer_keeps_eof_after_preceding_data_inside_burst() {
+        let writer = CountingWriter::default();
+        let bytes = Arc::clone(&writer.bytes);
+        let (outbound, outbound_rx) = mpsc::channel(8);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let failure = Arc::new(Mutex::new(None));
+
+        for frame in [
+            AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"request"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Eof, 1, Bytes::new()).expect("eof frame"),
+            AgentFrame::new(AgentFrameKind::Window, 1, Bytes::new())
+                .expect("window frame")
+                .with_credit(32),
+        ] {
+            outbound.send(frame).await.expect("queue frame");
+        }
+        drop(outbound);
+
+        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+
+        let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
+        let mut decoded = Vec::new();
+        while let Some(frame) = try_decode_frame(&mut encoded).expect("decode written frame") {
+            decoded.push((frame.kind, frame.stream_id));
+        }
+        assert_eq!(
+            decoded,
+            vec![
+                (AgentFrameKind::Window, 1),
+                (AgentFrameKind::Data, 1),
+                (AgentFrameKind::Eof, 1),
             ]
         );
         assert!(failure.lock().await.is_none());

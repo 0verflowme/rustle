@@ -56,6 +56,23 @@ impl TryFrom<u8> for AgentFrameKind {
     }
 }
 
+impl AgentFrameKind {
+    pub(crate) fn is_priority_control(self) -> bool {
+        matches!(
+            self,
+            Self::Hello
+                | Self::OpenTcp
+                | Self::OpenUdp
+                | Self::Window
+                | Self::Reset
+                | Self::Opened
+                | Self::Ping
+                | Self::Pong
+                | Self::OpenTcpHost
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentFrame {
     pub kind: AgentFrameKind,
