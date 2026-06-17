@@ -9,7 +9,8 @@ use quinn::{
     TransportConfig,
 };
 use rcgen::generate_simple_self_signed;
-use ring::digest;
+use ring::rand::SecureRandom;
+use ring::{digest, rand};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -17,8 +18,8 @@ use tokio::net::{TcpStream, UdpSocket};
 use crate::agent_proto::{AgentOpenHost, AgentOpenIpv4};
 
 pub const QUIC_AGENT_SERVER_NAME: &str = "rustle-agent";
-pub const QUIC_AGENT_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_AGENT_V1";
-pub const QUIC_BRIDGE_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_BRIDGE_V1";
+pub const QUIC_AGENT_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_AGENT_V2";
+pub const QUIC_BRIDGE_BOOTSTRAP_MAGIC: &str = "RUSTLE_QUIC_BRIDGE_V2";
 const QUIC_AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const QUIC_AGENT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 const QUIC_AGENT_MAX_CONCURRENT_BIDI_STREAMS: u16 = 1;
@@ -37,6 +38,10 @@ const QUIC_BRIDGE_UDP_CHUNK: usize = u16::MAX as usize;
 const QUIC_BRIDGE_PROTO_TCP: u8 = 6;
 const QUIC_BRIDGE_PROTO_UDP: u8 = 17;
 const QUIC_BRIDGE_PROTO_TCP_HOST: u8 = 12;
+const QUIC_AUTH_TOKEN_BYTES: usize = 32;
+const QUIC_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const QUIC_AUTH_FAILED_CODE: u32 = 0x5255_4155;
+const QUIC_AUTH_STATUS_OK: u8 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum QuicBridgeProtocol {
@@ -89,6 +94,7 @@ pub struct QuicAgentBootstrap {
     pub port: u16,
     pub cert_sha256: String,
     pub cert_der: Vec<u8>,
+    pub auth_token: Vec<u8>,
 }
 
 impl QuicAgentBootstrap {
@@ -102,10 +108,11 @@ impl QuicAgentBootstrap {
 
     fn encode_line_with_magic(&self, magic: &str) -> String {
         format!(
-            "{magic} {} {} {}",
+            "{magic} {} {} {} {}",
             self.port,
             self.cert_sha256,
-            lower_hex(&self.cert_der)
+            lower_hex(&self.cert_der),
+            lower_hex(&self.auth_token)
         )
     }
 
@@ -143,6 +150,14 @@ impl QuicAgentBootstrap {
                 .context("missing QUIC agent certificate DER")?,
         )
         .context("invalid QUIC agent certificate DER")?;
+        let auth_token = decode_hex(fields.next().context("missing QUIC agent auth token")?)
+            .context("invalid QUIC agent auth token")?;
+        if auth_token.len() != QUIC_AUTH_TOKEN_BYTES {
+            bail!(
+                "invalid QUIC agent auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
+                auth_token.len()
+            );
+        }
         if fields.next().is_some() {
             bail!("unexpected trailing fields in QUIC agent bootstrap line");
         }
@@ -156,9 +171,21 @@ impl QuicAgentBootstrap {
             port,
             cert_sha256,
             cert_der,
+            auth_token,
         })
     }
 }
+
+#[derive(Debug)]
+struct QuicAuthError;
+
+impl std::fmt::Display for QuicAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid QUIC helper auth token")
+    }
+}
+
+impl std::error::Error for QuicAuthError {}
 
 pub struct QuicAgentServer {
     endpoint: Endpoint,
@@ -184,25 +211,48 @@ impl QuicAgentServer {
     pub async fn accept_agent_stream(
         self,
     ) -> Result<(quinn::RecvStream, quinn::SendStream, QuicAgentSession)> {
-        let incoming =
-            self.endpoint.accept().await.ok_or_else(|| {
+        loop {
+            let incoming = self.endpoint.accept().await.ok_or_else(|| {
                 anyhow!("QUIC agent endpoint closed before accepting a connection")
             })?;
-        let connection = incoming
-            .await
-            .context("failed to accept QUIC agent connection")?;
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .context("failed to accept QUIC agent stream")?;
-        Ok((
-            recv,
-            send,
-            QuicAgentSession {
-                _endpoint: self.endpoint,
-                connection,
-            },
-        ))
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    eprintln!("quic-agent: rejected connection before auth: {err:#}");
+                    continue;
+                }
+            };
+            let (mut send, mut recv) =
+                match tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi()).await {
+                    Ok(Ok(streams)) => streams,
+                    Ok(Err(err)) => {
+                        eprintln!("quic-agent: failed to accept auth stream: {err:#}");
+                        connection.close(QUIC_AUTH_FAILED_CODE.into(), b"auth stream failed");
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("quic-agent: timed out waiting for auth stream");
+                        connection.close(QUIC_AUTH_FAILED_CODE.into(), b"auth timeout");
+                        continue;
+                    }
+                };
+            if let Err(err) = verify_quic_auth_token(&mut recv, &self.bootstrap.auth_token).await {
+                eprintln!("quic-agent: rejected unauthenticated connection: {err:#}");
+                connection.close(QUIC_AUTH_FAILED_CODE.into(), b"invalid auth token");
+                continue;
+            }
+            write_quic_auth_ok(&mut send)
+                .await
+                .context("failed to acknowledge QUIC agent auth")?;
+            return Ok((
+                recv,
+                send,
+                QuicAgentSession {
+                    _endpoint: self.endpoint,
+                    connection,
+                },
+            ));
+        }
     }
 }
 
@@ -218,14 +268,29 @@ impl QuicBridgeServer {
     }
 
     pub async fn run(self) -> Result<()> {
-        let incoming =
-            self.endpoint.accept().await.ok_or_else(|| {
+        loop {
+            let incoming = self.endpoint.accept().await.ok_or_else(|| {
                 anyhow!("QUIC bridge endpoint closed before accepting a connection")
             })?;
-        let connection = incoming
+            let connection = match incoming.await {
+                Ok(connection) => connection,
+                Err(err) => {
+                    eprintln!("quic-bridge-agent: rejected connection before auth: {err:#}");
+                    continue;
+                }
+            };
+            if let Err(err) = authenticate_quic_bridge_connection_on_server(
+                &connection,
+                &self.bootstrap.auth_token,
+            )
             .await
-            .context("failed to accept QUIC bridge connection")?;
-        run_bridge_on_connection(connection).await
+            {
+                eprintln!("quic-bridge-agent: rejected unauthenticated connection: {err:#}");
+                connection.close(QUIC_AUTH_FAILED_CODE.into(), b"invalid auth token");
+                continue;
+            }
+            return run_bridge_on_connection(connection).await;
+        }
     }
 }
 
@@ -275,6 +340,7 @@ pub fn start_quic_agent_server(bind: SocketAddr) -> Result<QuicAgentServer> {
         port,
         cert_sha256: sha256_hex(&cert_bytes),
         cert_der: cert_bytes,
+        auth_token: generate_quic_auth_token()?,
     };
     Ok(QuicAgentServer {
         endpoint,
@@ -295,6 +361,7 @@ pub fn start_quic_bridge_server(bind: SocketAddr) -> Result<QuicBridgeServer> {
         port,
         cert_sha256: sha256_hex(&cert_bytes),
         cert_der: cert_bytes,
+        auth_token: generate_quic_auth_token()?,
     };
     Ok(QuicBridgeServer {
         endpoint,
@@ -313,10 +380,16 @@ pub async fn connect_quic_agent_stream(
         .context("failed to start QUIC agent connection")?
         .await
         .context("failed to establish QUIC agent connection")?;
-    let (send, recv) = connection
+    let (mut send, mut recv) = connection
         .open_bi()
         .await
         .context("failed to open QUIC agent stream")?;
+    write_quic_auth_token(&mut send, bootstrap)
+        .await
+        .context("failed to authenticate QUIC agent stream")?;
+    read_quic_auth_ok(&mut recv)
+        .await
+        .context("failed to confirm QUIC agent auth")?;
     Ok((
         recv,
         send,
@@ -338,6 +411,9 @@ pub async fn connect_quic_bridge(
         .context("failed to start QUIC bridge connection")?
         .await
         .context("failed to establish QUIC bridge connection")?;
+    authenticate_quic_bridge_connection_on_client(&connection, bootstrap)
+        .await
+        .context("failed to authenticate native QUIC bridge connection")?;
     Ok(QuicBridgeClient {
         inner: Arc::new(QuicBridgeClientInner {
             _endpoint: endpoint,
@@ -696,6 +772,108 @@ async fn run_bridge_udp_stream(
     Ok(())
 }
 
+fn generate_quic_auth_token() -> Result<Vec<u8>> {
+    let mut token = vec![0_u8; QUIC_AUTH_TOKEN_BYTES];
+    rand::SystemRandom::new()
+        .fill(&mut token)
+        .map_err(|_| anyhow!("failed to generate QUIC helper auth token"))?;
+    Ok(token)
+}
+
+async fn write_quic_auth_token(
+    send: &mut quinn::SendStream,
+    bootstrap: &QuicAgentBootstrap,
+) -> Result<()> {
+    if bootstrap.auth_token.len() != QUIC_AUTH_TOKEN_BYTES {
+        bail!(
+            "invalid QUIC helper auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
+            bootstrap.auth_token.len()
+        );
+    }
+    send.write_all(&bootstrap.auth_token)
+        .await
+        .context("failed to write QUIC helper auth token")
+}
+
+async fn verify_quic_auth_token(recv: &mut quinn::RecvStream, expected: &[u8]) -> Result<()> {
+    if expected.len() != QUIC_AUTH_TOKEN_BYTES {
+        bail!(
+            "invalid expected QUIC helper auth token length {}, expected {QUIC_AUTH_TOKEN_BYTES}",
+            expected.len()
+        );
+    }
+    let mut actual = [0_u8; QUIC_AUTH_TOKEN_BYTES];
+    tokio::time::timeout(QUIC_AUTH_TIMEOUT, recv.read_exact(&mut actual))
+        .await
+        .context("timed out waiting for QUIC helper auth token")?
+        .context("failed to read QUIC helper auth token")?;
+    if !quic_auth_tokens_match(&actual, expected) {
+        return Err(QuicAuthError.into());
+    }
+    Ok(())
+}
+
+fn quic_auth_tokens_match(actual: &[u8; QUIC_AUTH_TOKEN_BYTES], expected: &[u8]) -> bool {
+    if expected.len() != QUIC_AUTH_TOKEN_BYTES {
+        return false;
+    }
+    let mut diff = 0_u8;
+    for (left, right) in actual.iter().zip(expected.iter()) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
+async fn write_quic_auth_ok(send: &mut quinn::SendStream) -> Result<()> {
+    send.write_all(&[QUIC_AUTH_STATUS_OK])
+        .await
+        .context("failed to write QUIC helper auth acknowledgement")
+}
+
+async fn read_quic_auth_ok(recv: &mut quinn::RecvStream) -> Result<()> {
+    let mut status = [0_u8; 1];
+    tokio::time::timeout(QUIC_AUTH_TIMEOUT, recv.read_exact(&mut status))
+        .await
+        .context("timed out waiting for QUIC helper auth acknowledgement")?
+        .context("failed to read QUIC helper auth acknowledgement")?;
+    if status[0] != QUIC_AUTH_STATUS_OK {
+        bail!(
+            "QUIC helper returned invalid auth acknowledgement {}",
+            status[0]
+        );
+    }
+    Ok(())
+}
+
+async fn authenticate_quic_bridge_connection_on_client(
+    connection: &Connection,
+    bootstrap: &QuicAgentBootstrap,
+) -> Result<()> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed to open native QUIC bridge auth stream")?;
+    write_quic_auth_token(&mut send, bootstrap).await?;
+    send.shutdown()
+        .await
+        .context("failed to finish native QUIC bridge auth stream")?;
+    read_quic_auth_ok(&mut recv).await
+}
+
+async fn authenticate_quic_bridge_connection_on_server(
+    connection: &Connection,
+    expected_token: &[u8],
+) -> Result<()> {
+    let (mut send, mut recv) = tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi())
+        .await
+        .context("timed out waiting for native QUIC bridge auth stream")?
+        .context("failed to accept native QUIC bridge auth stream")?;
+    verify_quic_auth_token(&mut recv, expected_token).await?;
+    write_quic_auth_ok(&mut send).await?;
+    let _ = send.shutdown().await;
+    Ok(())
+}
+
 fn quic_server_config(
     max_concurrent_bidi_streams: u16,
 ) -> Result<(ServerConfig, CertificateDer<'static>)> {
@@ -966,13 +1144,31 @@ mod tests {
     use super::*;
     use crate::agent_proto::AgentOpenIpv4;
 
+    fn test_auth_token() -> Vec<u8> {
+        (0..QUIC_AUTH_TOKEN_BYTES)
+            .map(|index| index as u8)
+            .collect()
+    }
+
+    fn test_bootstrap(port: u16) -> QuicAgentBootstrap {
+        let cert_der = vec![0, 1, 2, 0xfe, 0xff];
+        QuicAgentBootstrap {
+            port,
+            cert_sha256: sha256_hex(&cert_der),
+            cert_der,
+            auth_token: test_auth_token(),
+        }
+    }
+
+    fn tampered_bootstrap_token(bootstrap: &QuicAgentBootstrap) -> QuicAgentBootstrap {
+        let mut tampered = bootstrap.clone();
+        tampered.auth_token[0] ^= 0xff;
+        tampered
+    }
+
     #[test]
     fn bootstrap_line_round_trips_and_verifies_hash() {
-        let bootstrap = QuicAgentBootstrap {
-            port: 4433,
-            cert_der: vec![0, 1, 2, 0xfe, 0xff],
-            cert_sha256: sha256_hex(&[0, 1, 2, 0xfe, 0xff]),
-        };
+        let bootstrap = test_bootstrap(4433);
 
         assert_eq!(
             QuicAgentBootstrap::decode_line(&bootstrap.encode_line()).unwrap(),
@@ -982,11 +1178,7 @@ mod tests {
 
     #[test]
     fn bridge_bootstrap_line_round_trips_with_bridge_magic() {
-        let bootstrap = QuicAgentBootstrap {
-            port: 4434,
-            cert_der: vec![0x10, 0x20, 0xfe, 0xff],
-            cert_sha256: sha256_hex(&[0x10, 0x20, 0xfe, 0xff]),
-        };
+        let bootstrap = test_bootstrap(4434);
         let line = bootstrap.encode_bridge_line();
 
         assert!(line.starts_with(QUIC_BRIDGE_BOOTSTRAP_MAGIC));
@@ -998,11 +1190,7 @@ mod tests {
 
     #[test]
     fn bridge_bootstrap_line_rejects_agent_magic() {
-        let bootstrap = QuicAgentBootstrap {
-            port: 4434,
-            cert_der: vec![4, 5, 6],
-            cert_sha256: sha256_hex(&[4, 5, 6]),
-        };
+        let bootstrap = test_bootstrap(4434);
 
         assert!(QuicAgentBootstrap::decode_bridge_line(&bootstrap.encode_line()).is_err());
         assert!(QuicAgentBootstrap::decode_line(&bootstrap.encode_bridge_line()).is_err());
@@ -1010,15 +1198,30 @@ mod tests {
 
     #[test]
     fn bootstrap_line_rejects_tampered_cert() {
-        let bootstrap = QuicAgentBootstrap {
-            port: 4433,
-            cert_der: vec![1, 2, 3],
-            cert_sha256: sha256_hex(&[1, 2, 3]),
-        };
+        let bootstrap = test_bootstrap(4433);
         let mut line = bootstrap.encode_line();
         line.push_str("00");
 
         assert!(QuicAgentBootstrap::decode_line(&line).is_err());
+    }
+
+    #[test]
+    fn bootstrap_line_requires_valid_auth_token() {
+        let bootstrap = test_bootstrap(4433);
+        let cert_hex = lower_hex(&bootstrap.cert_der);
+        let missing = format!(
+            "{} {} {} {}",
+            QUIC_AGENT_BOOTSTRAP_MAGIC, bootstrap.port, bootstrap.cert_sha256, cert_hex
+        );
+        let short = format!("{missing} aa");
+        let non_hex = format!("{missing} {}", "x".repeat(QUIC_AUTH_TOKEN_BYTES * 2));
+        let mut trailing = bootstrap.encode_line();
+        trailing.push_str(" extra");
+
+        assert!(QuicAgentBootstrap::decode_line(&missing).is_err());
+        assert!(QuicAgentBootstrap::decode_line(&short).is_err());
+        assert!(QuicAgentBootstrap::decode_line(&non_hex).is_err());
+        assert!(QuicAgentBootstrap::decode_line(&trailing).is_err());
     }
 
     #[test]
@@ -1060,6 +1263,35 @@ mod tests {
             config.get_max_udp_payload_size(),
             u64::from(QUIC_AGENT_MAX_UDP_PAYLOAD_BYTES)
         );
+    }
+
+    #[tokio::test]
+    async fn quic_agent_auth_rejects_bad_token_and_accepts_next_connection() {
+        let quic_server =
+            start_quic_agent_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .expect("start QUIC agent");
+        let quic_addr = quic_server.local_addr().expect("QUIC local address");
+        let bootstrap = quic_server.bootstrap().clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (_recv, _send, session) = quic_server
+                .accept_agent_stream()
+                .await
+                .expect("accept authenticated QUIC agent stream");
+            let _ = done_rx.await;
+            session.close(0, b"test complete");
+        });
+
+        let bad_bootstrap = tampered_bootstrap_token(&bootstrap);
+        let bad = connect_quic_agent_stream(quic_addr, &bad_bootstrap).await;
+        assert!(bad.is_err(), "bad token unexpectedly authenticated");
+
+        let (_recv, _send, session) = connect_quic_agent_stream(quic_addr, &bootstrap)
+            .await
+            .expect("valid token authenticates after bad token");
+        session.close(0, b"test complete");
+        done_tx.send(()).expect("release server session");
+        server_task.await.expect("server task");
     }
 
     #[test]
@@ -1116,6 +1348,71 @@ mod tests {
         header[0] = b'X';
 
         assert!(decode_quic_bridge_open_header(&header).is_err());
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_auth_rejects_bad_token_and_accepts_next_connection() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind TCP echo listener");
+        let destination = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+            let mut request = [0_u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut socket, &mut request)
+                .await
+                .expect("read request");
+            tokio::io::AsyncWriteExt::write_all(&mut socket, b"auth:")
+                .await
+                .expect("write prefix");
+            tokio::io::AsyncWriteExt::write_all(&mut socket, &request)
+                .await
+                .expect("write response");
+        });
+
+        let quic_server =
+            start_quic_bridge_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .expect("start native QUIC bridge");
+        let quic_addr = quic_server.local_addr().expect("QUIC local address");
+        let bootstrap = quic_server.bootstrap().clone();
+        let bridge_task =
+            tokio::spawn(async move { quic_server.run().await.expect("run native QUIC bridge") });
+
+        let bad_bootstrap = tampered_bootstrap_token(&bootstrap);
+        let bad = connect_quic_bridge(quic_addr, &bad_bootstrap).await;
+        assert!(bad.is_err(), "bad token unexpectedly authenticated");
+
+        let client = connect_quic_bridge(quic_addr, &bootstrap)
+            .await
+            .expect("valid token authenticates after bad token");
+        let SocketAddr::V4(destination) = destination else {
+            panic!("test destination should be IPv4");
+        };
+        let mut stream = client
+            .open_tcp_ipv4(AgentOpenIpv4 {
+                destination_ip: *destination.ip(),
+                destination_port: destination.port(),
+                originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+                originator_port: 49152,
+            })
+            .await
+            .expect("open native QUIC bridge stream after auth");
+        stream
+            .send_data(Bytes::from_static(b"ping"))
+            .await
+            .expect("send request");
+        stream.send_eof().await.expect("send EOF");
+
+        let mut response = Vec::new();
+        let mut buf = vec![0_u8; 1024];
+        while let Some(chunk) = stream.recv_data(&mut buf).await.expect("read response") {
+            response.extend_from_slice(chunk.as_ref());
+        }
+
+        assert_eq!(response, b"auth:ping");
+        client.close("test complete");
+        bridge_task.await.expect("bridge task");
+        server_task.await.expect("TCP server task");
     }
 
     #[tokio::test]

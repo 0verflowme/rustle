@@ -193,4 +193,6 @@ RUSTLE_BENCH_BRIDGE_TRANSPORTS="quic-agent" scripts/bench-bridge-lab.sh
 
 QUIC requires UDP reachability from the local host to the remote helper's
 advertised address and port. Firewalls, NAT, or SSH-only bastion paths can block
-this mode even when the default SSH-agent transport works.
+this mode even when the default SSH-agent transport works. QUIC helpers also
+require the SSH-delivered bootstrap token; a stale or mismatched helper command
+will fail closed instead of accepting unauthenticated UDP clients.

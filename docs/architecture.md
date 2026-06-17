@@ -120,25 +120,27 @@ Rustle keeps three transport choices, but only one is the normal path:
   `--bridge-transport quic-agent` path carry the same framed Rustle agent
   protocol over a QUIC bidirectional stream. SSH is used only to authenticate
   and start the remote helper. The helper emits a one-line bootstrap record
-  containing its UDP port, self-signed certificate DER, and certificate
-  SHA-256; the local client verifies the hash and pins that certificate before
-  establishing the QUIC connection. This is the first v2 data-plane slice, not
-  yet the public default: it preserves existing agent flow-control, DNS, UDP,
-  and reconnect semantics while moving the byte carrier from SSH to QUIC. The
-  QUIC transport profile is explicit: the helper accepts one client-opened
-  bidirectional carrier stream, disables unidirectional streams, uses a 16 MiB
-  stream receive window, and caps connection receive/send windows at 64 MiB so
-  Quinn's default 100 Mbps / 100 ms stream window does not undercut Rustle's own
-  adaptive agent credit. This carrier is correctness and bootstrap groundwork.
+  containing its UDP port, self-signed certificate DER, certificate SHA-256,
+  and an opaque bearer token generated for that helper process. The local client
+  verifies the hash, pins that certificate, and proves possession of the SSH
+  bootstrap token before the helper accepts agent traffic. This is the first v2
+  data-plane slice, not yet the public default: it preserves existing agent
+  flow-control, DNS, UDP, and reconnect semantics while moving the byte carrier
+  from SSH to QUIC. The QUIC transport profile is explicit: the helper accepts
+  one client-opened bidirectional carrier stream, disables unidirectional
+  streams, uses a 16 MiB stream receive window, and caps connection receive/send
+  windows at 64 MiB so Quinn's default 100 Mbps / 100 ms stream window does not
+  undercut Rustle's own adaptive agent credit. This carrier is correctness and
+  bootstrap groundwork.
 - Experimental native QUIC bridge: a hidden `quic-bridge-agent` helper and
   `--bridge-transport quic-native` path reuse the same SSH-authenticated
-  certificate-pinned bootstrap, then map each TCP flow or UDP association to
-  its own QUIC bidirectional stream with a compact open header. TCP uses raw
-  stream bytes, hostname TCP opens carry a bounded hostname payload, and UDP
-  preserves datagram boundaries with a compact length prefix. IPv4 DNS remotes,
-  hostname DNS remotes, and generic IPv4 UDP can now use this native QUIC data
-  plane. Same-host bridge and DNS benchmarks must compare `quic-native` against
-  `agent` before making a faster-than-SSH-agent claim.
+  certificate-pinned and token-authenticated bootstrap, then map each TCP flow
+  or UDP association to its own QUIC bidirectional stream with a compact open
+  header. TCP uses raw stream bytes, hostname TCP opens carry a bounded hostname
+  payload, and UDP preserves datagram boundaries with a compact length prefix.
+  IPv4 DNS remotes, hostname DNS remotes, and generic IPv4 UDP can now use this
+  native QUIC data plane. Same-host bridge and DNS benchmarks must compare
+  `quic-native` against `agent` before making a faster-than-SSH-agent claim.
 - `direct-tcpip` compatibility mode: an explicit hidden transport requiring only
   a normal remote SSH server with TCP forwarding enabled. This path is the
   closest to sshuttle's zero-install behavior, but it is intentionally not the
