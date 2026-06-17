@@ -3,14 +3,12 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use crate::data_plane::{
-    spawn_dns_query_on_data_plane, spawn_tcp_bridge_on_data_plane, spawn_udp_association, DataPlane,
-};
+use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, tun_ipv4_packet,
-    TcpBridgeStart, TunnelEngine, UdpAssociationStart, UdpAssociationTransportPlan,
-    UdpIngressAction, MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
+    TunnelEngine, UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS,
+    MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
 };
 use crate::transport_model::{Destination, DnsResponseEvent, UdpAssociationEvents};
 use crate::tun_io::TunWriter;
@@ -21,7 +19,9 @@ mod events;
 mod prepare;
 #[cfg(test)]
 mod prepare_tests;
+mod tcp;
 mod tun;
+mod udp;
 
 pub(crate) use prepare::run_tunnel;
 
@@ -165,7 +165,7 @@ impl TunnelSupervisor {
                             udp_association_idle_timeout,
                             &mut udp_actions,
                         );
-                        execute_udp_ingress_actions(engine, &data_plane, &mut udp_actions);
+                        udp::execute_ingress_actions(engine, &data_plane, &mut udp_actions);
                         continue;
                     }
 
@@ -177,7 +177,7 @@ impl TunnelSupervisor {
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,
                     )?;
-                    execute_tcp_bridge_starts(
+                    tcp::execute_bridge_starts(
                         engine,
                         &mut tcp_bridge_starts,
                         &data_plane,
@@ -252,7 +252,7 @@ impl TunnelSupervisor {
                         data_plane.admission_limits(),
                         &mut tcp_bridge_starts,
                     )?;
-                    execute_tcp_bridge_starts(
+                    tcp::execute_bridge_starts(
                         engine,
                         &mut tcp_bridge_starts,
                         &data_plane,
@@ -265,54 +265,4 @@ impl TunnelSupervisor {
             }
         }
     }
-}
-
-fn execute_tcp_bridge_starts(
-    engine: &mut TunnelEngine,
-    starts: &mut Vec<TcpBridgeStart>,
-    data_plane: &Arc<dyn DataPlane>,
-    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
-) -> Result<()> {
-    for start in starts.drain(..) {
-        let bridge = spawn_tcp_bridge_on_data_plane(
-            Arc::clone(data_plane),
-            start.id,
-            start.ready_wait_ms,
-            event_tx.clone(),
-            bridge_event_accounting.clone(),
-        );
-        engine.register_tcp_bridge(start, bridge)?;
-    }
-    Ok(())
-}
-
-fn execute_udp_ingress_actions(
-    engine: &mut TunnelEngine,
-    data_plane: &Arc<dyn DataPlane>,
-    actions: &mut Vec<UdpIngressAction>,
-) {
-    for action in actions.drain(..) {
-        if let Some(start) = engine.apply_udp_ingress_action(action) {
-            execute_udp_association_start(data_plane, start);
-        }
-    }
-}
-
-fn execute_udp_association_start(data_plane: &Arc<dyn DataPlane>, start: UdpAssociationStart) {
-    eprintln!(
-        "udp: opening association {}:{} -> {}:{} over {}",
-        start.key.src_ip,
-        start.key.src_port,
-        start.key.dst_ip,
-        start.key.dst_port,
-        start.transport_label,
-    );
-    spawn_udp_association(
-        data_plane.open_udp_ipv4(start.key.into_open_request()),
-        start.key,
-        start.from_local,
-        start.events,
-        start.idle_timeout,
-    );
 }
