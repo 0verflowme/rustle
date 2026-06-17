@@ -22,6 +22,10 @@ HOTPATH_COLUMNS = {
     "ready_wait_p50_ms",
     "flow_throughput_min_mib_s",
     "local_queue_wait_p50_ms",
+    "local_queue_wait_max_ms",
+    "local_queue_wait_avg_ms",
+    "remote_event_wait_max_ms",
+    "remote_event_wait_avg_ms",
     "likely_bottleneck",
 }
 QUIC_DIAGNOSTIC_COLUMNS = {
@@ -211,13 +215,18 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "ready_wait_p50_ms\tready_wait_total_ms\t"
                     "payload_queue_wait_p50_ms\tfirst_byte_wait_p50_ms\t"
                     "body_drain_p50_ms\tlocal_send_wait_p50_ms\t"
-                    "local_send_wait_total_ms\tlocal_send_waits\t"
+                    "local_send_wait_total_ms\tlocal_send_wait_max_ms\t"
+                    "local_send_wait_avg_ms\tlocal_send_waits\t"
                     "local_queue_wait_p50_ms\tlocal_queue_wait_total_ms\t"
+                    "local_queue_wait_max_ms\tlocal_queue_wait_avg_ms\t"
                     "local_queue_waits\t"
                     "agent_send_credit_wait_p50_ms\tagent_send_credit_wait_total_ms\t"
+                    "agent_send_credit_wait_max_ms\tagent_send_credit_wait_avg_ms\t"
                     "agent_send_outbound_wait_p50_ms\t"
-                    "agent_send_outbound_wait_total_ms\tagent_send_frames\t"
+                    "agent_send_outbound_wait_total_ms\tagent_send_outbound_wait_max_ms\t"
+                    "agent_send_outbound_wait_avg_ms\tagent_send_frames\t"
                     "remote_event_wait_p50_ms\tremote_event_wait_total_ms\t"
+                    "remote_event_wait_max_ms\tremote_event_wait_avg_ms\t"
                     "remote_event_waits\tduration_p50_ms\tduration_p95_ms\t"
                     "flow_throughput_min_mib_s\tflow_throughput_p50_mib_s\t"
                     "flow_throughput_p95_mib_s\t"
@@ -227,8 +236,11 @@ def write_sample_hotpath(path: pathlib.Path) -> None:
                     "agent\t2\t2\t0\t512\t4096\t2048\t2048\t0.100\t0.200\t0.300\t"
                     "0.400\t0.500\t0.700\t0.100\t0.050\t0.100\t0.100\t"
                     "0.100\t0.200\t"
-                    "0.000\t0.000\t0\t0.000\t0.000\t0\t0.000\t0.000\t"
-                    "0.000\t0.000\t4\t0.000\t0.000\t0\t1.000\t2.000\t"
+                    "0.000\t0.000\t0.000\t-\t0\t"
+                    "0.000\t0.000\t0.000\t-\t0\t"
+                    "0.000\t0.000\t0.000\t0.000\t"
+                    "0.000\t0.000\t0.000\t0.000\t4\t"
+                    "0.000\t0.000\t0.000\t-\t0\t1.000\t2.000\t"
                     "0.95\t1.95\t2.95\t1.95\tbody_drain"
                 ),
             ]
