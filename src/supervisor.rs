@@ -24,7 +24,7 @@ use crate::transport_model::{
 use crate::tun_io::TunWriter;
 pub(crate) use crate::tunnel_lifecycle::virtual_dns_ip;
 use crate::tunnel_lifecycle::{
-    open_tun, open_tunnel_host, shutdown_signal, ShutdownSignalFuture, TunConfig, TunnelCleanup,
+    open_tun, open_tunnel_host, shutdown_signal, ShutdownSignal, TunConfig, TunnelCleanup,
     TunnelHostConfig,
 };
 use crate::{platform, ssh_bridge, tcp_core, TunCaptureArgs, TunnelArgs};
@@ -38,6 +38,7 @@ const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
     validate_tun_args(&args)?;
+    let shutdown = shutdown_signal().await?;
     let target_routes = expand_target_routes(&args.targets)?;
     let tun = open_tun(&TunConfig::new(
         args.tun_ip,
@@ -57,14 +58,23 @@ pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
     )
     .context("failed to initialize userspace TCP flow manager")?;
 
-    let result = capture_packets(tun.dev, flow_manager, args.exit_after_packets).await;
+    let result = capture_packets(tun.dev, flow_manager, args.exit_after_packets, shutdown).await;
     drop(routes);
     result
 }
 
 pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;
-    let tunnel = PreparedTunnel::prepare(args).await?;
+    let shutdown = shutdown_signal().await?;
+    let mut startup_shutdown = shutdown.clone();
+    let Some(tunnel) = await_startup_or_shutdown(
+        &mut startup_shutdown,
+        PreparedTunnel::prepare(args, shutdown),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     tunnel.run().await
 }
 
@@ -74,7 +84,7 @@ struct PreparedTunnel {
 }
 
 impl PreparedTunnel {
-    async fn prepare(args: TunnelArgs) -> Result<Self> {
+    async fn prepare(args: TunnelArgs, shutdown: ShutdownSignal) -> Result<Self> {
         let helper_plan = bridge_agent_command_plan(
             args.bridge_transport,
             args.agent_command.as_deref(),
@@ -133,7 +143,7 @@ impl PreparedTunnel {
                 data_plane,
                 dns_remote,
                 Duration::from_millis(args.udp_idle_timeout_ms),
-                shutdown_signal(),
+                shutdown,
             ),
             cleanup: host.cleanup,
         })
@@ -153,7 +163,7 @@ pub(crate) struct TunnelSupervisor {
     data_plane: Arc<dyn DataPlane>,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
-    shutdown: ShutdownSignalFuture,
+    shutdown: ShutdownSignal,
 }
 
 impl TunnelSupervisor {
@@ -163,7 +173,7 @@ impl TunnelSupervisor {
         data_plane: Arc<dyn DataPlane>,
         dns_remote: Destination,
         udp_association_idle_timeout: Duration,
-        shutdown: ShutdownSignalFuture,
+        shutdown: ShutdownSignal,
     ) -> Self {
         Self {
             dev,
@@ -212,7 +222,7 @@ impl TunnelSupervisor {
         stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                signal = &mut *shutdown => {
+                signal = shutdown.recv() => {
                     eprintln!("signal: {} received", signal?);
                     eprintln!(
                         "stats: final {}",
@@ -401,21 +411,36 @@ fn execute_udp_association_start(start: UdpAssociationStart<Arc<dyn DataPlane>>)
     );
 }
 
+async fn await_startup_or_shutdown<T, Fut>(
+    shutdown: &mut ShutdownSignal,
+    startup: Fut,
+) -> Result<Option<T>>
+where
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    tokio::select! {
+        result = startup => result.map(Some),
+        signal = shutdown.recv() => {
+            eprintln!("signal: {} received during startup", signal?);
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) async fn capture_packets(
     dev: tun_rs::AsyncDevice,
     mut flow_manager: tcp_core::FlowManager,
     exit_after_packets: Option<u64>,
+    mut shutdown: ShutdownSignal,
 ) -> Result<()> {
     let tun = TunWriter::new(&dev);
     let mut buf = vec![0_u8; PACKET_BUF_SIZE];
     let mut outbound_packets = Vec::with_capacity(tcp_core::PACKET_QUEUE_CAPACITY);
     let started_at = StdInstant::now();
     let mut captured_packets = 0_u64;
-    let mut shutdown = shutdown_signal();
-
     loop {
         tokio::select! {
-            signal = &mut shutdown => {
+            signal = shutdown.recv() => {
                 eprintln!("signal: {} received", signal?);
                 return Ok(());
             }
@@ -744,5 +769,29 @@ mod tests {
         };
         validate_tunnel_args(&args)
             .expect("native QUIC supports hostname DNS remote through TCP host open");
+    }
+
+    #[tokio::test]
+    async fn startup_shutdown_wins_over_pending_startup() {
+        let mut shutdown = ShutdownSignal::triggered_for_test("interrupt");
+        let startup = std::future::pending::<Result<&'static str>>();
+
+        let result = await_startup_or_shutdown(&mut shutdown, startup)
+            .await
+            .expect("shutdown should be clean");
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_startup_wins_when_shutdown_is_pending() {
+        let mut shutdown = ShutdownSignal::pending_for_test();
+
+        let result =
+            await_startup_or_shutdown(&mut shutdown, async { Ok::<_, anyhow::Error>("prepared") })
+                .await
+                .expect("startup should complete");
+
+        assert_eq!(result, Some("prepared"));
     }
 }

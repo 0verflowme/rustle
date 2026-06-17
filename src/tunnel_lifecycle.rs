@@ -1,13 +1,11 @@
-use std::future::Future;
 use std::net::Ipv4Addr;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Context, Error, Result};
 use bytes::Bytes;
 use ipnet::Ipv4Net;
 use tokio::net::UdpSocket;
-use tokio::sync::Semaphore;
+use tokio::sync::{oneshot, watch, Semaphore};
 use tun_rs::DeviceBuilder;
 
 use crate::data_plane::DataPlane;
@@ -19,8 +17,6 @@ use crate::routing::{
 };
 use crate::transport_model::Destination;
 use crate::{dns, platform, tcp_core};
-
-pub(crate) type ShutdownSignalFuture = Pin<Box<dyn Future<Output = Result<&'static str>> + Send>>;
 
 pub(crate) struct TunConfig {
     pub(crate) tun_ip: Ipv4Addr,
@@ -255,9 +251,75 @@ pub(crate) async fn start_local_dns_proxy(
     Ok(LocalDnsProxy { task })
 }
 
+#[derive(Clone)]
+pub(crate) struct ShutdownSignal {
+    rx: watch::Receiver<Option<ShutdownEvent>>,
+    _task: Option<Arc<ShutdownSignalTask>>,
+    #[cfg(test)]
+    _test_tx: Option<Arc<watch::Sender<Option<ShutdownEvent>>>>,
+}
+
+impl ShutdownSignal {
+    pub(crate) async fn recv(&mut self) -> Result<&'static str> {
+        loop {
+            if let Some(event) = self.rx.borrow().clone() {
+                return event.into_result();
+            }
+            self.rx
+                .changed()
+                .await
+                .context("shutdown signal monitor stopped before reporting a signal")?;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for_test() -> Self {
+        let (tx, rx) = watch::channel(None);
+        Self {
+            rx,
+            _task: None,
+            _test_tx: Some(Arc::new(tx)),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn triggered_for_test(reason: &'static str) -> Self {
+        let (_tx, rx) = watch::channel(Some(ShutdownEvent::Signal(reason)));
+        Self {
+            rx,
+            _task: None,
+            _test_tx: None,
+        }
+    }
+}
+
+struct ShutdownSignalTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ShutdownSignalTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ShutdownEvent {
+    Signal(&'static str),
+    Error(String),
+}
+
+impl ShutdownEvent {
+    fn into_result(self) -> Result<&'static str> {
+        match self {
+            Self::Signal(reason) => Ok(reason),
+            Self::Error(error) => bail!("{error}"),
+        }
+    }
+}
+
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UnixShutdownSignal {
+    Interrupt,
     Terminate,
     Hangup,
 }
@@ -266,6 +328,7 @@ pub(crate) enum UnixShutdownSignal {
 impl UnixShutdownSignal {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Interrupt => "interrupt",
             Self::Terminate => "terminate",
             Self::Hangup => "hangup",
         }
@@ -273,6 +336,7 @@ impl UnixShutdownSignal {
 
     pub(crate) fn os_name(self) -> &'static str {
         match self {
+            Self::Interrupt => "SIGINT",
             Self::Terminate => "SIGTERM",
             Self::Hangup => "SIGHUP",
         }
@@ -280,6 +344,7 @@ impl UnixShutdownSignal {
 
     pub(crate) fn kind(self) -> tokio::signal::unix::SignalKind {
         match self {
+            Self::Interrupt => tokio::signal::unix::SignalKind::interrupt(),
             Self::Terminate => tokio::signal::unix::SignalKind::terminate(),
             Self::Hangup => tokio::signal::unix::SignalKind::hangup(),
         }
@@ -287,28 +352,82 @@ impl UnixShutdownSignal {
 }
 
 #[cfg(unix)]
-pub(crate) fn unix_shutdown_signals() -> [UnixShutdownSignal; 2] {
-    [UnixShutdownSignal::Terminate, UnixShutdownSignal::Hangup]
+pub(crate) fn unix_shutdown_signals() -> [UnixShutdownSignal; 3] {
+    [
+        UnixShutdownSignal::Interrupt,
+        UnixShutdownSignal::Terminate,
+        UnixShutdownSignal::Hangup,
+    ]
 }
 
-pub(crate) fn shutdown_signal() -> ShutdownSignalFuture {
-    Box::pin(wait_for_shutdown_signal())
+pub(crate) async fn shutdown_signal() -> Result<ShutdownSignal> {
+    let (tx, rx) = watch::channel(None);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let event = match wait_for_shutdown_signal(ready_tx).await {
+            Ok(reason) => ShutdownEvent::Signal(reason),
+            Err(err) => ShutdownEvent::Error(format!("{err:#}")),
+        };
+        let _ = tx.send(Some(event));
+    });
+
+    match ready_rx
+        .await
+        .context("shutdown signal monitor stopped during initialization")?
+    {
+        Ok(()) => Ok(ShutdownSignal {
+            rx,
+            _task: Some(Arc::new(ShutdownSignalTask(task))),
+            #[cfg(test)]
+            _test_tx: None,
+        }),
+        Err(err) => {
+            task.abort();
+            bail!("{err}")
+        }
+    }
 }
 
-async fn wait_for_shutdown_signal() -> Result<&'static str> {
+async fn wait_for_shutdown_signal(
+    ready: oneshot::Sender<std::result::Result<(), String>>,
+) -> Result<&'static str> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::signal;
 
-        let [terminate, hangup] = unix_shutdown_signals();
-        let mut sigterm = signal(terminate.kind())
-            .with_context(|| format!("failed to listen for {}", terminate.os_name()))?;
-        let mut sighup = signal(hangup.kind())
-            .with_context(|| format!("failed to listen for {}", hangup.os_name()))?;
+        let [interrupt, terminate, hangup] = unix_shutdown_signals();
+        let mut sigint = match signal(interrupt.kind()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                let err = Error::new(err)
+                    .context(format!("failed to listen for {}", interrupt.os_name()));
+                let _ = ready.send(Err(format!("{err:#}")));
+                return Err(err);
+            }
+        };
+        let mut sigterm = match signal(terminate.kind()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                let err = Error::new(err)
+                    .context(format!("failed to listen for {}", terminate.os_name()));
+                let _ = ready.send(Err(format!("{err:#}")));
+                return Err(err);
+            }
+        };
+        let mut sighup = match signal(hangup.kind()) {
+            Ok(signal) => signal,
+            Err(err) => {
+                let err =
+                    Error::new(err).context(format!("failed to listen for {}", hangup.os_name()));
+                let _ = ready.send(Err(format!("{err:#}")));
+                return Err(err);
+            }
+        };
+        let _ = ready.send(Ok(()));
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for Ctrl+C")?;
-                Ok("interrupt")
+            received = sigint.recv() => {
+                received.with_context(|| format!("{} stream closed", interrupt.os_name()))?;
+                Ok(interrupt.label())
             }
             received = sigterm.recv() => {
                 received.with_context(|| format!("{} stream closed", terminate.os_name()))?;
@@ -323,6 +442,7 @@ async fn wait_for_shutdown_signal() -> Result<&'static str> {
 
     #[cfg(not(unix))]
     {
+        let _ = ready.send(Ok(()));
         tokio::signal::ctrl_c()
             .await
             .context("failed to listen for Ctrl+C")?;
@@ -382,7 +502,20 @@ mod tests {
 
         assert_eq!(
             signals,
-            vec![("terminate", "SIGTERM"), ("hangup", "SIGHUP")]
+            vec![
+                ("interrupt", "SIGINT"),
+                ("terminate", "SIGTERM"),
+                ("hangup", "SIGHUP")
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn cloned_shutdown_signal_observes_existing_signal() {
+        let mut shutdown = ShutdownSignal::triggered_for_test("interrupt");
+        let mut cloned = shutdown.clone();
+
+        assert_eq!(shutdown.recv().await.unwrap(), "interrupt");
+        assert_eq!(cloned.recv().await.unwrap(), "interrupt");
     }
 }
