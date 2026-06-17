@@ -35,6 +35,7 @@ const UDP_CLOSE_EVENT_CHANNEL_DEPTH: usize = MAX_ACTIVE_UDP_ASSOCIATIONS;
 const _: () = assert!(DNS_EVENT_CHANNEL_DEPTH >= MAX_IN_FLIGHT_DNS_QUERIES);
 const _: () = assert!(UDP_CLOSE_EVENT_CHANNEL_DEPTH >= MAX_ACTIVE_UDP_ASSOCIATIONS);
 const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
+const BRIDGE_EVENT_BATCH_LIMIT: usize = 32;
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
     validate_tun_args(&args)?;
@@ -342,7 +343,7 @@ impl TunnelSupervisor {
                     let Some(event) = event else {
                         bail!("SSH bridge event channel closed");
                     };
-                    engine.handle_bridge_event(event)?;
+                    handle_bridge_event_batch(engine, event, &mut event_rx)?;
                     engine.poll_tcp();
                     tun.write_engine_packets(engine).await?;
                     engine.flush_remote_backlogs()?;
@@ -376,6 +377,32 @@ impl TunnelSupervisor {
             }
         }
     }
+}
+
+fn handle_bridge_event_batch(
+    engine: &mut TunnelEngine,
+    first: ssh_bridge::BridgeEvent,
+    event_rx: &mut tokio::sync::mpsc::Receiver<ssh_bridge::BridgeEvent>,
+) -> Result<usize> {
+    let mut handled = 0_usize;
+    let mut next = Some(first);
+    while handled < BRIDGE_EVENT_BATCH_LIMIT {
+        let event = if let Some(event) = next.take() {
+            event
+        } else {
+            match event_rx.try_recv() {
+                Ok(event) => event,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        };
+        engine.handle_bridge_event(event)?;
+        handled += 1;
+        if engine.should_pause_bridge_events() {
+            break;
+        }
+    }
+    Ok(handled)
 }
 
 fn execute_tcp_bridge_starts(
@@ -803,5 +830,49 @@ mod tests {
                 .expect("startup should complete");
 
         assert_eq!(result, Some("prepared"));
+    }
+
+    #[test]
+    fn bridge_event_batch_is_bounded() {
+        let mut engine = TunnelEngine::new(
+            tcp_core::FlowManager::new(
+                DEFAULT_TUN_IP,
+                DEFAULT_TUN_PREFIX,
+                &[tcp_core::Ipv4NetParts::new(
+                    Ipv4Addr::new(198, 18, 0, 0),
+                    15,
+                )],
+                usize::from(DEFAULT_MTU),
+            )
+            .expect("flow manager"),
+        );
+        let id = tcp_core::FlowId::new(
+            tcp_core::FlowKey::tcp(
+                Ipv4Addr::new(10, 255, 255, 2),
+                49152,
+                Ipv4Addr::new(198, 18, 77, 77),
+                80,
+            ),
+            1,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(BRIDGE_EVENT_BATCH_LIMIT + 1);
+        for _ in 0..BRIDGE_EVENT_BATCH_LIMIT {
+            tx.try_send(ssh_bridge::BridgeEvent::Closed { id })
+                .expect("queue bridge event");
+        }
+
+        let handled =
+            handle_bridge_event_batch(&mut engine, ssh_bridge::BridgeEvent::Closed { id }, &mut rx)
+                .expect("handle bridge event batch");
+
+        assert_eq!(handled, BRIDGE_EVENT_BATCH_LIMIT);
+        assert_eq!(
+            rx.try_recv().expect("one queued event should remain"),
+            ssh_bridge::BridgeEvent::Closed { id }
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
     }
 }
