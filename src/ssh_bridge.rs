@@ -15,7 +15,6 @@ pub const FLOW_CHANNEL_DEPTH: usize = 64;
 pub const FLOW_CHANNEL_BYTES: usize = 128 * 1024;
 pub const DIRECT_TCPIP_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 pub const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
-pub const DNS_DIRECT_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 pub const BRIDGE_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const BRIDGE_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 

@@ -8,6 +8,7 @@ use crate::agent_bridge::AgentBridgeConnector;
 use crate::agent_proto;
 use crate::cli::{AgentDnsLabArgs, AgentLabArgs, AgentUdpLabArgs};
 use crate::control_plane::{connect_tunnel_runtime, SshAgentBridgeConnector};
+use crate::data_plane::query_dns_on_data_plane;
 use crate::defaults::{DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP};
 use crate::lab_support::{
     build_dns_a_query, default_http_request, parse_ipv4_destination, percentile_nearest_rank,
@@ -254,14 +255,14 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
         let id = 0x5200_u16.wrapping_add(index as u16);
         let query = build_dns_a_query(id, &args.name)?;
         let query_started = StdInstant::now();
-        let response = data_plane
-            .query_dns(
-                dns_remote.clone(),
-                Bytes::copy_from_slice(&query),
-                DEFAULT_TUN_IP,
-            )
-            .await
-            .with_context(|| format!("DNS query {} through Rustle transport failed", index + 1))?;
+        let response = query_dns_on_data_plane(
+            data_plane.as_ref(),
+            &dns_remote,
+            query.as_ref(),
+            DEFAULT_TUN_IP,
+        )
+        .await
+        .with_context(|| format!("DNS query {} through Rustle transport failed", index + 1))?;
         let elapsed = query_started.elapsed().as_micros();
         validate_dns_response(&query, response.as_ref())
             .with_context(|| format!("invalid DNS response for query {}", index + 1))?;

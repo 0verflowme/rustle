@@ -8,7 +8,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch, Semaphore};
 use tun_rs::DeviceBuilder;
 
-use crate::data_plane::DataPlane;
+use crate::data_plane::{query_dns_on_data_plane, DataPlane};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::MAX_IN_FLIGHT_DNS_QUERIES;
 use crate::routing::{
@@ -228,9 +228,13 @@ pub(crate) async fn start_local_dns_proxy(
                     remote.host,
                     remote.port
                 );
-                let response = match data_plane
-                    .query_dns(remote, query.clone(), DEFAULT_TUN_IP)
-                    .await
+                let response = match query_dns_on_data_plane(
+                    data_plane.as_ref(),
+                    &remote,
+                    query.as_ref(),
+                    DEFAULT_TUN_IP,
+                )
+                .await
                 {
                     Ok(response) => response,
                     Err(err) => {

@@ -6,14 +6,13 @@ use anyhow::{bail, Context, Result};
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
-use super::{DataPlane, DataPlaneDnsFuture};
+use super::DataPlane;
 #[cfg(test)]
 use crate::agent_transport;
-use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
     DataPlaneIpv4Open, DataPlaneTcpOpen, DataPlaneTcpOpenMode, Destination, DnsResponseEvent,
 };
-use crate::{agent_proto, dns, ssh_bridge};
+use crate::{agent_proto, dns};
 
 use super::stream::AgentIoStream;
 
@@ -27,14 +26,14 @@ pub(crate) fn spawn_dns_query_on_data_plane(
     originator_ip: Ipv4Addr,
 ) {
     tokio::spawn(async move {
-        let result = data_plane
-            .query_dns(
-                remote,
-                Bytes::copy_from_slice(request.payload.as_ref()),
-                originator_ip,
-            )
-            .await
-            .map_err(|err| err.to_string());
+        let result = query_dns_on_data_plane(
+            data_plane.as_ref(),
+            &remote,
+            request.payload.as_ref(),
+            originator_ip,
+        )
+        .await
+        .map_err(|err| err.to_string());
         send_dns_response_event(&event_tx, DnsResponseEvent { request, result });
     });
 }
@@ -53,124 +52,57 @@ pub(crate) fn send_dns_response_event(
     }
 }
 
-pub(super) fn query_dns_over_ssh_future(
-    ssh: SshSessionPool,
-    remote: Destination,
-    query: Bytes,
-) -> DataPlaneDnsFuture<'static> {
-    Box::pin(async move { query_dns_over_ssh(ssh, &remote, query.as_ref()).await })
-}
-
-pub(super) fn query_dns_over_stream_data_plane_future<D>(
-    data_plane: D,
-    remote: Destination,
-    query: Bytes,
-    originator_ip: Ipv4Addr,
-) -> DataPlaneDnsFuture<'static>
-where
-    D: DataPlane + 'static,
-{
-    Box::pin(async move {
-        query_dns_over_stream_data_plane(&data_plane, &remote, query.as_ref(), originator_ip).await
-    })
-}
-
-async fn query_dns_over_ssh(
-    ssh: SshSessionPool,
+pub(crate) async fn query_dns_on_data_plane(
+    data_plane: &dyn DataPlane,
     remote: &Destination,
     query: &[u8],
+    originator_ip: Ipv4Addr,
 ) -> Result<Bytes> {
-    if query.len() > usize::from(u16::MAX) {
-        bail!("DNS query exceeds TCP DNS length limit");
+    if data_plane.caps().udp_associations {
+        if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
+            let stream = data_plane
+                .open_udp_ipv4(DataPlaneIpv4Open {
+                    destination_ip: remote_ip,
+                    destination_port: remote.port,
+                    originator_ip,
+                    originator_port: 0,
+                    flow_generation: None,
+                })
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to open {} UDP DNS association to {}:{}",
+                        data_plane.label(),
+                        remote.host,
+                        remote.port
+                    )
+                })?;
+            return query_dns_over_agent_udp_stream(stream, query).await;
+        }
     }
 
-    let mut channel = tokio::time::timeout(
-        ssh_bridge::DNS_DIRECT_OPEN_TIMEOUT,
-        ssh.open_background_direct_tcpip(
-            remote.host.clone(),
-            u32::from(remote.port),
-            "127.0.0.1".to_owned(),
-            0,
-        ),
-    )
-    .await
-    .context("timed out opening SSH direct-tcpip channel to DNS resolver")?
-    .with_context(|| {
-        format!(
-            "failed to open SSH direct-tcpip channel to DNS resolver {}:{}",
-            remote.host, remote.port
-        )
-    })?;
-
-    let mut frame = BytesMut::with_capacity(query.len() + 2);
-    frame.extend_from_slice(&(query.len() as u16).to_be_bytes());
-    frame.extend_from_slice(query);
-    channel
-        .data_bytes(frame.freeze())
-        .await
-        .context("failed to write DNS TCP query over SSH")?;
-
-    let response = tokio::time::timeout(DNS_QUERY_TIMEOUT, async {
-        let mut received = BytesMut::with_capacity(512);
-        let mut expected_len = None;
-
-        while let Some(msg) = channel.wait().await {
-            match msg {
-                russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
-                    received.extend_from_slice(data.as_ref());
-                    if expected_len.is_none() && received.len() >= 2 {
-                        expected_len =
-                            Some(usize::from(u16::from_be_bytes([received[0], received[1]])));
-                    }
-                    if let Some(len) = expected_len {
-                        if received.len() >= len + 2 {
-                            let frame = received.split_to(len + 2).freeze();
-                            return Ok(frame.slice(2..));
-                        }
-                    }
-                }
-                russh::ChannelMsg::Eof => break,
-                _ => {}
-            }
-        }
-
-        bail!("remote DNS resolver closed before sending a complete TCP DNS response")
-    })
-    .await
-    .context("timed out waiting for remote DNS TCP response")??;
-
-    let _ = channel.close().await;
-    Ok(response)
-}
-
-async fn query_dns_over_stream_data_plane<D>(
-    data_plane: &D,
-    remote: &Destination,
-    query: &[u8],
-    originator_ip: Ipv4Addr,
-) -> Result<Bytes>
-where
-    D: DataPlane,
-{
     if let Ok(remote_ip) = remote.host.parse::<Ipv4Addr>() {
         let stream = data_plane
-            .open_udp_ipv4(DataPlaneIpv4Open {
-                destination_ip: remote_ip,
-                destination_port: remote.port,
-                originator_ip,
-                originator_port: 0,
-                flow_generation: None,
-            })
+            .open_tcp(
+                DataPlaneTcpOpen::Ipv4(DataPlaneIpv4Open {
+                    destination_ip: remote_ip,
+                    destination_port: remote.port,
+                    originator_ip,
+                    originator_port: 0,
+                    flow_generation: None,
+                }),
+                DataPlaneTcpOpenMode::Strict,
+            )
             .await
             .with_context(|| {
                 format!(
-                    "failed to open {} UDP DNS association to {}:{}",
+                    "failed to open {} TCP DNS stream to {}:{}",
                     data_plane.label(),
                     remote.host,
                     remote.port
                 )
             })?;
-        query_dns_over_agent_udp_stream(stream, query).await
+        query_dns_over_agent_tcp_stream(stream, query).await
     } else {
         let stream = data_plane
             .open_tcp(
@@ -555,7 +487,7 @@ mod tests {
         let (bridge, bridge_task) = test_quic_native_bridge().await;
         let data_plane = super::super::QuicNativeDataPlane::new(bridge.clone());
 
-        let response = query_dns_over_stream_data_plane(
+        let response = query_dns_on_data_plane(
             &data_plane,
             &remote,
             b"\x12\x34native-query",
@@ -674,7 +606,7 @@ mod tests {
         let (bridge, bridge_task) = test_quic_native_bridge().await;
         let data_plane = super::super::QuicNativeDataPlane::new(bridge.clone());
 
-        let response = query_dns_over_stream_data_plane(
+        let response = query_dns_on_data_plane(
             &data_plane,
             &remote,
             b"\xab\xcdnative-name-query",

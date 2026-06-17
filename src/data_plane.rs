@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +15,8 @@ use crate::quic_agent;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneReconnectSnapshot,
-    DataPlaneRuntimeSnapshot, DataPlaneTcpOpen, DataPlaneTcpOpenMode, Destination,
-    UdpAssociationEvents, UdpFlowKey,
+    DataPlaneRuntimeSnapshot, DataPlaneTcpOpen, DataPlaneTcpOpenMode, UdpAssociationEvents,
+    UdpFlowKey,
 };
 use crate::{ssh_bridge, tcp_core};
 
@@ -28,13 +27,12 @@ mod tcp;
 mod test_support;
 mod udp;
 
-pub(crate) use dns::spawn_dns_query_on_data_plane;
+pub(crate) use dns::{query_dns_on_data_plane, spawn_dns_query_on_data_plane};
 use stream::AgentIoStream;
 use tcp::spawn_data_plane_tcp_bridge_with_open;
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
-pub(crate) type DataPlaneDnsFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
 pub(crate) type OpenTcpFuture<'a> =
     Pin<Box<dyn Future<Output = Result<AgentIoStream>> + Send + 'a>>;
 pub(crate) type OpenUdpFuture<'a> =
@@ -46,12 +44,6 @@ pub(crate) trait DataPlane: Send + Sync {
     fn caps(&self) -> DataPlaneCaps;
     fn admission_limits(&self) -> BridgeAdmissionLimits;
     fn snapshot(&self) -> DataPlaneSnapshotFuture<'_>;
-    fn query_dns(
-        &self,
-        remote: Destination,
-        query: Bytes,
-        originator_ip: Ipv4Addr,
-    ) -> DataPlaneDnsFuture<'_>;
     fn open_tcp(
         &self,
         open: DataPlaneTcpOpen,
@@ -205,15 +197,6 @@ impl DataPlane for DirectTcpipDataPlane {
         Box::pin(async { DataPlaneRuntimeSnapshot::default() })
     }
 
-    fn query_dns(
-        &self,
-        remote: Destination,
-        query: Bytes,
-        _originator_ip: Ipv4Addr,
-    ) -> DataPlaneDnsFuture<'_> {
-        dns::query_dns_over_ssh_future(self.ssh.clone(), remote, query)
-    }
-
     fn open_tcp(
         &self,
         open: DataPlaneTcpOpen,
@@ -323,15 +306,6 @@ impl DataPlane for FramedAgentDataPlane {
         Box::pin(async move { data_plane_runtime_snapshot_from_agent(agent.snapshot().await) })
     }
 
-    fn query_dns(
-        &self,
-        remote: Destination,
-        query: Bytes,
-        originator_ip: Ipv4Addr,
-    ) -> DataPlaneDnsFuture<'_> {
-        dns::query_dns_over_stream_data_plane_future(self.clone(), remote, query, originator_ip)
-    }
-
     fn open_tcp(
         &self,
         open: DataPlaneTcpOpen,
@@ -404,15 +378,6 @@ impl DataPlane for QuicNativeDataPlane {
         Box::pin(async move { data_plane_runtime_snapshot_from_quic_native(bridge.snapshot()) })
     }
 
-    fn query_dns(
-        &self,
-        remote: Destination,
-        query: Bytes,
-        originator_ip: Ipv4Addr,
-    ) -> DataPlaneDnsFuture<'_> {
-        dns::query_dns_over_stream_data_plane_future(self.clone(), remote, query, originator_ip)
-    }
-
     fn open_tcp(
         &self,
         open: DataPlaneTcpOpen,
@@ -463,7 +428,7 @@ impl DataPlane for QuicNativeDataPlane {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
 
     use super::*;
