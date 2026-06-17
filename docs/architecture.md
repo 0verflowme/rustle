@@ -161,7 +161,7 @@ magic(4) kind(1) flags(1) reserved(2) stream_id(8) credit(4) payload_len(4)
 ```
 
 The current magic is `RLA1`, protocol version is `1`, and the maximum payload is
-64 KiB. Frame kinds cover hello negotiation, IPv4 TCP open, hostname TCP open
+256 KiB. Frame kinds cover hello negotiation, IPv4 TCP open, hostname TCP open
 for DNS relay, IPv4 UDP open, opened acknowledgements, data, window credit, EOF,
 close, reset, and zero-stream heartbeat ping/pong. Payload sizes are validated
 before payload allocation, reserved bits must be zero, and the decoder is
@@ -173,8 +173,8 @@ buffers, and backpressure is represented by explicit byte credit instead of
 hidden SSH channel behavior alone. `Opened` frames grant initial send credit,
 `Window` frames replenish credit as bytes are consumed or written downstream, and
 senders wait before emitting `Data` frames when credit is exhausted. Each
-direction starts with a 1 MiB receive window, then sustained streams grow that
-window to a bounded 2 MiB cap after the receiver consumes a full current window.
+direction starts with a 4 MiB receive window, then sustained streams grow that
+window to a bounded 24 MiB cap after the receiver consumes a full current window.
 That keeps tiny flows at the low-latency initial window while giving large
 responses more in-flight credit without unbounded SSH-channel buffering. The
 local agent transport segments oversized caller buffers into bounded `Data`
@@ -205,7 +205,7 @@ Remote TCP connect attempts are bounded below the controller stream-open timeout
 a slow or blackholed destination becomes a per-stream `Reset`, not a lane-wide
 transport failure.
 The remote agent reads TCP responses in protocol-payload-sized chunks, currently
-64 KiB, so large responses do not pay unnecessary per-frame scheduling overhead.
+256 KiB, so large responses do not pay unnecessary per-frame scheduling overhead.
 Auto selection makes the framed agent path the preferred transport and keeps
 `direct-tcpip` only as the compatibility fallback. Removing that fallback should
 wait until live release evidence proves agent bootstrap across the supported

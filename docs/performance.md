@@ -729,8 +729,8 @@ Performance work must preserve these invariants:
 
 - the public tunnel command remains compact: `rustle -r user@host CIDR...`
 - bridge queues are bounded by item count and byte count
-- remote-to-local TCP backlog is bounded per flow and globally, currently 2 MiB
-  per flow with a 128 MiB process-wide backlog cap
+- remote-to-local TCP backlog is bounded per flow and globally, currently 32 MiB
+  per flow with a 512 MiB process-wide backlog cap
 - smoltcp TX packets are drained into caller-owned scratch vectors so the TUN
   loop does not allocate a fresh `Vec<PacketBuf>` for each packet poll
 - `FlowManager` enumeration for bridge admission and local-byte drain uses
@@ -765,7 +765,7 @@ Performance work must preserve these invariants:
   buffering
 - single-flow remote-to-local throughput depends on both the smoltcp proxy
   response buffer and the agent stream response window; the agent window starts
-  aligned at 1 MiB and sustained streams adapt up to a bounded 2 MiB cap, so one
+  aligned at 4 MiB and sustained streams adapt up to a bounded 24 MiB cap, so one
   high-latency flow is not capped by the old 256 KiB credit window while tiny
   flows keep the lower initial window
 - each remote backlog admits multiple local TCP send windows so high-throughput

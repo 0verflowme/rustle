@@ -84,6 +84,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn agent_window_constants_match_live_rtt_targets() {
+        assert_eq!(AGENT_STREAM_INITIAL_WINDOW_BYTES, 4 * 1024 * 1024);
+        assert_eq!(AGENT_STREAM_MAX_WINDOW_BYTES, 24 * 1024 * 1024);
+        assert_eq!(AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES, 1024 * 1024);
+        assert_eq!(AGENT_STREAM_RECEIVE_CREDIT_MAX_BATCH_BYTES, 1024 * 1024);
+    }
+
+    #[test]
     fn credit_window_batches_initial_credit_until_threshold() {
         let mut window = AgentCreditWindow::new();
         let chunk = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / 4;

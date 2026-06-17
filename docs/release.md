@@ -342,8 +342,8 @@ Required before tagging a release:
 - `credit_window_grows_after_sustained_full_window_consumption`,
   `stream_recv_grows_receive_window_after_sustained_consumption`, and
   `runtime_receive_credit_grows_after_sustained_window_consumption` pass,
-  proving agent receive windows start at the latency-friendly 1 MiB window and
-  adapt to a bounded 2 MiB cap on sustained streams on both sides of the agent
+  proving agent receive windows start at the latency-friendly 4 MiB window and
+  adapt to a bounded 24 MiB cap on sustained streams on both sides of the agent
   protocol.
 - `remote_backlog_per_flow_has_agent_window_frame_headroom` passes, proving the
   per-flow remote backlog is sized from the local TCP send window with multiple

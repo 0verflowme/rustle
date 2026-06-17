@@ -1013,6 +1013,8 @@ mod tests {
             backlogs.max_bytes_per_flow(),
             tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW
         );
+        assert_eq!(backlogs.max_bytes_per_flow(), 32 * 1024 * 1024);
+        assert_eq!(REMOTE_BACKLOG_BYTES_TOTAL, 512 * 1024 * 1024);
         assert!(backlogs.max_bytes_per_flow() > agent_window::AGENT_STREAM_MAX_WINDOW_BYTES);
         assert!(backlogs.max_bytes_per_flow() < REMOTE_BACKLOG_BYTES_TOTAL);
     }
