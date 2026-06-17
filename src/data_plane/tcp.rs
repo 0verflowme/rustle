@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::future::Future;
 use std::time::Instant as StdInstant;
 
 use anyhow::{Context, Result};
@@ -7,7 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridge, ReconnectingAgentBridge};
 use crate::ssh_control::SshSessionPool;
+use crate::transport_model::DataPlaneIpv4Open;
 use crate::{agent_proto, quic_agent, ssh_bridge, tcp_core};
+
+use super::stream::AgentIoStream;
 
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 
@@ -27,21 +31,47 @@ pub(super) fn spawn_direct_tcpip_bridge(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn spawn_agent_tcp_bridge(
     id: tcp_core::FlowId,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
     agent: ReconnectingAgentBridge,
 ) -> ssh_bridge::FlowBridge {
+    let open = tcp_open_request(id);
+    spawn_agent_tcp_bridge_with_open(
+        id,
+        event_tx,
+        agent.clone(),
+        open_agent_tcp_stream(agent, open),
+    )
+}
+
+pub(super) fn spawn_agent_tcp_bridge_with_open<Fut>(
+    id: tcp_core::FlowId,
+    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    agent: ReconnectingAgentBridge,
+    open_stream: Fut,
+) -> ssh_bridge::FlowBridge
+where
+    Fut: Future<Output = Result<AgentIoStream>> + Send + 'static,
+{
     ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
         let open_started_at = StdInstant::now();
-        let open = agent_proto::AgentOpenIpv4 {
-            destination_ip: id.key.dst_ip,
-            destination_port: id.key.dst_port,
-            originator_ip: id.key.src_ip,
-            originator_port: id.key.src_port,
-        };
-        let mut stream = match agent.open_tcp_ipv4_optimistic(open).await {
-            Ok(stream) => stream,
+        let open = tcp_open_request(id);
+        let mut stream = match open_stream.await {
+            Ok(AgentIoStream::Bridge(stream)) => stream,
+            Ok(_) => {
+                let _ = ssh_bridge::send_bridge_event(
+                    &event_tx,
+                    ssh_bridge::BridgeEvent::Failed {
+                        id,
+                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                        message: "agent data plane returned a non-agent TCP stream".to_owned(),
+                    },
+                )
+                .await;
+                return;
+            }
             Err(err) => {
                 let _ = ssh_bridge::send_bridge_event(
                     &event_tx,
@@ -96,7 +126,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
                                         pre_open_retries += 1;
                                         match retry_agent_pre_open_stream(
                                             &agent,
-                                            open,
+                                            open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
                                         ).await {
@@ -216,7 +246,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
                                         pre_open_retries += 1;
                                         match retry_agent_pre_open_stream(
                                             &agent,
-                                            open,
+                                            open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
                                         ).await {
@@ -262,7 +292,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
                                     pre_open_retries += 1;
                                     match retry_agent_pre_open_stream(
                                         &agent,
-                                        open,
+                                        open.into_agent_open(),
                                         stream,
                                         &pre_open_local,
                                     ).await {
@@ -313,7 +343,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
                                 pre_open_retries += 1;
                                 match retry_agent_pre_open_stream(
                                     &agent,
-                                    open,
+                                    open.into_agent_open(),
                                     stream,
                                     &pre_open_local,
                                 ).await {
@@ -352,6 +382,26 @@ pub(crate) fn spawn_agent_tcp_bridge(
         let _ =
             ssh_bridge::send_bridge_event(&event_tx, ssh_bridge::BridgeEvent::Closed { id }).await;
     })
+}
+
+fn tcp_open_request(id: tcp_core::FlowId) -> DataPlaneIpv4Open {
+    DataPlaneIpv4Open {
+        destination_ip: id.key.dst_ip,
+        destination_port: id.key.dst_port,
+        originator_ip: id.key.src_ip,
+        originator_port: id.key.src_port,
+    }
+}
+
+#[cfg(test)]
+async fn open_agent_tcp_stream(
+    agent: ReconnectingAgentBridge,
+    open: DataPlaneIpv4Open,
+) -> Result<AgentIoStream> {
+    agent
+        .open_tcp_ipv4_optimistic(open.into_agent_open())
+        .await
+        .map(AgentIoStream::Bridge)
 }
 
 pub(super) fn spawn_quic_native_tcp_bridge(

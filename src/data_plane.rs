@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::pin::Pin;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
@@ -14,8 +14,8 @@ use crate::agent_transport;
 use crate::quic_agent;
 use crate::ssh_control::SshSessionPool;
 use crate::transport_model::{
-    BridgeAdmissionLimits, DataPlaneCaps, DataPlaneReconnectSnapshot, DataPlaneRuntimeSnapshot,
-    Destination, UdpAssociationEvents, UdpFlowKey,
+    BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneReconnectSnapshot,
+    DataPlaneRuntimeSnapshot, Destination, UdpAssociationEvents, UdpFlowKey,
 };
 use crate::{ssh_bridge, tcp_core};
 
@@ -27,16 +27,18 @@ mod test_support;
 mod udp;
 
 pub(crate) use dns::spawn_dns_query_on_data_plane;
-pub(crate) use tcp::spawn_agent_tcp_bridge;
-use tcp::{spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge};
-use udp::{
-    spawn_agent_udp_association_with_idle_timeout,
-    spawn_quic_native_udp_association_with_idle_timeout,
+use stream::AgentIoStream;
+use tcp::{
+    spawn_agent_tcp_bridge_with_open, spawn_direct_tcpip_bridge, spawn_quic_native_tcp_bridge,
 };
 
 pub(crate) type DataPlaneSnapshotFuture<'a> =
     Pin<Box<dyn Future<Output = DataPlaneRuntimeSnapshot> + Send + 'a>>;
 pub(crate) type DataPlaneDnsFuture<'a> = Pin<Box<dyn Future<Output = Result<Bytes>> + Send + 'a>>;
+pub(crate) type OpenTcpFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AgentIoStream>> + Send + 'a>>;
+pub(crate) type OpenUdpFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<AgentIoStream>> + Send + 'a>>;
 
 pub(crate) trait DataPlane: Send + Sync {
     fn label(&self) -> &'static str;
@@ -55,13 +57,23 @@ pub(crate) trait DataPlane: Send + Sync {
         query: Bytes,
         originator_ip: Ipv4Addr,
     ) -> DataPlaneDnsFuture<'_>;
+    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static>;
+    fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static>;
     fn spawn_udp_association(
         &self,
         key: UdpFlowKey,
         from_local: mpsc::Receiver<Bytes>,
         events: UdpAssociationEvents,
         idle_timeout: Duration,
-    );
+    ) {
+        udp::spawn_udp_association_with_idle_timeout(
+            self.open_udp_ipv4(udp::udp_open_request(key)),
+            key,
+            from_local,
+            events,
+            idle_timeout,
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -172,6 +184,26 @@ impl DataPlane for DirectTcpipDataPlane {
         dns::query_dns_over_ssh_future(self.ssh.clone(), remote, query)
     }
 
+    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+        Box::pin(async move {
+            bail!(
+                "data plane does not support agent-style optimistic TCP stream opens to {}:{}",
+                open.destination_ip,
+                open.destination_port
+            )
+        })
+    }
+
+    fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static> {
+        Box::pin(async move {
+            bail!(
+                "data plane does not support generic UDP associations to {}:{}",
+                open.destination_ip,
+                open.destination_port
+            )
+        })
+    }
+
     fn spawn_udp_association(
         &self,
         key: UdpFlowKey,
@@ -220,7 +252,18 @@ impl DataPlane for FramedAgentDataPlane {
             "agent: opening stream {}:{} for local {}:{} generation={}",
             flow.dst_ip, flow.dst_port, flow.src_ip, flow.src_port, id.generation
         );
-        spawn_agent_tcp_bridge(id, event_tx, self.agent.clone())
+        let open = DataPlaneIpv4Open {
+            destination_ip: flow.dst_ip,
+            destination_port: flow.dst_port,
+            originator_ip: flow.src_ip,
+            originator_port: flow.src_port,
+        };
+        spawn_agent_tcp_bridge_with_open(
+            id,
+            event_tx,
+            self.agent.clone(),
+            self.open_tcp_ipv4_optimistic(open),
+        )
     }
 
     fn query_dns(
@@ -232,20 +275,18 @@ impl DataPlane for FramedAgentDataPlane {
         dns::query_dns_over_agent_future(self.agent.clone(), remote, query, originator_ip)
     }
 
-    fn spawn_udp_association(
-        &self,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    ) {
-        spawn_agent_udp_association_with_idle_timeout(
-            self.agent.clone(),
-            key,
-            from_local,
-            events,
-            idle_timeout,
-        );
+    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+        let agent = self.agent.clone();
+        Box::pin(async move {
+            agent
+                .open_tcp_ipv4_optimistic(open.into_agent_open())
+                .await
+                .map(AgentIoStream::Bridge)
+        })
+    }
+
+    fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static> {
+        Box::pin(udp::open_agent_udp_association(self.agent.clone(), open))
     }
 }
 
@@ -295,20 +336,21 @@ impl DataPlane for QuicNativeDataPlane {
         dns::query_dns_over_quic_native_future(self.bridge.clone(), remote, query, originator_ip)
     }
 
-    fn spawn_udp_association(
-        &self,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    ) {
-        spawn_quic_native_udp_association_with_idle_timeout(
+    fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static> {
+        let bridge = self.bridge.clone();
+        Box::pin(async move {
+            bridge
+                .open_tcp_ipv4_optimistic(open.into_agent_open())
+                .await
+                .map(AgentIoStream::QuicNativeTcp)
+        })
+    }
+
+    fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static> {
+        Box::pin(udp::open_quic_native_udp_association(
             self.bridge.clone(),
-            key,
-            from_local,
-            events,
-            idle_timeout,
-        );
+            open,
+        ))
     }
 }
 
@@ -318,6 +360,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::agent_proto;
 
     struct FailingAgentConnector;
 
@@ -401,6 +444,32 @@ mod tests {
         let data_plane = QuicNativeDataPlane::new(bridge.clone());
 
         (data_plane, bridge, bridge_task)
+    }
+
+    fn data_plane_ipv4_open(destination: SocketAddr) -> DataPlaneIpv4Open {
+        let destination = match destination {
+            SocketAddr::V4(addr) => addr,
+            SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+        };
+        DataPlaneIpv4Open {
+            destination_ip: *destination.ip(),
+            destination_port: destination.port(),
+            originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+            originator_port: 49152,
+        }
+    }
+
+    async fn recv_data_payload(stream: &mut AgentIoStream) -> Bytes {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .expect("timed out waiting for data frame")
+                .expect("read data frame")
+                .expect("stream closed before data frame");
+            if frame.kind == agent_proto::AgentFrameKind::Data {
+                return frame.payload;
+            }
+        }
     }
 
     #[tokio::test]
@@ -522,6 +591,94 @@ mod tests {
             .expect("agent join")
             .expect("agent run");
         udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn framed_agent_data_plane_open_udp_ipv4_future_is_spawnable() {
+        let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind UDP target");
+        let destination = socket.local_addr().expect("UDP target address");
+        let udp_server = tokio::spawn(async move {
+            let mut buf = [0_u8; 2048];
+            let (len, peer) = socket.recv_from(&mut buf).await.expect("read UDP query");
+            assert_eq!(&buf[..len], b"trait-udp");
+            socket
+                .send_to(b"trait-udp-ok", peer)
+                .await
+                .expect("write UDP response");
+        });
+        let (data_plane, bridge, agent_task) = test_agent_data_plane().await;
+        let data_plane: Arc<dyn DataPlane> = Arc::new(data_plane);
+
+        let open_task = tokio::spawn(data_plane.open_udp_ipv4(data_plane_ipv4_open(destination)));
+        let mut stream = open_task
+            .await
+            .expect("open task joins")
+            .expect("open UDP stream");
+        stream
+            .send_data(Bytes::from_static(b"trait-udp"))
+            .await
+            .expect("write UDP datagram");
+        assert_eq!(
+            recv_data_payload(&mut stream).await,
+            Bytes::from_static(b"trait-udp-ok")
+        );
+        stream.close().await.expect("close UDP stream");
+
+        drop(data_plane);
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent_task)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        udp_server.await.expect("UDP server join");
+    }
+
+    #[tokio::test]
+    async fn framed_agent_data_plane_open_tcp_ipv4_optimistic_round_trips() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind TCP target");
+        let destination = listener.local_addr().expect("TCP target address");
+        let tcp_server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+            let mut buf = [0_u8; 9];
+            socket.read_exact(&mut buf).await.expect("read TCP request");
+            assert_eq!(&buf, b"trait-tcp");
+            socket
+                .write_all(b"trait-tcp-ok")
+                .await
+                .expect("write TCP response");
+        });
+        let (data_plane, bridge, agent_task) = test_agent_data_plane().await;
+        let data_plane: Arc<dyn DataPlane> = Arc::new(data_plane);
+
+        let mut stream = data_plane
+            .open_tcp_ipv4_optimistic(data_plane_ipv4_open(destination))
+            .await
+            .expect("open optimistic TCP stream");
+        stream
+            .send_data(Bytes::from_static(b"trait-tcp"))
+            .await
+            .expect("write TCP request");
+        assert_eq!(
+            recv_data_payload(&mut stream).await,
+            Bytes::from_static(b"trait-tcp-ok")
+        );
+        stream.close().await.expect("close TCP stream");
+
+        drop(data_plane);
+        drop(bridge);
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent_task)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+        tcp_server.await.expect("TCP server join");
     }
 
     #[tokio::test]

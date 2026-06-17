@@ -7,7 +7,7 @@ use crate::agent_bridge::{AgentBridgeStream, QuicNativeBridgeStream};
 #[cfg(test)]
 use crate::agent_transport;
 
-pub(super) enum AgentIoStream {
+pub(crate) enum AgentIoStream {
     Bridge(AgentBridgeStream),
     QuicNativeTcp(QuicNativeBridgeStream),
     QuicNativeUdp(QuicNativeBridgeStream),
@@ -16,7 +16,7 @@ pub(super) enum AgentIoStream {
 }
 
 impl AgentIoStream {
-    pub(super) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
+    pub(crate) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_data(bytes).await,
             Self::QuicNativeTcp(stream) => stream.send_data(bytes.into()).await,
@@ -26,7 +26,7 @@ impl AgentIoStream {
         }
     }
 
-    pub(super) async fn send_eof(&mut self) -> Result<()> {
+    pub(crate) async fn send_eof(&mut self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.send_eof().await,
             Self::QuicNativeTcp(stream) => stream.send_eof().await,
@@ -36,7 +36,7 @@ impl AgentIoStream {
         }
     }
 
-    pub(super) async fn recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
+    pub(crate) async fn recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
         match self {
             Self::Bridge(stream) => Ok(stream.recv().await),
             Self::QuicNativeTcp(stream) => {
@@ -63,7 +63,7 @@ impl AgentIoStream {
         }
     }
 
-    pub(super) async fn close(self) -> Result<()> {
+    pub(crate) async fn close(self) -> Result<()> {
         match self {
             Self::Bridge(stream) => stream.close().await,
             Self::QuicNativeTcp(mut stream) => stream.send_eof().await,

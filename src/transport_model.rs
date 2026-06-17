@@ -4,6 +4,7 @@ use clap::ValueEnum;
 use std::net::Ipv4Addr;
 use tokio::sync::mpsc;
 
+use crate::agent_proto;
 use crate::dns;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -81,6 +82,25 @@ pub(crate) struct Destination {
     pub(crate) port: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DataPlaneIpv4Open {
+    pub(crate) destination_ip: Ipv4Addr,
+    pub(crate) destination_port: u16,
+    pub(crate) originator_ip: Ipv4Addr,
+    pub(crate) originator_port: u16,
+}
+
+impl DataPlaneIpv4Open {
+    pub(crate) fn into_agent_open(self) -> agent_proto::AgentOpenIpv4 {
+        agent_proto::AgentOpenIpv4 {
+            destination_ip: self.destination_ip,
+            destination_port: self.destination_port,
+            originator_ip: self.originator_ip,
+            originator_port: self.originator_port,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DataPlaneReconnectSnapshot {
     pub(crate) attempts: u64,
@@ -118,6 +138,15 @@ pub(crate) struct UdpFlowKey {
 }
 
 impl UdpFlowKey {
+    pub(crate) fn into_open_request(self) -> DataPlaneIpv4Open {
+        DataPlaneIpv4Open {
+            destination_ip: self.dst_ip,
+            destination_port: self.dst_port,
+            originator_ip: self.src_ip,
+            originator_port: self.src_port,
+        }
+    }
+
     pub(crate) fn from_packet(packet: &dns::UdpPacket) -> Self {
         Self {
             src_ip: packet.src_ip,

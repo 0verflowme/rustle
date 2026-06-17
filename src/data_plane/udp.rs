@@ -11,46 +11,14 @@ use crate::agent_proto;
 use crate::agent_transport;
 #[cfg(test)]
 use crate::dns;
-use crate::transport_model::{UdpAssociationEvents, UdpFlowKey};
+use crate::transport_model::{DataPlaneIpv4Open, UdpAssociationEvents, UdpFlowKey};
 
 use super::stream::AgentIoStream;
 
 #[cfg(test)]
 pub(crate) const UDP_DATAGRAM_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(super) fn spawn_agent_udp_association_with_idle_timeout(
-    agent: ReconnectingAgentBridge,
-    key: UdpFlowKey,
-    from_local: mpsc::Receiver<Bytes>,
-    events: UdpAssociationEvents,
-    idle_timeout: Duration,
-) {
-    spawn_udp_association_with_idle_timeout(
-        open_agent_udp_association(agent, key),
-        key,
-        from_local,
-        events,
-        idle_timeout,
-    );
-}
-
-pub(super) fn spawn_quic_native_udp_association_with_idle_timeout(
-    bridge: QuicNativeBridge,
-    key: UdpFlowKey,
-    from_local: mpsc::Receiver<Bytes>,
-    events: UdpAssociationEvents,
-    idle_timeout: Duration,
-) {
-    spawn_udp_association_with_idle_timeout(
-        open_quic_native_udp_association(bridge, key),
-        key,
-        from_local,
-        events,
-        idle_timeout,
-    );
-}
-
-fn spawn_udp_association_with_idle_timeout<Fut>(
+pub(super) fn spawn_udp_association_with_idle_timeout<Fut>(
     open_stream: Fut,
     key: UdpFlowKey,
     from_local: mpsc::Receiver<Bytes>,
@@ -87,43 +55,38 @@ where
     run_udp_association_stream(stream, key, &mut from_local, events, idle_timeout).await
 }
 
-fn udp_open_request(key: UdpFlowKey) -> agent_proto::AgentOpenIpv4 {
-    agent_proto::AgentOpenIpv4 {
-        destination_ip: key.dst_ip,
-        destination_port: key.dst_port,
-        originator_ip: key.src_ip,
-        originator_port: key.src_port,
-    }
+pub(super) fn udp_open_request(key: UdpFlowKey) -> DataPlaneIpv4Open {
+    key.into_open_request()
 }
 
-async fn open_agent_udp_association(
+pub(super) async fn open_agent_udp_association(
     agent: ReconnectingAgentBridge,
-    key: UdpFlowKey,
+    open: DataPlaneIpv4Open,
 ) -> Result<AgentIoStream> {
     agent
-        .open_udp_ipv4(udp_open_request(key))
+        .open_udp_ipv4(open.into_agent_open())
         .await
         .map(AgentIoStream::Bridge)
         .with_context(|| {
             format!(
                 "failed to open agent UDP association to {}:{}",
-                key.dst_ip, key.dst_port
+                open.destination_ip, open.destination_port
             )
         })
 }
 
-async fn open_quic_native_udp_association(
+pub(super) async fn open_quic_native_udp_association(
     bridge: QuicNativeBridge,
-    key: UdpFlowKey,
+    open: DataPlaneIpv4Open,
 ) -> Result<AgentIoStream> {
     bridge
-        .open_udp_ipv4(udp_open_request(key))
+        .open_udp_ipv4(open.into_agent_open())
         .await
         .map(AgentIoStream::QuicNativeUdp)
         .with_context(|| {
             format!(
                 "failed to open native QUIC UDP association to {}:{}",
-                key.dst_ip, key.dst_port
+                open.destination_ip, open.destination_port
             )
         })
 }
@@ -137,7 +100,7 @@ async fn run_quic_native_udp_association(
     idle_timeout: Duration,
 ) -> Result<()> {
     run_udp_association(
-        open_quic_native_udp_association(bridge, key),
+        open_quic_native_udp_association(bridge, udp_open_request(key)),
         key,
         from_local,
         events,
@@ -568,8 +531,8 @@ mod tests {
         let mut association_limit = AdmissionCounter::new(1);
         assert!(association_limit.try_admit());
 
-        spawn_agent_udp_association_with_idle_timeout(
-            bridge.clone(),
+        spawn_udp_association_with_idle_timeout(
+            open_agent_udp_association(bridge.clone(), udp_open_request(key)),
             key,
             from_local,
             events,
@@ -619,8 +582,8 @@ mod tests {
         let mut association_limit = AdmissionCounter::new(1);
         assert!(association_limit.try_admit());
 
-        spawn_quic_native_udp_association_with_idle_timeout(
-            bridge.clone(),
+        spawn_udp_association_with_idle_timeout(
+            open_quic_native_udp_association(bridge.clone(), udp_open_request(key)),
             key,
             from_local,
             events,
