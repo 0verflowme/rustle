@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 pub const AGENT_PROTOCOL_VERSION: u16 = 1;
-pub const AGENT_MAX_FRAME_PAYLOAD: usize = 64 * 1024;
+pub const AGENT_MAX_FRAME_PAYLOAD: usize = 256 * 1024;
 pub const AGENT_FRAME_HEADER_LEN: usize = 24;
 pub const AGENT_MAGIC: [u8; 4] = *b"RLA1";
 

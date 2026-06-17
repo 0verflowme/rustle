@@ -6,10 +6,10 @@ use smoltcp::time::Instant as SmolInstant;
 
 use crate::tcp_core;
 
-pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
+pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 32;
 pub(crate) const REMOTE_BACKLOG_BYTES_PER_FLOW: usize =
     tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW;
-pub(crate) const REMOTE_BACKLOG_BYTES_TOTAL: usize = 128 * 1024 * 1024;
+pub(crate) const REMOTE_BACKLOG_BYTES_TOTAL: usize = 512 * 1024 * 1024;
 const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
 
 #[derive(Debug)]

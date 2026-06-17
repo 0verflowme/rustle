@@ -1,5 +1,5 @@
 pub const AGENT_STREAM_INITIAL_WINDOW_BYTES: usize = 1024 * 1024;
-pub const AGENT_STREAM_MAX_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+pub const AGENT_STREAM_MAX_WINDOW_BYTES: usize = 16 * 1024 * 1024;
 pub const AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES: usize = AGENT_STREAM_INITIAL_WINDOW_BYTES / 4;
 pub const AGENT_STREAM_RECEIVE_CREDIT_MAX_BATCH_BYTES: usize = 512 * 1024;
 const AGENT_STREAM_WINDOW_GROWTH_FACTOR: usize = 2;
@@ -101,20 +101,16 @@ mod tests {
     #[test]
     fn credit_window_grows_after_sustained_full_window_consumption() {
         let mut window = AgentCreditWindow::new();
+        let mut current = AGENT_STREAM_INITIAL_WINDOW_BYTES;
 
-        assert_eq!(
-            window.record_consumed(AGENT_STREAM_INITIAL_WINDOW_BYTES),
-            Some(AGENT_STREAM_INITIAL_WINDOW_BYTES * 2)
-        );
-        assert_eq!(
-            window.current_window(),
-            AGENT_STREAM_INITIAL_WINDOW_BYTES * 2
-        );
-
-        assert_eq!(
-            window.record_consumed(AGENT_STREAM_INITIAL_WINDOW_BYTES * 2),
-            Some(AGENT_STREAM_INITIAL_WINDOW_BYTES * 4)
-        );
+        while current < AGENT_STREAM_MAX_WINDOW_BYTES {
+            let next = current
+                .saturating_mul(AGENT_STREAM_WINDOW_GROWTH_FACTOR)
+                .min(AGENT_STREAM_MAX_WINDOW_BYTES);
+            assert_eq!(window.record_consumed(current), Some(next));
+            assert_eq!(window.current_window(), next);
+            current = next;
+        }
         assert_eq!(window.current_window(), AGENT_STREAM_MAX_WINDOW_BYTES);
     }
 

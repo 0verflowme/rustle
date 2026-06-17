@@ -12,8 +12,9 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::agent_proto::{
-    encode_frame_into, encoded_frames_len, try_decode_frame, AgentFrame, AgentFrameKind,
-    AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
+    encode_frame_into, encoded_frame_len, encoded_frames_len, try_decode_frame, AgentFrame,
+    AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
+    CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -25,6 +26,7 @@ const AGENT_UDP_READ_CHUNK: usize = 64 * 1024;
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_FRAME_WRITE_BURST: usize = 64;
+const AGENT_FRAME_WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
 
 const _: () = assert!(
     AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_LOCAL_INPUT_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
@@ -174,9 +176,16 @@ where
 {
     frames.clear();
     frames.push(first);
+    let mut burst_bytes = encoded_frame_len(frames.first().expect("burst has first frame"))?;
     for _ in 1..AGENT_FRAME_WRITE_BURST {
+        if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
+            break;
+        }
         match out_rx.try_recv() {
-            Ok(frame) => frames.push(frame),
+            Ok(frame) => {
+                burst_bytes = burst_bytes.saturating_add(encoded_frame_len(&frame)?);
+                frames.push(frame);
+            }
             Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
                 break;
             }
@@ -976,7 +985,9 @@ mod tests {
     use tokio::time::timeout;
 
     use super::*;
-    use crate::agent_proto::{encode_frame, try_decode_frame, AgentHello, AgentOpenIpv4};
+    use crate::agent_proto::{
+        encode_frame, try_decode_frame, AgentHello, AgentOpenIpv4, AGENT_FRAME_HEADER_LEN,
+    };
     use crate::agent_window::{
         AGENT_STREAM_INITIAL_WINDOW_BYTES as AGENT_STREAM_WINDOW_BYTES,
         AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES,
@@ -1132,6 +1143,40 @@ mod tests {
         );
         assert_eq!(decoded[AGENT_FRAME_WRITE_BURST], total_frames as u64);
         assert!(encoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_writer_caps_large_data_burst_by_encoded_bytes() {
+        let writer = CountingWriter::default();
+        let flushes = Arc::clone(&writer.flushes);
+        let writes = Arc::clone(&writer.writes);
+        let frames_until_byte_cap =
+            AGENT_FRAME_WRITE_BURST_BYTES / (AGENT_MAX_FRAME_PAYLOAD + AGENT_FRAME_HEADER_LEN) + 1;
+        assert!(frames_until_byte_cap < AGENT_FRAME_WRITE_BURST);
+        let total_frames = frames_until_byte_cap + 1;
+        let (out_tx, out_rx) = mpsc::channel(total_frames);
+
+        for stream_id in 1..=total_frames {
+            out_tx
+                .send(
+                    AgentFrame::new(
+                        AgentFrameKind::Data,
+                        stream_id as u64,
+                        Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
+                    )
+                    .expect("data frame"),
+                )
+                .await
+                .expect("queue frame");
+        }
+        drop(out_tx);
+
+        write_agent_frames(writer, out_rx)
+            .await
+            .expect("write byte-capped bursts");
+
+        assert_eq!(writes.load(Ordering::Acquire), 2);
+        assert_eq!(flushes.load(Ordering::Acquire), 2);
     }
 
     #[test]
