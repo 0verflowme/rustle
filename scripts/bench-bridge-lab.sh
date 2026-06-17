@@ -6,9 +6,27 @@ source "${SCRIPT_DIR}/smoke-lib.sh"
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-bridge-bench.XXXXXX")"
 
+summarize_hotpath_trace_logs() {
+  [[ -n "${RUSTLE_HOTPATH_TRACE:-}" ]] || return 0
+  [[ -x "${SCRIPT_DIR}/summarize-hotpath-trace.py" ]] || return 0
+
+  local logs=()
+  local log
+  while IFS= read -r -d '' log; do
+    logs+=("$log")
+  done < <(find "$TMPDIR" -name 'bench-*.err' -print0)
+
+  [[ "${#logs[@]}" -gt 0 ]] || return 0
+  grep -q 'rustle_hotpath_tcp' "${logs[@]}" 2>/dev/null || return 0
+
+  smoke_info "hotpath trace summary for bridge benchmark logs"
+  "${SCRIPT_DIR}/summarize-hotpath-trace.py" "${logs[@]}" >&2 || true
+}
+
 cleanup() {
   smoke_stop_pid "${SMOKE_HTTP_PID:-}"
   smoke_stop_pid "${SMOKE_SSHD_PID:-}"
+  summarize_hotpath_trace_logs
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
@@ -28,6 +46,9 @@ MAX_ELAPSED_MS="${RUSTLE_BENCH_MAX_ELAPSED_MS:-}"
 MAX_P50_US="${RUSTLE_BENCH_MAX_P50_US:-}"
 CHECK_PROCESS_LEAKS="${RUSTLE_BENCH_CHECK_PROCESS_LEAKS:-1}"
 SSHD_FD_LEAK_ALLOWANCE="${RUSTLE_BENCH_SSHD_FD_LEAK_ALLOWANCE:-2}"
+HTTP_RESPONSE_DELAY_MS="${RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS:-0}"
+HTTP_CHUNK_BYTES="${RUSTLE_BENCH_HTTP_CHUNK_BYTES:-0}"
+HTTP_CHUNK_DELAY_MS="${RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS:-0}"
 RESULTS_TSV="${TMPDIR}/bridge-results.tsv"
 
 case "$RUNS" in
@@ -110,6 +131,15 @@ esac
 case "$SSHD_FD_LEAK_ALLOWANCE" in
   '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_SSHD_FD_LEAK_ALLOWANCE must be a non-negative integer" ;;
 esac
+case "$HTTP_RESPONSE_DELAY_MS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS must be a non-negative integer" ;;
+esac
+case "$HTTP_CHUNK_BYTES" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_HTTP_CHUNK_BYTES must be a non-negative integer" ;;
+esac
+case "$HTTP_CHUNK_DELAY_MS" in
+  '' | *[!0-9]*) smoke_die "RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS must be a non-negative integer" ;;
+esac
 
 smoke_start_sshd "$TMPDIR"
 SSHD_BASE_FDS=""
@@ -129,6 +159,9 @@ for body_bytes in $BODY_BYTES; do
   fi
 
   export RUSTLE_SMOKE_HTTP_BODY_BYTES="$body_bytes"
+  export RUSTLE_SMOKE_HTTP_RESPONSE_DELAY_MS="$HTTP_RESPONSE_DELAY_MS"
+  export RUSTLE_SMOKE_HTTP_CHUNK_BYTES="$HTTP_CHUNK_BYTES"
+  export RUSTLE_SMOKE_HTTP_CHUNK_DELAY_MS="$HTTP_CHUNK_DELAY_MS"
   http_tmp="${TMPDIR}/http-${body_bytes}"
   mkdir -p "$http_tmp"
   smoke_start_http_server "$http_tmp"

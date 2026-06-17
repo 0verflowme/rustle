@@ -360,6 +360,7 @@ import socket
 import sys
 import os
 import threading
+import time
 
 try:
     BrokenPipeError
@@ -375,6 +376,19 @@ ready = sys.argv[2]
 marker = b"rustle-smoke-ok\n"
 body_size = int(os.environ.get("RUSTLE_SMOKE_HTTP_BODY_BYTES", str(len(marker))))
 listen_backlog = int(os.environ.get("RUSTLE_SMOKE_HTTP_BACKLOG", "1024"))
+response_delay_ms = int(os.environ.get("RUSTLE_SMOKE_HTTP_RESPONSE_DELAY_MS", "0"))
+chunk_bytes = int(os.environ.get("RUSTLE_SMOKE_HTTP_CHUNK_BYTES", "0"))
+chunk_delay_ms = int(os.environ.get("RUSTLE_SMOKE_HTTP_CHUNK_DELAY_MS", "0"))
+if body_size < 1:
+    raise SystemExit("RUSTLE_SMOKE_HTTP_BODY_BYTES must be at least 1")
+if listen_backlog < 1:
+    raise SystemExit("RUSTLE_SMOKE_HTTP_BACKLOG must be at least 1")
+if response_delay_ms < 0:
+    raise SystemExit("RUSTLE_SMOKE_HTTP_RESPONSE_DELAY_MS must be non-negative")
+if chunk_bytes < 0:
+    raise SystemExit("RUSTLE_SMOKE_HTTP_CHUNK_BYTES must be non-negative")
+if chunk_delay_ms < 0:
+    raise SystemExit("RUSTLE_SMOKE_HTTP_CHUNK_DELAY_MS must be non-negative")
 body = marker
 if body_size > len(marker):
     body += b"x" * (body_size - len(marker))
@@ -397,7 +411,15 @@ def handle_connection(conn):
                 if not chunk:
                     break
                 data += chunk
-            conn.sendall(response)
+            if response_delay_ms:
+                time.sleep(response_delay_ms / 1000.0)
+            if chunk_bytes:
+                for offset in range(0, len(response), chunk_bytes):
+                    conn.sendall(response[offset:offset + chunk_bytes])
+                    if chunk_delay_ms and offset + chunk_bytes < len(response):
+                        time.sleep(chunk_delay_ms / 1000.0)
+            else:
+                conn.sendall(response)
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             pass
     finally:

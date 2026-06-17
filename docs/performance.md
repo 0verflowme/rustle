@@ -88,8 +88,9 @@ tiny-response p50 against `agent`.
 `scripts/verify-local.sh` uses a conservative tiny-response 1-flow latency gate
 with both elapsed and median measured `p50_us` ceilings across the fast-path
 transports, `agent` and `quic-native`, runs a 1 MiB / 1-flow gate that keeps
-`direct-tcpip` under compatibility throughput coverage, and runs a 100 MiB single-flow throughput gate
-through both the primary `agent` transport and `quic-native`
+`direct-tcpip` under compatibility throughput coverage, runs a delayed 1 KiB
+agent gate with `RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS=25`, and runs a
+100 MiB single-flow throughput gate through both the primary `agent` transport and `quic-native`
 (`RUSTLE_BENCH_BODY_BYTES=104857600`). It also runs the same 100 MiB gate through `quic-agent`,
 proving the SSH-bootstrap/UDP-QUIC carrier can sustain a large response with
 release-mode code. Together these guard against a debug binary, multi-second
@@ -108,6 +109,14 @@ Those checks are intentionally coarse guardrails, not release claims. They
 catch obvious agent-path and single-flow regressions while leaving detailed
 performance conclusions to multi-run live benchmarks on the same SSH server and
 target.
+
+The rootless bridge benchmark can shape its local HTTP fixture with
+`RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS`, `RUSTLE_BENCH_HTTP_CHUNK_BYTES`, and
+`RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS`. These knobs do not emulate real SSH RTT or
+remote kernel behavior, but they create deterministic delayed-response and
+chunked-response cases for local regression checks. When `RUSTLE_HOTPATH_TRACE`
+is enabled, `scripts/bench-bridge-lab.sh` summarizes traced flow timings from
+the per-run stderr logs before cleanup.
 
 This benchmark is useful for bridge regressions because it exercises:
 

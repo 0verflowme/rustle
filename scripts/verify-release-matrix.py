@@ -743,6 +743,34 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         BRIDGE_BENCH,
+        "RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS",
+    ),
+    (
+        BRIDGE_BENCH,
+        "RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS",
+    ),
+    (
+        BRIDGE_BENCH,
+        "RUSTLE_BENCH_HTTP_CHUNK_BYTES",
+    ),
+    (
+        BRIDGE_BENCH,
+        "summarize_hotpath_trace_logs",
+    ),
+    (
+        SMOKE_LIB,
+        "RUSTLE_SMOKE_HTTP_RESPONSE_DELAY_MS",
+    ),
+    (
+        SMOKE_LIB,
+        "RUSTLE_SMOKE_HTTP_CHUNK_DELAY_MS",
+    ),
+    (
+        SMOKE_LIB,
+        "RUSTLE_SMOKE_HTTP_CHUNK_BYTES",
+    ),
+    (
+        BRIDGE_BENCH,
         "RUSTLE_BENCH_CHECK_PROCESS_LEAKS",
     ),
     (
@@ -908,6 +936,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         'RUSTLE_BENCH_MAX_P50_US="${RUSTLE_BENCH_MAX_P50_US:-25000}"',
+    ),
+    (
+        VERIFY_LOCAL,
+        "RUSTLE_BENCH_HTTP_RESPONSE_DELAY_MS=25",
     ),
     (
         VERIFY_LOCAL,
