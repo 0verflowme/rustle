@@ -1,4 +1,5 @@
 mod agent_startup;
+mod quic_connect;
 mod quic_startup;
 mod runtime;
 mod ssh_agent_startup;
