@@ -365,6 +365,7 @@ UDP_DROPPED="$(smoke_stat_value "$FINAL_STATS" '.*udp=fwd:[0-9]+ ok:[0-9]+ fail:
 UDP_ACTIVE="$(smoke_stat_value "$FINAL_STATS" '.*udp=fwd:[0-9]+ ok:[0-9]+ fail:[0-9]+ drop:[0-9]+ active:([0-9]+).*')"
 BRIDGE_SEND_FAILED="$(smoke_stat_value "$FINAL_STATS" '.*bridge_send_fail:([0-9]+).*')"
 BACKLOG_OVERFLOWED="$(smoke_stat_value "$FINAL_STATS" '.*backlog_overflow:([0-9]+).*')"
+BRIDGE_EVENT_QUEUE_REMOTE_BYTES="$(smoke_stat_value "$FINAL_STATS" '.*bridge_event_queue=remote_bytes:([^ ]+) max:.*')"
 
 smoke_require_stat_at_least "TUN RX packets" "$TUN_RX_PACKETS" 1 "$FINAL_STATS"
 smoke_require_stat_at_least "TUN TX packets" "$TUN_TX_PACKETS" 1 "$FINAL_STATS"
@@ -375,6 +376,7 @@ smoke_require_stat_zero "UDP drops" "$UDP_DROPPED" "$FINAL_STATS"
 smoke_require_stat_zero "UDP active associations" "$UDP_ACTIVE" "$FINAL_STATS"
 smoke_require_stat_zero "bridge send failures" "$BRIDGE_SEND_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "remote backlog overflows" "$BACKLOG_OVERFLOWED" "$FINAL_STATS"
+smoke_require_stat_zero_bytes "bridge event queued remote bytes" "$BRIDGE_EVENT_QUEUE_REMOTE_BYTES" "$FINAL_STATS"
 
 ROUTE_AFTER="$(route_snapshot)"
 if [[ "$ROUTE_AFTER" != "$ROUTE_BEFORE" ]]; then

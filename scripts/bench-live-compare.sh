@@ -961,7 +961,7 @@ rustle_extra_stats() {
   local final_stats
   final_stats="$(grep 'stats: final' "$log" | tail -n 1 || true)"
   if [[ -z "$final_stats" ]]; then
-    printf '\t\t\t\t\t'
+    printf '\t\t\t\t\t\t'
     return
   fi
   local ssh_opened
@@ -970,19 +970,24 @@ rustle_extra_stats() {
   local agent_reconnect_ok
   local agent_reconnect_failed
   local backlog_overflow
+  local bridge_event_queue_remote_bytes
   ssh_opened="$(smoke_stat_value "$final_stats" '.*ssh=open:([0-9]+) fail:.*')"
   ssh_failed="$(smoke_stat_value "$final_stats" '.*ssh=open:[0-9]+ fail:([0-9]+) eof:.*')"
   agent_reconnect_attempts="$(smoke_stat_value "$final_stats" '.*agent_reconnect=attempt:([0-9]+) ok:.*')"
   agent_reconnect_ok="$(smoke_stat_value "$final_stats" '.*agent_reconnect=attempt:[0-9]+ ok:([0-9]+) fail:.*')"
   agent_reconnect_failed="$(smoke_stat_value "$final_stats" '.*agent_reconnect=attempt:[0-9]+ ok:[0-9]+ fail:([0-9]+).*')"
   backlog_overflow="$(smoke_stat_value "$final_stats" '.*backlog_overflow:([0-9]+).*')"
-  printf '%s\t%s\t%s\t%s\t%s\t%s' \
+  bridge_event_queue_remote_bytes="$(smoke_stat_value "$final_stats" '.*bridge_event_queue=remote_bytes:([^ ]+) max:.*')"
+  if [[ "$bridge_event_queue_remote_bytes" == "0B" ]]; then
+    bridge_event_queue_remote_bytes=0
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "$ssh_opened" "$ssh_failed" \
     "$agent_reconnect_attempts" "$agent_reconnect_ok" "$agent_reconnect_failed" \
-    "$backlog_overflow"
+    "$backlog_overflow" "$bridge_event_queue_remote_bytes"
 }
 
-printf 'tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\tp95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\tssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\tagent_reconnect_failed\tbacklog_overflow\n'
+printf 'tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\tp95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\tssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\tagent_reconnect_failed\tbacklog_overflow\tbridge_event_queue_remote_bytes\n'
 
 for tool in $TOOLS; do
   case "$tool" in
@@ -1056,7 +1061,7 @@ for tool in $TOOLS; do
       else
         stop_sshuttle
         CURRENT_STOPPER=""
-        extra=$'\t\t\t\t\t'
+        extra=$'\t\t\t\t\t\t'
       fi
       if [[ -n "$CURRENT_PASSWORD_FILE" ]]; then
         rm -f "$CURRENT_PASSWORD_FILE"

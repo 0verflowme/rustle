@@ -8,6 +8,14 @@ import sys
 import tempfile
 import argparse
 
+EXPECTED_COLUMNS = 21
+DIAGNOSTIC_FAILURE_COLUMNS = (
+    ("ssh_failed", 15),
+    ("agent_reconnect_failed", 18),
+    ("backlog_overflow", 19),
+    ("bridge_event_queue_remote_bytes", 20),
+)
+
 
 def verify(
     path: pathlib.Path,
@@ -21,7 +29,7 @@ def verify(
         if not line or line.startswith("tool\t"):
             continue
         parts = line.split("\t")
-        if len(parts) != 20:
+        if len(parts) != EXPECTED_COLUMNS:
             raise SystemExit(f"invalid live fixture benchmark row: {line!r}")
         tool = parts[0]
         requests = int(parts[2])
@@ -43,6 +51,15 @@ def verify(
                 f"{tool}: success={success} failed={failed} "
                 f"bytes={bytes_total} expected={expected}"
             )
+        if (tool == "rustle" or tool.startswith("rustle-")) and success > 0 and failed == 0:
+            for column_name, column in DIAGNOSTIC_FAILURE_COLUMNS:
+                try:
+                    value = int(parts[column])
+                except ValueError:
+                    failures.append(f"{tool}: {column_name} is not numeric")
+                    continue
+                if value != 0:
+                    failures.append(f"{tool}: {column_name}={value}")
 
     if rows == 0:
         raise SystemExit(f"live fixture body_bytes={body_bytes} produced no benchmark rows")
@@ -75,11 +92,11 @@ def self_test() -> None:
         "tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\t"
         "p95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\t"
         "ssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\t"
-        "agent_reconnect_failed\tbacklog_overflow\n"
+        "agent_reconnect_failed\tbacklog_overflow\tbridge_event_queue_remote_bytes\n"
     )
     good = header + (
         "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\n"
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
         handle.write(good)
@@ -88,7 +105,7 @@ def self_test() -> None:
 
     allowed_failed = header + (
         "sshuttle\t1\t1\t1\t0\t1\t1000\t1000.0\t1000.0\t512\t0.00\t"
-        "0.00\t1.0\t2.0\t\t\t\t\t\t\n"
+        "0.00\t1.0\t2.0\t\t\t\t\t\t\t\n"
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
         handle.write(allowed_failed)
@@ -99,16 +116,23 @@ def self_test() -> None:
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t3072\t29.30\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\n",
         1024,
         "produced invalid benchmark rows",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t1\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\n",
         1024,
         "produced invalid benchmark rows",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t1024\n",
+        1024,
+        "bridge_event_queue_remote_bytes=1024",
     )
 
 

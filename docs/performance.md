@@ -328,13 +328,14 @@ scripts/bench-live-compare.sh
 Output is tab-separated:
 
 ```text
-tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  bytes  throughput_mib_s  req_s  avg_cpu_pct  max_cpu_pct  ssh_opened  ssh_failed  agent_reconnect_attempts  agent_reconnect_ok  agent_reconnect_failed  backlog_overflow
+tool  run  requests  concurrency  success  failed  wall_ms  p50_ms  p95_ms  bytes  throughput_mib_s  req_s  avg_cpu_pct  max_cpu_pct  ssh_opened  ssh_failed  agent_reconnect_attempts  agent_reconnect_ok  agent_reconnect_failed  backlog_overflow  bridge_event_queue_remote_bytes
 ```
 
 Every run is verified before the script exits. Successful Rustle rows must have
-zero diagnostic failure counters for `ssh_failed`, `agent_reconnect_failed`, and
-`backlog_overflow`; nonzero values fail the live benchmark even when request
-success and optional performance thresholds pass.
+zero diagnostic failure counters for `ssh_failed`, `agent_reconnect_failed`,
+`backlog_overflow`, and `bridge_event_queue_remote_bytes`; nonzero values fail
+the live benchmark even when request success and optional performance thresholds
+pass.
 
 By default the live harness benchmarks Rustle with the primary `agent` transport
 first, then the `direct-tcpip` compatibility path, producing `rustle-agent` and

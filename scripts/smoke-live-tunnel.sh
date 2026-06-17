@@ -398,6 +398,7 @@ SSH_FAILED="$(smoke_stat_value "$FINAL_STATS" '.*ssh=open:[0-9]+ fail:([0-9]+) e
 AGENT_RECONNECT_FAILED="$(smoke_stat_value "$FINAL_STATS" '.*agent_reconnect=attempt:[0-9]+ ok:[0-9]+ fail:([0-9]+).*')"
 BRIDGE_SEND_FAILED="$(smoke_stat_value "$FINAL_STATS" '.*bridge_send_fail:([0-9]+).*')"
 BACKLOG_OVERFLOWED="$(smoke_stat_value "$FINAL_STATS" '.*backlog_overflow:([0-9]+).*')"
+BRIDGE_EVENT_QUEUE_REMOTE_BYTES="$(smoke_stat_value "$FINAL_STATS" '.*bridge_event_queue=remote_bytes:([^ ]+) max:.*')"
 
 smoke_require_stat_at_least "ssh opens" "$SSH_OPENED" "$REQUESTS" "$FINAL_STATS"
 smoke_require_stat_at_least "TUN RX packets" "$TUN_RX_PACKETS" 1 "$FINAL_STATS"
@@ -406,6 +407,7 @@ smoke_require_stat_zero "SSH open failures" "$SSH_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "agent reconnect failures" "$AGENT_RECONNECT_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "bridge send failures" "$BRIDGE_SEND_FAILED" "$FINAL_STATS"
 smoke_require_stat_zero "remote backlog overflows" "$BACKLOG_OVERFLOWED" "$FINAL_STATS"
+smoke_require_stat_zero_bytes "bridge event queued remote bytes" "$BRIDGE_EVENT_QUEUE_REMOTE_BYTES" "$FINAL_STATS"
 
 case "$BRIDGE_TRANSPORT" in
   direct-tcpip)

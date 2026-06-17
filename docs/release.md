@@ -539,7 +539,8 @@ Required before tagging a release:
   opens over one Rustle process. The smoke also verifies nonzero TUN packet
   movement, transport-specific open logs for requested direct or agent mode, and
   zero SSH open failures, agent reconnect failures, bridge send failures, and
-  remote backlog overflows in the final stats.
+  remote backlog overflows, and bridge-event queued remote bytes in the final
+  stats.
 - Route, DNS, and process cleanup checks show no Rustle-owned leftovers. On
   Unix, the tunnel and capture loops must treat Ctrl-C, SIGTERM, and SIGHUP as
   graceful shutdown signals so normal route, DNS, TUN, local DNS proxy, and

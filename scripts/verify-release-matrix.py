@@ -1243,6 +1243,8 @@ REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS = [
     "allowed_failed_tools",
     "max_expected = body_bytes * requests",
     "body_bytes * success",
+    "DIAGNOSTIC_FAILURE_COLUMNS",
+    "bridge_event_queue_remote_bytes",
     "invalid live fixture benchmark row",
     "produced no benchmark rows",
     "produced invalid benchmark rows",
@@ -1262,6 +1264,7 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
     "assert_rejects",
     "verify_live_benchmark_rows",
     "verify_live_fixture_rows",
+    "bridge_event_queue_remote_bytes",
     "no controlled fixture evidence",
     "missing required live evidence file",
 ]
@@ -1370,6 +1373,8 @@ REQUIRED_LIVE_BENCHMARK_ROW_SNIPPETS = [
     "ssh_failed=1",
     "agent_reconnect_failed=1",
     "backlog_overflow=1",
+    "bridge_event_queue_remote_bytes",
+    "bridge_event_queue_remote_bytes=4096",
     "matched no successful rows",
     "--self-test",
     "assert_rejects",
@@ -1380,6 +1385,8 @@ REQUIRED_LIVE_SMOKE_SNIPPETS = [
     "RUSTLE_LIVE_SSH_CONFIG",
     "RUSTLE_LIVE_AGENT_PATH",
     "cannot be combined with RUSTLE_LIVE_AGENT_PATH",
+    "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
+    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
     "--ssh-config",
     "--agent-path",
     "--password-file",
@@ -1398,6 +1405,8 @@ REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
     "RUSTLE_LIVE_UDP_AGENT_PATH",
     "RUSTLE_LIVE_AGENT_PATH",
     "cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH",
+    "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
+    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
     "agent|quic-agent|quic-native",
     "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS",
     "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES",
@@ -1431,6 +1440,7 @@ REQUIRED_SMOKE_LIB_SNIPPETS = [
     "smoke_process_fd_count",
     "smoke_process_tree_fd_count",
     "smoke_require_process_tree_fd_count_at_most",
+    "smoke_require_stat_zero_bytes",
     "route: added 0.0.0.0/1",
     "route: added 128.0.0.0/1",
 ]
@@ -1475,6 +1485,8 @@ REQUIRED_TUN_DNS_SMOKE_SNIPPETS = [
     "system resolver DNS smoke response ok",
     "resolvectl status",
     "networksetup -getdnsservers",
+    "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
+    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
 ]
 
 REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
@@ -1483,6 +1495,8 @@ REQUIRED_NETNS_UDP_SMOKE_SNIPPETS = [
     "--udp-idle-timeout-ms",
     "waiting for UDP association idle cleanup",
     'smoke_require_stat_zero "UDP active associations"',
+    "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
+    'smoke_require_stat_zero_bytes "bridge event queued remote bytes"',
 ]
 
 REQUIRED_SSH_CONFIG_ALIAS_SMOKE_SNIPPETS = [
