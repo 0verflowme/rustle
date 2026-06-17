@@ -171,23 +171,12 @@ impl TunnelSupervisor {
                 }
                 event = udp_response_rx.recv() => {
                     if let Some(event) = event {
-                        let tun_write = tun.write_udp_response(event.key, event.payload).await?;
-                        engine.record_udp_delivery(tun_write);
+                        udp::execute_response_event(engine, &tun, event).await?;
                     }
                 }
                 event = udp_close_rx.recv() => {
                     if let Some(event) = event {
-                        engine.close_udp_association(event.key);
-                        if let Some(error) = event.error {
-                            eprintln!(
-                                "udp: association {}:{} -> {}:{} closed with error: {error}",
-                                event.key.src_ip,
-                                event.key.src_port,
-                                event.key.dst_ip,
-                                event.key.dst_port,
-                            );
-                            engine.record_udp_close_error();
-                        }
+                        udp::execute_close_event(engine, event);
                     }
                 }
                 event = event_rx.recv(), if !engine.should_pause_bridge_events() => {
