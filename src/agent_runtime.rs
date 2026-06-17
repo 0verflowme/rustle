@@ -5,16 +5,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::agent_io::AgentFrameBurstWriter;
+use crate::agent_io::{AgentFrameBurstWriter, AgentFrameReader};
 use crate::agent_proto::{
-    try_decode_frame, AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4,
-    AGENT_CARRIER_READ_BUFFER_BYTES, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
+    AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
+    CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -188,16 +188,16 @@ async fn read_agent_frames<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut input = BytesMut::with_capacity(AGENT_MAX_FRAME_PAYLOAD);
-    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
+    let mut frame_reader = AgentFrameReader::new();
     let mut streams = HashMap::<u64, AgentStreamHandle>::new();
     let (done_tx, mut done_rx) = mpsc::channel(AGENT_STREAM_COMPLETIONS);
     let mut peer_max_frame_payload = AGENT_MAX_FRAME_PAYLOAD;
 
     loop {
         drain_completed_streams(&mut done_rx, &mut streams);
-        while let Some(frame) =
-            try_decode_frame(&mut input).context("failed to decode agent frame")?
+        while let Some(frame) = frame_reader
+            .try_next_frame()
+            .context("failed to decode agent frame")?
         {
             drain_completed_streams(&mut done_rx, &mut streams);
             handle_agent_frame(
@@ -213,12 +213,10 @@ where
         drain_completed_streams(&mut done_rx, &mut streams);
 
         tokio::select! {
-            read = reader.read(&mut read_buf) => {
-                let read = read.context("failed to read agent input")?;
-                if read == 0 {
+            read = frame_reader.read_more(&mut reader, "failed to read agent input") => {
+                if read? == 0 {
                     break;
                 }
-                input.extend_from_slice(&read_buf[..read]);
             }
             maybe_stream_id = done_rx.recv(), if !streams.is_empty() => {
                 if let Some(stream_id) = maybe_stream_id {
@@ -936,6 +934,7 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
 
+    use bytes::BytesMut;
     use tokio::io::AsyncWrite;
     use tokio::io::{duplex, split};
     use tokio::net::{TcpListener, TcpStream, UdpSocket};

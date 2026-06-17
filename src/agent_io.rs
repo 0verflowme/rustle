@@ -1,16 +1,78 @@
 use std::collections::VecDeque;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use bytes::BytesMut;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::agent_proto::{
-    encode_frame_into, encoded_frame_len, encoded_frames_len, AgentFrame, AgentFrameKind,
+    encode_frame_into, encoded_frame_len, encoded_frames_len, try_decode_frame, AgentFrame,
+    AgentFrameKind, AGENT_CARRIER_READ_BUFFER_BYTES, AGENT_MAX_FRAME_PAYLOAD,
 };
 
 pub(crate) const AGENT_FRAME_WRITE_BURST: usize = 64;
 pub(crate) const AGENT_FRAME_WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) struct AgentFrameReader {
+    input: BytesMut,
+    read_buf: Vec<u8>,
+}
+
+impl AgentFrameReader {
+    pub(crate) fn new() -> Self {
+        Self::from_input(BytesMut::with_capacity(AGENT_MAX_FRAME_PAYLOAD))
+    }
+
+    pub(crate) fn from_input(input: BytesMut) -> Self {
+        Self {
+            input,
+            read_buf: vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_input(self) -> BytesMut {
+        self.input
+    }
+
+    pub(crate) fn try_next_frame(&mut self) -> Result<Option<AgentFrame>> {
+        try_decode_frame(&mut self.input)
+    }
+
+    pub(crate) async fn read_more<R>(
+        &mut self,
+        reader: &mut R,
+        context: &'static str,
+    ) -> Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let read = reader.read(&mut self.read_buf).await.context(context)?;
+        if read != 0 {
+            self.input.extend_from_slice(&self.read_buf[..read]);
+        }
+        Ok(read)
+    }
+
+    pub(crate) async fn read_frame<R>(
+        &mut self,
+        reader: &mut R,
+        read_context: &'static str,
+        closed_context: &'static str,
+    ) -> Result<AgentFrame>
+    where
+        R: AsyncRead + Unpin,
+    {
+        loop {
+            if let Some(frame) = self.try_next_frame()? {
+                return Ok(frame);
+            }
+            if self.read_more(reader, read_context).await? == 0 {
+                bail!("{closed_context}");
+            }
+        }
+    }
+}
 
 pub(crate) struct AgentFrameBurstWriter {
     frames: Vec<AgentFrame>,

@@ -4,15 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use bytes::{Bytes, BytesMut};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use crate::agent_io::{write_agent_frame_unflushed, AgentFrameBurstWriter};
+use crate::agent_io::{write_agent_frame_unflushed, AgentFrameBurstWriter, AgentFrameReader};
 use crate::agent_proto::{
-    try_decode_frame, AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4,
-    AGENT_CARRIER_READ_BUFFER_BYTES, AGENT_MAX_FRAME_PAYLOAD, AGENT_PROTOCOL_VERSION,
-    CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
+    AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
+    AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -110,8 +109,14 @@ impl AgentTransport {
         )
         .await?;
 
-        let mut inbound = BytesMut::new();
-        let hello = read_agent_frame(&mut reader, &mut inbound).await?;
+        let mut frame_reader = AgentFrameReader::new();
+        let hello = frame_reader
+            .read_frame(
+                &mut reader,
+                "failed to read agent frame",
+                "agent stream closed before next frame",
+            )
+            .await?;
         if hello.kind != AgentFrameKind::Hello {
             bail!("agent expected hello response, got {:?}", hello.kind);
         }
@@ -142,7 +147,7 @@ impl AgentTransport {
         ));
         tokio::spawn(read_agent_frames(
             reader,
-            inbound,
+            frame_reader,
             Arc::clone(&streams),
             Arc::clone(&failure),
             heartbeat_enabled.then(|| Arc::clone(&heartbeat)),
@@ -693,16 +698,22 @@ where
 
 async fn read_agent_frames<R>(
     mut reader: R,
-    mut inbound: BytesMut,
+    mut frame_reader: AgentFrameReader,
     streams: StreamMap,
     failure: FailureState,
     heartbeat: Option<HeartbeatState>,
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
     loop {
-        match read_agent_frame_with_buffer(&mut reader, &mut inbound, &mut read_buf).await {
+        match frame_reader
+            .read_frame(
+                &mut reader,
+                "failed to read agent frame",
+                "agent stream closed before next frame",
+            )
+            .await
+        {
             Ok(frame) => dispatch_agent_frame(&streams, heartbeat.as_ref(), frame).await,
             Err(err) => {
                 mark_agent_failed(&failure, &streams, err.to_string()).await;
@@ -712,36 +723,21 @@ async fn read_agent_frames<R>(
     }
 }
 
-async fn read_agent_frame<R>(reader: &mut R, inbound: &mut BytesMut) -> Result<AgentFrame>
+#[cfg(test)]
+async fn read_agent_frame<R>(reader: &mut R, inbound: &mut bytes::BytesMut) -> Result<AgentFrame>
 where
     R: AsyncRead + Unpin,
 {
-    let mut read_buf = vec![0_u8; AGENT_CARRIER_READ_BUFFER_BYTES];
-    read_agent_frame_with_buffer(reader, inbound, &mut read_buf).await
-}
-
-async fn read_agent_frame_with_buffer<R>(
-    reader: &mut R,
-    inbound: &mut BytesMut,
-    read_buf: &mut [u8],
-) -> Result<AgentFrame>
-where
-    R: AsyncRead + Unpin,
-{
-    loop {
-        if let Some(frame) = try_decode_frame(inbound)? {
-            return Ok(frame);
-        }
-
-        let read = reader
-            .read(read_buf)
-            .await
-            .context("failed to read agent frame")?;
-        if read == 0 {
-            bail!("agent stream closed before next frame");
-        }
-        inbound.extend_from_slice(&read_buf[..read]);
-    }
+    let mut frame_reader = AgentFrameReader::from_input(std::mem::take(inbound));
+    let frame = frame_reader
+        .read_frame(
+            reader,
+            "failed to read agent frame",
+            "agent stream closed before next frame",
+        )
+        .await?;
+    *inbound = frame_reader.into_input();
+    Ok(frame)
 }
 
 async fn run_agent_heartbeat(
@@ -912,13 +908,14 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
     use std::time::Duration;
 
-    use tokio::io::{duplex, split, AsyncWrite};
+    use bytes::BytesMut;
+    use tokio::io::{duplex, split, AsyncReadExt, AsyncWrite};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::time::timeout;
 
     use super::*;
     use crate::agent_io::{AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES};
-    use crate::agent_proto::AGENT_FRAME_HEADER_LEN;
+    use crate::agent_proto::{try_decode_frame, AGENT_FRAME_HEADER_LEN};
     use crate::agent_runtime::{run, AgentRuntimeConfig};
     use crate::agent_window::{
         AGENT_STREAM_INITIAL_WINDOW_BYTES as AGENT_STREAM_WINDOW_BYTES,
