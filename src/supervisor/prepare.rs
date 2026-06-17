@@ -1,19 +1,13 @@
-use std::time::Duration;
+use anyhow::Result;
 
-use anyhow::{bail, Context, Result};
+mod config;
+mod prepared;
 
-use super::TunnelSupervisor;
-use crate::control_plane::{connect_tunnel_runtime, validate_agent_session_request_count};
-use crate::packet_engine::PACKET_BUF_SIZE;
-use crate::remote_helper::bridge_agent_command_plan;
-use crate::routing::{expand_target_routes, ssh_control_ip_to_protect};
-use crate::ssh_control::validate_ssh_session_count;
-use crate::transport_model::{parse_destination, BridgeTransportKind, TunnelRuntimeOptions};
-use crate::tunnel_lifecycle::{
-    open_tun, open_tunnel_host, shutdown_signal, virtual_dns_ip, ShutdownSignal, TunConfig,
-    TunnelCleanup, TunnelHostConfig,
-};
-use crate::{platform, tcp_core, TunnelArgs};
+pub(crate) use config::validate_tunnel_args;
+
+use self::prepared::PreparedTunnel;
+use crate::tunnel_lifecycle::{shutdown_signal, ShutdownSignal};
+use crate::TunnelArgs;
 
 pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;
@@ -30,85 +24,6 @@ pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     tunnel.run().await
 }
 
-struct PreparedTunnel {
-    supervisor: TunnelSupervisor,
-    cleanup: TunnelCleanup,
-}
-
-impl PreparedTunnel {
-    async fn prepare(args: TunnelArgs, shutdown: ShutdownSignal) -> Result<Self> {
-        let helper_plan = bridge_agent_command_plan(
-            args.bridge_transport,
-            args.agent_command.as_deref(),
-            args.agent_path.as_deref(),
-        )?;
-        let target_routes = expand_target_routes(&args.targets)?;
-        let dns_remote = parse_destination(&args.dns_remote)
-            .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
-        let ssh_control_ip = args
-            .ssh
-            .ssh_server
-            .as_deref()
-            .map(|_| ssh_control_ip_to_protect(&args.ssh, &target_routes))
-            .transpose()?
-            .flatten();
-        let tun_config = TunConfig::new(args.tun_ip, args.tun_prefix, args.mtu, args.name);
-        let tun = open_tun(&tun_config)?;
-
-        let runtime = connect_tunnel_runtime(
-            &args.ssh,
-            args.bridge_transport,
-            helper_plan,
-            args.mtu,
-            Some(&dns_remote),
-            TunnelRuntimeOptions {
-                ssh_sessions: args.ssh_sessions,
-                agent_sessions: args.agent_sessions,
-                fast_start_auto_agent_lanes: true,
-            },
-        )
-        .await?;
-        let data_plane = runtime.data_plane();
-        let host = open_tunnel_host(TunnelHostConfig {
-            tun_config,
-            tun,
-            target_routes,
-            ssh_control_ip,
-            configure_dns: args.configure_dns,
-            dns_remote: dns_remote.clone(),
-            data_plane: data_plane.clone(),
-        })
-        .await?;
-
-        let flow_manager = tcp_core::FlowManager::new(
-            args.tun_ip,
-            args.tun_prefix,
-            &host.route_parts,
-            usize::from(args.mtu),
-        )
-        .context("failed to initialize userspace TCP flow manager")?;
-
-        Ok(Self {
-            supervisor: TunnelSupervisor::new(
-                host.tun.dev,
-                flow_manager,
-                data_plane,
-                dns_remote,
-                Duration::from_millis(args.udp_idle_timeout_ms),
-                shutdown,
-            ),
-            cleanup: host.cleanup,
-        })
-    }
-
-    async fn run(mut self) -> Result<()> {
-        let result = self.supervisor.run().await;
-        let Self { cleanup, .. } = self;
-        drop(cleanup);
-        result
-    }
-}
-
 pub(super) async fn await_startup_or_shutdown<T, Fut>(
     shutdown: &mut ShutdownSignal,
     startup: Fut,
@@ -123,46 +38,4 @@ where
             Ok(None)
         }
     }
-}
-
-pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
-    let _ = expand_target_routes(&args.targets)?;
-    let Some(remote) = args.ssh.ssh_server.as_deref() else {
-        bail!("missing SSH remote; use -r user@host");
-    };
-    let _ = parse_destination(&args.dns_remote)
-        .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
-    if matches!(
-        args.bridge_transport,
-        BridgeTransportKind::Auto
-            | BridgeTransportKind::DirectTcpip
-            | BridgeTransportKind::QuicNative
-    ) {
-        validate_ssh_session_count(args.ssh_sessions)?;
-    }
-    if matches!(
-        args.bridge_transport,
-        BridgeTransportKind::Auto | BridgeTransportKind::Agent | BridgeTransportKind::QuicAgent
-    ) {
-        validate_agent_session_request_count(args.agent_sessions)?;
-    }
-    if args.udp_idle_timeout_ms == 0 {
-        bail!("udp-idle-timeout-ms must be at least 1");
-    }
-    platform::preflight_route_management().context("route preflight failed")?;
-    if args.tun_prefix > 32 {
-        bail!("tun-prefix must be <= 32");
-    }
-    if args.mtu < 576 {
-        bail!("mtu must be at least the IPv4 minimum of 576 bytes");
-    }
-    if args.mtu as usize > PACKET_BUF_SIZE {
-        bail!("mtu must not exceed packet buffer size {PACKET_BUF_SIZE}");
-    }
-    if args.configure_dns {
-        virtual_dns_ip(args.tun_ip, args.tun_prefix)?;
-        platform::preflight_system_dns().context("DNS preflight failed")?;
-    }
-    let _ = remote;
-    Ok(())
 }
