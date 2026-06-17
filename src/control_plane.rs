@@ -1,26 +1,21 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Result};
-use russh::client::Handle;
+use anyhow::{bail, Result};
 
-use crate::agent_bridge::{
-    AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
-    AgentBridgeTransport, ReconnectingAgentBridge,
-};
+use crate::agent_bridge::{AgentBridgeConnector, AgentBridgeTransport, ReconnectingAgentBridge};
 use crate::data_plane::{
     DataPlane, DirectTcpipDataPlane, FramedAgentDataPlane, QuicNativeDataPlane,
 };
-use crate::remote_helper::{HelperCommandPlan, HelperKind};
-use crate::ssh_control::{
-    connect_prepared_ssh, connect_ssh_pool, prepare_ssh_connection, Client, PreparedSshConnection,
-};
+use crate::remote_helper::HelperCommandPlan;
+use crate::ssh_control::connect_ssh_pool;
 use crate::transport_model::{BridgeTransportKind, Destination, TunnelRuntimeOptions};
-use crate::{agent_proto, agent_transport, SshArgs};
+use crate::{agent_proto, SshArgs};
 
 mod agent_startup;
 mod helper_startup;
 mod quic_startup;
+mod ssh_agent_startup;
 
 pub(crate) use agent_startup::{
     connect_agent_bridge_transports_from_connector,
@@ -29,6 +24,7 @@ pub(crate) use agent_startup::{
 };
 use helper_startup::connect_prepared_helper_with_upload_fallback;
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
+pub(crate) use ssh_agent_startup::SshAgentBridgeConnector;
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -49,105 +45,6 @@ impl TunnelRuntime {
     pub(crate) fn data_plane(&self) -> Arc<dyn DataPlane> {
         Arc::clone(&self.data_plane)
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct SshAgentBridgeConnector {
-    prepared: Arc<PreparedSshConnection>,
-    helper_plan: HelperCommandPlan,
-    mtu: u16,
-}
-
-impl SshAgentBridgeConnector {
-    pub(crate) fn new(ssh: SshArgs, helper_plan: HelperCommandPlan, mtu: u16) -> Result<Self> {
-        Ok(Self {
-            prepared: Arc::new(prepare_ssh_connection(&ssh)?),
-            helper_plan,
-            mtu,
-        })
-    }
-
-    async fn connect_primary_transport(&self) -> Result<AgentBridgeTransport> {
-        let mtu = self.mtu;
-        connect_prepared_helper_with_upload_fallback(
-            &self.prepared,
-            &self.helper_plan,
-            HelperKind::StdioAgent,
-            move |handle, command| async move {
-                connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
-            },
-            move |handle, command| async move {
-                connect_agent_bridge_transport_on_handle(handle, &command, mtu).await
-            },
-            "Rustle agent",
-            Some("agent: bootstrapped remote agent from local binary"),
-        )
-        .await
-    }
-}
-
-impl AgentBridgeConnector for SshAgentBridgeConnector {
-    fn primary_command(&self) -> &str {
-        &self.helper_plan.command
-    }
-
-    fn connect_initial(&self, desired_sessions: usize) -> AgentBridgeConnectManyFuture<'_> {
-        Box::pin(async move {
-            connect_agent_bridge_transports_from_connector(self, desired_sessions).await
-        })
-    }
-
-    fn connect_primary(&self) -> AgentBridgeConnectFuture<'_> {
-        Box::pin(async move { self.connect_primary_transport().await })
-    }
-
-    fn connect_command<'a>(&'a self, agent_command: &'a str) -> AgentBridgeConnectFuture<'a> {
-        Box::pin(async move {
-            connect_agent_bridge_transport_fresh_prepared_ssh_command(
-                &self.prepared,
-                agent_command,
-                self.mtu,
-            )
-            .await
-        })
-    }
-}
-
-async fn connect_agent_bridge_transport_fresh_prepared_ssh_command(
-    prepared: &PreparedSshConnection,
-    agent_command: &str,
-    mtu: u16,
-) -> Result<AgentBridgeTransport> {
-    // A Rustle agent lane is deliberately a fresh SSH connection with one exec
-    // channel, not another channel multiplexed over an existing SSH carrier.
-    let handle = connect_prepared_ssh(prepared).await?;
-    connect_agent_bridge_transport_on_handle(handle, agent_command, mtu).await
-}
-
-async fn connect_agent_bridge_transport_on_handle(
-    handle: Handle<Client>,
-    agent_command: &str,
-    mtu: u16,
-) -> Result<AgentBridgeTransport> {
-    let channel = handle
-        .channel_open_session()
-        .await
-        .context("failed to open SSH session channel for Rustle agent")?;
-    channel
-        .exec(true, agent_command.to_owned())
-        .await
-        .with_context(|| format!("failed to exec remote Rustle agent: {agent_command}"))?;
-
-    let stream = channel.into_stream();
-    let (reader, writer) = tokio::io::split(stream);
-    let transport = agent_transport::AgentTransport::connect(reader, writer, mtu)
-        .await
-        .context("failed to negotiate Rustle agent protocol over SSH")?;
-    if transport.peer_hello().max_frame_payload == 0 {
-        bail!("remote Rustle agent advertised a zero max frame payload");
-    }
-
-    Ok(AgentBridgeTransport::ssh(handle, transport, agent_command))
 }
 
 pub(crate) async fn connect_tunnel_runtime(
@@ -172,45 +69,28 @@ pub(crate) async fn connect_tunnel_runtime(
                 options.agent_sessions,
                 desired_agent_sessions,
             );
-            let agent = if fast_start_agent_lanes {
-                connect_auto_agent_bridge_transports_from_connector(
-                    connector.as_ref(),
-                    desired_agent_sessions,
-                )
-                .await?
-            } else {
-                connector.connect_initial(desired_agent_sessions).await?
-            };
-            ensure_agent_dns_remote_supported(&agent, dns_remote)?;
-            let agent = if fast_start_agent_lanes {
-                ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
-                    connector,
-                    agent,
-                    desired_agent_sessions,
-                    Some(AGENT_FAST_START_WARMUP_DELAY),
-                )
-            } else {
-                ReconnectingAgentBridge::new_with_desired_lanes(
-                    connector,
-                    agent,
-                    desired_agent_sessions,
-                )
-            };
-            Ok(TunnelRuntime::new(FramedAgentDataPlane::new(agent)))
+            let data_plane = connect_framed_agent_data_plane(
+                connector,
+                desired_agent_sessions,
+                fast_start_agent_lanes,
+                dns_remote,
+            )
+            .await?;
+            Ok(TunnelRuntime::new(data_plane))
         }
         BridgeTransportKind::QuicAgent => {
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(
                 SshQuicAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?,
             );
-            let agent = connector.connect_initial(desired_agent_sessions).await?;
-            ensure_agent_dns_remote_supported(&agent, dns_remote)?;
-            let agent = ReconnectingAgentBridge::new_with_desired_lanes(
+            let data_plane = connect_framed_agent_data_plane(
                 connector,
-                agent,
                 desired_agent_sessions,
-            );
-            Ok(TunnelRuntime::new(FramedAgentDataPlane::new(agent)))
+                false,
+                dns_remote,
+            )
+            .await?;
+            Ok(TunnelRuntime::new(data_plane))
         }
         BridgeTransportKind::QuicNative => {
             let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
@@ -225,51 +105,94 @@ pub(crate) async fn connect_tunnel_runtime(
                 options.agent_sessions,
                 desired_agent_sessions,
             );
-            let agent_result = if fast_start_agent_lanes {
-                connect_auto_agent_bridge_transports_from_connector(
-                    connector.as_ref(),
-                    desired_agent_sessions,
-                )
-                .await
-            } else {
-                connector.connect_initial(desired_agent_sessions).await
-            };
-            match agent_result {
-                Ok(agent) => {
-                    if let Err(err) = ensure_agent_dns_remote_supported(&agent, dns_remote) {
-                        eprintln!(
-                            "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
-                        );
-                        let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                        return Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)));
-                    }
-                    eprintln!("transport: auto selected agent");
-                    let agent = if fast_start_agent_lanes {
-                        ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
-                            connector,
-                            agent,
-                            desired_agent_sessions,
-                            Some(AGENT_FAST_START_WARMUP_DELAY),
-                        )
-                    } else {
-                        ReconnectingAgentBridge::new_with_desired_lanes(
-                            connector,
-                            agent,
-                            desired_agent_sessions,
-                        )
-                    };
-                    Ok(TunnelRuntime::new(FramedAgentDataPlane::new(agent)))
-                }
+            let transports = match connect_initial_agent_transports(
+                connector.as_ref(),
+                desired_agent_sessions,
+                fast_start_agent_lanes,
+            )
+            .await
+            {
+                Ok(transports) => transports,
                 Err(err) => {
                     eprintln!(
                         "transport: auto could not start agent ({err:#}); falling back to direct-tcpip"
                     );
                     let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                    Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)))
+                    return Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)));
                 }
+            };
+            if let Err(err) = ensure_agent_dns_remote_supported(&transports, dns_remote) {
+                eprintln!(
+                    "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
+                );
+                let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
+                return Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)));
             }
+            eprintln!("transport: auto selected agent");
+            Ok(TunnelRuntime::new(framed_agent_data_plane_from_transports(
+                connector,
+                transports,
+                desired_agent_sessions,
+                fast_start_agent_lanes,
+            )))
         }
     }
+}
+
+async fn connect_framed_agent_data_plane(
+    connector: Arc<dyn AgentBridgeConnector>,
+    desired_agent_sessions: usize,
+    fast_start_agent_lanes: bool,
+    dns_remote: Option<&Destination>,
+) -> Result<FramedAgentDataPlane> {
+    let transports = connect_initial_agent_transports(
+        connector.as_ref(),
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+    )
+    .await?;
+    ensure_agent_dns_remote_supported(&transports, dns_remote)?;
+    Ok(framed_agent_data_plane_from_transports(
+        connector,
+        transports,
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+    ))
+}
+
+async fn connect_initial_agent_transports(
+    connector: &dyn AgentBridgeConnector,
+    desired_agent_sessions: usize,
+    fast_start_agent_lanes: bool,
+) -> Result<Vec<AgentBridgeTransport>> {
+    if fast_start_agent_lanes {
+        connect_auto_agent_bridge_transports_from_connector(connector, desired_agent_sessions).await
+    } else {
+        connector.connect_initial(desired_agent_sessions).await
+    }
+}
+
+fn framed_agent_data_plane_from_transports(
+    connector: Arc<dyn AgentBridgeConnector>,
+    transports: Vec<AgentBridgeTransport>,
+    desired_agent_sessions: usize,
+    fast_start_agent_lanes: bool,
+) -> FramedAgentDataPlane {
+    let agent = if fast_start_agent_lanes {
+        ReconnectingAgentBridge::new_with_desired_lanes_and_missing_repair_delay(
+            connector,
+            transports,
+            desired_agent_sessions,
+            Some(AGENT_FAST_START_WARMUP_DELAY),
+        )
+    } else {
+        ReconnectingAgentBridge::new_with_desired_lanes(
+            connector,
+            transports,
+            desired_agent_sessions,
+        )
+    };
+    FramedAgentDataPlane::new(agent)
 }
 
 fn ensure_agent_dns_remote_supported(
@@ -279,10 +202,21 @@ fn ensure_agent_dns_remote_supported(
     let Some(remote) = remote else {
         return Ok(());
     };
+    let capabilities = transports
+        .iter()
+        .map(AgentBridgeTransport::peer_capabilities)
+        .collect::<Vec<_>>();
+    ensure_agent_dns_capabilities_supported(&capabilities, remote)
+}
+
+fn ensure_agent_dns_capabilities_supported(
+    capabilities: &[u64],
+    remote: &Destination,
+) -> Result<()> {
     if remote.host.parse::<Ipv4Addr>().is_ok() {
-        if transports
+        if capabilities
             .iter()
-            .all(|transport| transport.peer_capabilities() & agent_proto::CAP_UDP_ASSOCIATE != 0)
+            .all(|capabilities| capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0)
         {
             return Ok(());
         }
@@ -291,9 +225,9 @@ fn ensure_agent_dns_remote_supported(
             remote.host
         );
     }
-    if transports
+    if capabilities
         .iter()
-        .all(|transport| transport.peer_capabilities() & agent_proto::CAP_TCP_CONNECT_HOST != 0)
+        .all(|capabilities| capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0)
     {
         return Ok(());
     }
@@ -301,4 +235,68 @@ fn ensure_agent_dns_remote_supported(
         "agent DNS transport to hostname {} requires hostname TCP connect support",
         remote.host
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remote(host: &str) -> Destination {
+        Destination {
+            host: host.to_owned(),
+            port: 53,
+        }
+    }
+
+    #[test]
+    fn dns_remote_ipv4_requires_udp_capability_on_every_agent_lane() {
+        let remote = remote("1.1.1.1");
+
+        ensure_agent_dns_capabilities_supported(
+            &[
+                agent_proto::CAP_UDP_ASSOCIATE,
+                agent_proto::CAP_UDP_ASSOCIATE | agent_proto::CAP_TCP_CONNECT_HOST,
+            ],
+            &remote,
+        )
+        .expect("all lanes support UDP DNS");
+
+        let err = ensure_agent_dns_capabilities_supported(
+            &[
+                agent_proto::CAP_UDP_ASSOCIATE,
+                agent_proto::CAP_TCP_CONNECT_HOST,
+            ],
+            &remote,
+        )
+        .expect_err("one lane lacks UDP DNS support");
+        assert!(err.to_string().contains(
+            "agent DNS transport to IPv4 resolver 1.1.1.1 requires UDP associate support"
+        ));
+    }
+
+    #[test]
+    fn dns_remote_hostname_requires_host_tcp_capability_on_every_agent_lane() {
+        let remote = remote("dns.example.test");
+
+        ensure_agent_dns_capabilities_supported(
+            &[
+                agent_proto::CAP_TCP_CONNECT_HOST,
+                agent_proto::CAP_TCP_CONNECT_HOST | agent_proto::CAP_UDP_ASSOCIATE,
+            ],
+            &remote,
+        )
+        .expect("all lanes support hostname DNS");
+
+        let err = ensure_agent_dns_capabilities_supported(
+            &[
+                agent_proto::CAP_TCP_CONNECT_HOST,
+                agent_proto::CAP_UDP_ASSOCIATE,
+            ],
+            &remote,
+        )
+        .expect_err("one lane lacks hostname TCP DNS support");
+        assert!(err.to_string().contains(
+            "agent DNS transport to hostname dns.example.test requires hostname TCP connect support"
+        ));
+    }
 }
