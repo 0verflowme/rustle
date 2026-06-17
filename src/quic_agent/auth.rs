@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use ring::rand::SecureRandom;
@@ -20,6 +20,13 @@ impl std::fmt::Display for QuicAuthError {
 }
 
 impl std::error::Error for QuicAuthError {}
+
+pub(super) fn quic_auth_stage_context(label: &str, stage: &str, started: Instant) -> String {
+    format!(
+        "{label} stage={stage} elapsed_ms={}",
+        started.elapsed().as_millis()
+    )
+}
 
 pub(super) async fn open_quic_bi_stream_with_timeout(
     connection: &quinn::Connection,
@@ -113,23 +120,41 @@ pub(super) async fn authenticate_quic_bridge_connection_on_client(
     connection: &quinn::Connection,
     auth_token: &[u8],
 ) -> Result<()> {
+    let stage_started = Instant::now();
     let (mut send, mut recv) = open_quic_bi_stream_with_timeout(
         connection,
         QUIC_AUTH_TIMEOUT,
         "native QUIC bridge auth stream",
     )
     .await
-    .context("native QUIC bridge auth stage=open_stream")?;
+    .with_context(|| {
+        quic_auth_stage_context("native QUIC bridge auth", "open_stream", stage_started)
+    })?;
+    let stage_started = Instant::now();
     write_quic_auth_token(&mut send, auth_token)
         .await
-        .context("native QUIC bridge auth stage=write_token")?;
+        .with_context(|| {
+            quic_auth_stage_context("native QUIC bridge auth", "write_token", stage_started)
+        })?;
+    let stage_started = Instant::now();
     tokio::time::timeout(QUIC_AUTH_TIMEOUT, send.shutdown())
         .await
-        .context("native QUIC bridge auth stage=finish_send timed out")?
-        .context("native QUIC bridge auth stage=finish_send failed")?;
-    read_quic_auth_ok(&mut recv)
-        .await
-        .context("native QUIC bridge auth stage=read_ack")
+        .with_context(|| {
+            format!(
+                "{} timed_out",
+                quic_auth_stage_context("native QUIC bridge auth", "finish_send", stage_started)
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "{} failed",
+                quic_auth_stage_context("native QUIC bridge auth", "finish_send", stage_started)
+            )
+        })?;
+    let stage_started = Instant::now();
+    read_quic_auth_ok(&mut recv).await.with_context(|| {
+        quic_auth_stage_context("native QUIC bridge auth", "read_ack", stage_started)
+    })
 }
 
 pub(super) async fn authenticate_quic_bridge_connection_on_server(

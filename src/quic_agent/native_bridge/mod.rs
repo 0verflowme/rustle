@@ -647,6 +647,7 @@ mod tests {
             &bad_token_hash[..12]
         )));
         assert!(bad_detail.contains("native QUIC bridge auth stage="));
+        assert!(bad_detail.contains("elapsed_ms="));
 
         let client = connect_quic_bridge(quic_addr, &bootstrap)
             .await

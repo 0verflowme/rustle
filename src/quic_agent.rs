@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use quinn::{Connection, Endpoint};
@@ -9,9 +10,9 @@ mod config;
 mod native_bridge;
 
 use auth::{
-    generate_quic_auth_token, open_quic_bi_stream_with_timeout, read_quic_auth_ok,
-    verify_quic_auth_token, write_quic_auth_ok, write_quic_auth_token, QUIC_AUTH_FAILED_CODE,
-    QUIC_AUTH_TIMEOUT,
+    generate_quic_auth_token, open_quic_bi_stream_with_timeout, quic_auth_stage_context,
+    read_quic_auth_ok, verify_quic_auth_token, write_quic_auth_ok, write_quic_auth_token,
+    QUIC_AUTH_FAILED_CODE, QUIC_AUTH_TIMEOUT,
 };
 use bootstrap::sha256_hex;
 pub use bootstrap::QuicAgentBootstrap;
@@ -132,15 +133,23 @@ pub async fn connect_quic_agent_stream(
         .context("failed to start QUIC agent connection")?
         .await
         .context("failed to establish QUIC agent connection")?;
+    let stage_started = Instant::now();
     let (mut send, mut recv) =
         open_quic_bi_stream_with_timeout(&connection, QUIC_AUTH_TIMEOUT, "QUIC agent auth stream")
-            .await?;
+            .await
+            .with_context(|| {
+                quic_auth_stage_context("QUIC agent auth", "open_stream", stage_started)
+            })?;
+    let stage_started = Instant::now();
     write_quic_auth_token(&mut send, &bootstrap.auth_token)
         .await
-        .context("failed to authenticate QUIC agent stream")?;
+        .with_context(|| {
+            quic_auth_stage_context("QUIC agent auth", "write_token", stage_started)
+        })?;
+    let stage_started = Instant::now();
     read_quic_auth_ok(&mut recv)
         .await
-        .context("failed to confirm QUIC agent auth")?;
+        .with_context(|| quic_auth_stage_context("QUIC agent auth", "read_ack", stage_started))?;
     Ok((
         recv,
         send,
@@ -182,7 +191,13 @@ mod tests {
 
         let bad_bootstrap = tampered_bootstrap_token(&bootstrap);
         let bad = connect_quic_agent_stream(quic_addr, &bad_bootstrap).await;
-        assert!(bad.is_err(), "bad token unexpectedly authenticated");
+        let bad_err = match bad {
+            Ok(_) => panic!("bad token unexpectedly authenticated"),
+            Err(err) => err,
+        };
+        let bad_detail = format!("{bad_err:#}");
+        assert!(bad_detail.contains("QUIC agent auth stage=read_ack"));
+        assert!(bad_detail.contains("elapsed_ms="));
 
         let (_recv, _send, session) = connect_quic_agent_stream(quic_addr, &bootstrap)
             .await
