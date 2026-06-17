@@ -375,13 +375,13 @@ where
 }
 
 fn quic_data_plane_attempt_timeout(total_timeout: Duration, attempts: usize) -> Duration {
-    let attempts = attempts.max(1);
-    let divisor = u32::try_from(attempts).unwrap_or(u32::MAX);
-    let per_attempt = total_timeout / divisor;
-    if per_attempt < Duration::from_millis(1) {
+    // Do not split this budget across resolved addresses: QUIC connect plus
+    // token auth has its own stage timeouts, and too-small outer attempts hide
+    // useful stage context on dual-stack or multi-address hosts.
+    if attempts == 0 || total_timeout < Duration::from_millis(1) {
         Duration::from_millis(1)
     } else {
-        per_attempt
+        total_timeout
     }
 }
 
@@ -569,17 +569,21 @@ mod tests {
     }
 
     #[test]
-    fn quic_data_plane_attempt_timeout_splits_total_budget() {
+    fn quic_data_plane_attempt_timeout_keeps_full_budget_per_address() {
         assert_eq!(
             quic_data_plane_attempt_timeout(Duration::from_secs(8), 1),
             Duration::from_secs(8)
         );
         assert_eq!(
             quic_data_plane_attempt_timeout(Duration::from_secs(8), 2),
-            Duration::from_secs(4)
+            Duration::from_secs(8)
         );
         assert_eq!(
             quic_data_plane_attempt_timeout(Duration::from_millis(1), 4),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            quic_data_plane_attempt_timeout(Duration::from_secs(8), 0),
             Duration::from_millis(1)
         );
     }
