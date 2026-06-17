@@ -1,26 +1,32 @@
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap};
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::Result;
-use bytes::Bytes;
 use smoltcp::time::Instant as SmolInstant;
 use tokio::sync::mpsc;
 
 use crate::transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
     DataPlaneRuntimeSnapshot, UdpAssociation, UdpAssociationEvents, UdpFlowKey,
-    UDP_DATAGRAMS_PER_ASSOCIATION,
 };
 use crate::{dns, ssh_bridge, tcp_core};
 
+mod backlog;
+mod udp;
+
+pub(crate) use backlog::{RemoteBacklogPush, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW};
+#[cfg(test)]
+pub(crate) use backlog::{REMOTE_BACKLOG_BYTES_TOTAL, REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW};
+pub(crate) use udp::{
+    apply_udp_ingress_action, parse_udp_request_for_agent_tunnel, plan_udp_datagram_actions,
+    UdpAssociationStart, UdpAssociationTransportPlan, UdpIngressAction,
+    MAX_ACTIVE_UDP_ASSOCIATIONS,
+};
+#[cfg(test)]
+pub(crate) use udp::{apply_udp_ingress_actions, drop_unsupported_direct_udp, UdpDropReason};
+
 pub(crate) const PACKET_BUF_SIZE: usize = 2048;
-pub(crate) const REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW: usize = 8;
-pub(crate) const REMOTE_BACKLOG_BYTES_PER_FLOW: usize =
-    tcp_core::TCP_SEND_BUFFER_BYTES * REMOTE_BACKLOG_TCP_SEND_WINDOWS_PER_FLOW;
-pub(crate) const REMOTE_BACKLOG_BYTES_TOTAL: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_IN_FLIGHT_DNS_QUERIES: usize = 128;
-pub(crate) const MAX_ACTIVE_UDP_ASSOCIATIONS: usize = 512;
-const REMOTE_CLOSE_DEFER_FLUSHES: u8 = 2;
 
 pub(crate) fn smol_now(started_at: StdInstant) -> SmolInstant {
     let millis = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -56,17 +62,6 @@ pub(crate) fn tun_ipv4_packet(packet: &[u8]) -> Option<&[u8]> {
             None
         }
         _ => None,
-    }
-}
-
-pub(crate) fn parse_udp_request_for_agent_tunnel(packet: &[u8]) -> Option<dns::UdpPacket> {
-    match dns::parse_ipv4_udp_packet(packet) {
-        Ok(Some(request)) if request.dst_port != dns::DNS_PORT => Some(request),
-        Ok(_) => None,
-        Err(err) => {
-            eprintln!("udp: packet parse failed: {err}");
-            None
-        }
     }
 }
 
@@ -673,65 +668,6 @@ pub(crate) struct BridgeEventStats {
     pub(crate) stale_bridge_events: u64,
 }
 
-pub(crate) struct UdpAssociationTransportPlan<T> {
-    pub(crate) label: &'static str,
-    pub(crate) transport: T,
-}
-
-impl<T> UdpAssociationTransportPlan<T> {
-    pub(crate) fn new(label: &'static str, transport: T) -> Self {
-        Self { label, transport }
-    }
-}
-
-pub(crate) struct UdpAssociationStart<T> {
-    pub(crate) transport: T,
-    pub(crate) key: UdpFlowKey,
-    pub(crate) from_local: mpsc::Receiver<Bytes>,
-    pub(crate) events: UdpAssociationEvents,
-    pub(crate) idle_timeout: Duration,
-}
-
-pub(crate) enum UdpIngressAction<T> {
-    StartAssociation(UdpAssociationStart<T>),
-    SendDatagram {
-        key: UdpFlowKey,
-        to_remote: mpsc::Sender<Bytes>,
-        payload: Bytes,
-        transport_label: &'static str,
-    },
-    DropDatagram {
-        key: UdpFlowKey,
-        reason: UdpDropReason,
-    },
-}
-
-impl<T> UdpIngressAction<T> {
-    fn start_association(
-        transport: T,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    ) -> Self {
-        Self::StartAssociation(UdpAssociationStart {
-            transport,
-            key,
-            from_local,
-            events,
-            idle_timeout,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum UdpDropReason {
-    UnsupportedTransport,
-    AssociationLimitReached { max: usize },
-    AssociationQueueFull,
-    AssociationClosed,
-}
-
 pub(crate) fn format_duration(duration: Duration) -> String {
     let seconds = duration.as_secs();
     let millis = duration.subsec_millis();
@@ -752,175 +688,6 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes}B")
     }
-}
-
-pub(crate) fn plan_udp_datagram_actions<T>(
-    transport: Option<UdpAssociationTransportPlan<T>>,
-    request: dns::UdpPacket,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    events: UdpAssociationEvents,
-    idle_timeout: Duration,
-    actions: &mut Vec<UdpIngressAction<T>>,
-) {
-    let key = UdpFlowKey::from_packet(&request);
-    let Some(transport) = transport else {
-        actions.push(UdpIngressAction::DropDatagram {
-            key,
-            reason: UdpDropReason::UnsupportedTransport,
-        });
-        return;
-    };
-    let transport_label = transport.label;
-    let association = match associations.entry(key) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => {
-            if !association_limit.try_admit() {
-                actions.push(UdpIngressAction::DropDatagram {
-                    key,
-                    reason: UdpDropReason::AssociationLimitReached {
-                        max: association_limit.max(),
-                    },
-                });
-                return;
-            }
-
-            let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
-            actions.push(UdpIngressAction::start_association(
-                transport.transport,
-                key,
-                from_local,
-                events.clone(),
-                idle_timeout,
-            ));
-            entry.insert(UdpAssociation {
-                to_remote: to_remote.clone(),
-            })
-        }
-    };
-
-    actions.push(UdpIngressAction::SendDatagram {
-        key,
-        to_remote: association.to_remote.clone(),
-        payload: request.payload,
-        transport_label,
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn apply_udp_ingress_actions<T>(
-    actions: &mut Vec<UdpIngressAction<T>>,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    stats: &mut TunnelStats,
-    starts: &mut Vec<UdpAssociationStart<T>>,
-) {
-    for action in actions.drain(..) {
-        if let Some(start) =
-            apply_udp_ingress_action(action, associations, association_limit, stats)
-        {
-            starts.push(start);
-        }
-    }
-}
-
-pub(crate) fn apply_udp_ingress_action<T>(
-    action: UdpIngressAction<T>,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    stats: &mut TunnelStats,
-) -> Option<UdpAssociationStart<T>> {
-    match action {
-        UdpIngressAction::StartAssociation(start) => {
-            return Some(start);
-        }
-        UdpIngressAction::SendDatagram {
-            key,
-            to_remote,
-            payload,
-            transport_label,
-        } => match to_remote.try_send(payload) {
-            Ok(()) => {
-                stats.udp_forwarded = stats.udp_forwarded.saturating_add(1);
-                eprintln!(
-                    "udp: forwarding datagram {}:{} -> {}:{} over {}",
-                    key.src_ip, key.src_port, key.dst_ip, key.dst_port, transport_label,
-                );
-            }
-            Err(mpsc::error::TrySendError::Full(_)) => drop_udp_datagram(
-                key,
-                UdpDropReason::AssociationQueueFull,
-                associations,
-                association_limit,
-                stats,
-            ),
-            Err(mpsc::error::TrySendError::Closed(_)) => drop_udp_datagram(
-                key,
-                UdpDropReason::AssociationClosed,
-                associations,
-                association_limit,
-                stats,
-            ),
-        },
-        UdpIngressAction::DropDatagram { key, reason } => {
-            drop_udp_datagram(key, reason, associations, association_limit, stats);
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
-    let mut associations = HashMap::new();
-    let mut association_limit = DnsInflight::new(1);
-    let start = apply_udp_ingress_action::<()>(
-        UdpIngressAction::DropDatagram {
-            key: UdpFlowKey::from_packet(request),
-            reason: UdpDropReason::UnsupportedTransport,
-        },
-        &mut associations,
-        &mut association_limit,
-        stats,
-    );
-    debug_assert!(start.is_none());
-}
-
-fn drop_udp_datagram(
-    key: UdpFlowKey,
-    reason: UdpDropReason,
-    associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
-    association_limit: &mut DnsInflight,
-    stats: &mut TunnelStats,
-) {
-    if reason == UdpDropReason::AssociationClosed {
-        associations.remove(&key);
-        association_limit.complete();
-    }
-    match reason {
-        UdpDropReason::UnsupportedTransport => {
-            eprintln!(
-                "udp: dropping datagram {}:{} -> {}:{} because direct-tcpip transport does not support generic UDP",
-                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-            );
-        }
-        UdpDropReason::AssociationLimitReached { max } => {
-            eprintln!("udp: dropping datagram because {max} UDP associations are already active",);
-        }
-        UdpDropReason::AssociationQueueFull => {
-            eprintln!(
-                "udp: dropping datagram {}:{} -> {}:{} because the association queue is full",
-                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-            );
-        }
-        UdpDropReason::AssociationClosed => {
-            eprintln!(
-                "udp: dropping datagram {}:{} -> {}:{} because the association is closed",
-                key.src_ip, key.src_port, key.dst_ip, key.dst_port,
-            );
-        }
-    }
-    stats.udp_dropped = stats.udp_dropped.saturating_add(1);
-    stats.record_udp_response(false);
 }
 
 pub(crate) fn ensure_bridges<F>(
@@ -1244,213 +1011,6 @@ pub(crate) fn bridge_event_name(event: &ssh_bridge::BridgeEvent) -> &'static str
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct RemoteBacklogs {
-    max_bytes_per_flow: usize,
-    max_total_bytes: usize,
-    total_bytes: usize,
-    pub(crate) flows: HashMap<tcp_core::FlowId, RemoteBacklog>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct RemoteBacklog {
-    pub(crate) chunks: VecDeque<Bytes>,
-    pub(crate) front_offset: usize,
-    pub(crate) bytes: usize,
-    pub(crate) close_after_flush: bool,
-    pub(crate) close_defer_flushes: u8,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub(crate) enum RemoteBacklogPush {
-    Accepted,
-    FlowLimit,
-    TotalLimit,
-}
-
-impl RemoteBacklogs {
-    pub(crate) fn new(max_bytes_per_flow: usize) -> Self {
-        Self::with_limits(max_bytes_per_flow, REMOTE_BACKLOG_BYTES_TOTAL)
-    }
-
-    pub(crate) fn with_limits(max_bytes_per_flow: usize, max_total_bytes: usize) -> Self {
-        Self {
-            max_bytes_per_flow,
-            max_total_bytes,
-            total_bytes: 0,
-            flows: HashMap::new(),
-        }
-    }
-
-    pub(crate) fn max_bytes_per_flow(&self) -> usize {
-        self.max_bytes_per_flow
-    }
-
-    pub(crate) fn max_total_bytes(&self) -> usize {
-        self.max_total_bytes
-    }
-
-    pub(crate) fn active_flow_count(&self) -> usize {
-        self.flows.len()
-    }
-
-    pub(crate) fn total_bytes(&self) -> u64 {
-        self.total_bytes as u64
-    }
-
-    pub(crate) fn should_pause_bridge_events(&self) -> bool {
-        self.total_bytes >= self.bridge_event_pause_threshold()
-            || self
-                .flows
-                .values()
-                .any(|backlog| backlog.bytes >= self.bridge_event_per_flow_pause_threshold())
-    }
-
-    pub(crate) fn bridge_event_pause_threshold(&self) -> usize {
-        self.max_total_bytes
-            .saturating_sub(self.max_total_bytes / 4)
-    }
-
-    pub(crate) fn bridge_event_per_flow_pause_threshold(&self) -> usize {
-        self.max_bytes_per_flow
-            .saturating_sub(self.max_bytes_per_flow / 4)
-    }
-
-    pub(crate) fn push(
-        &mut self,
-        id: tcp_core::FlowId,
-        bytes: impl Into<Bytes>,
-    ) -> RemoteBacklogPush {
-        let bytes = bytes.into();
-        if bytes.is_empty() {
-            return RemoteBacklogPush::Accepted;
-        }
-        if self.total_bytes.saturating_add(bytes.len()) > self.max_total_bytes {
-            return RemoteBacklogPush::TotalLimit;
-        }
-        let backlog = self.flows.entry(id).or_default();
-        if backlog.bytes.saturating_add(bytes.len()) > self.max_bytes_per_flow {
-            return RemoteBacklogPush::FlowLimit;
-        }
-        backlog.bytes += bytes.len();
-        self.total_bytes += bytes.len();
-        backlog.chunks.push_back(bytes);
-        if backlog.close_after_flush {
-            backlog.close_defer_flushes = REMOTE_CLOSE_DEFER_FLUSHES;
-        }
-        RemoteBacklogPush::Accepted
-    }
-
-    pub(crate) fn close_after_flush(&mut self, id: tcp_core::FlowId) {
-        let backlog = self.flows.entry(id).or_default();
-        backlog.close_after_flush = true;
-        backlog.close_defer_flushes = REMOTE_CLOSE_DEFER_FLUSHES;
-    }
-
-    pub(crate) fn remove_id(&mut self, id: tcp_core::FlowId) {
-        if let Some(backlog) = self.flows.remove(&id) {
-            self.total_bytes = self.total_bytes.saturating_sub(backlog.bytes);
-        }
-    }
-
-    pub(crate) fn remove_flow(&mut self, flow: tcp_core::FlowKey) {
-        let mut removed_bytes = 0_usize;
-        self.flows.retain(|id, backlog| {
-            if id.key == flow {
-                removed_bytes = removed_bytes.saturating_add(backlog.bytes);
-                false
-            } else {
-                true
-            }
-        });
-        self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
-    }
-
-    pub(crate) fn flush_all_into(
-        &mut self,
-        flow_manager: &mut tcp_core::FlowManager,
-        now: SmolInstant,
-        flows: &mut Vec<tcp_core::FlowId>,
-        closed: &mut Vec<tcp_core::FlowKey>,
-    ) -> Result<()> {
-        flows.clear();
-        flows.reserve(self.flows.len());
-        flows.extend(self.flows.keys().copied());
-        closed.clear();
-        closed.reserve(flows.len());
-        for id in flows.drain(..) {
-            self.flush_flow_into(flow_manager, id, now, closed)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn flush_flow_into(
-        &mut self,
-        flow_manager: &mut tcp_core::FlowManager,
-        id: tcp_core::FlowId,
-        now: SmolInstant,
-        closed: &mut Vec<tcp_core::FlowKey>,
-    ) -> Result<()> {
-        let flow = id.key;
-        if !flow_manager.contains_flow_id(id) {
-            eprintln!(
-                "tcp: dropping stale remote backlog for {flow:?} generation={}",
-                id.generation
-            );
-            self.remove_id(id);
-            return Ok(());
-        }
-
-        let Some(backlog) = self.flows.get_mut(&id) else {
-            return Ok(());
-        };
-
-        let mut abort_flow = false;
-        while let Some(chunk) = backlog.chunks.front() {
-            let pending = &chunk[backlog.front_offset..];
-            let Some(sent) = flow_manager.try_send_flow_bytes_at(flow, pending, now)? else {
-                eprintln!(
-                    "tcp: remote backlog cannot flush because local flow closed for {flow:?}; resetting flow"
-                );
-                abort_flow = true;
-                break;
-            };
-
-            if sent == 0 {
-                return Ok(());
-            }
-
-            backlog.front_offset += sent;
-            backlog.bytes = backlog.bytes.saturating_sub(sent);
-            self.total_bytes = self.total_bytes.saturating_sub(sent);
-            if backlog.front_offset == chunk.len() {
-                backlog.chunks.pop_front();
-                backlog.front_offset = 0;
-            }
-        }
-
-        if abort_flow {
-            self.remove_id(id);
-            flow_manager.abort_flow(flow)?;
-            closed.push(flow);
-            return Ok(());
-        }
-
-        if backlog.close_after_flush {
-            if backlog.close_defer_flushes > 0 {
-                backlog.close_defer_flushes -= 1;
-                return Ok(());
-            }
-            self.flows.remove(&id);
-            flow_manager.close_flow(flow, tcp_core::FlowState::HalfClosedRemote)?;
-        } else if backlog.bytes == 0 {
-            self.flows.remove(&id);
-        }
-
-        Ok(())
-    }
-}
-
 pub(crate) fn expire_stale_flows(
     flow_manager: &mut tcp_core::FlowManager,
     bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
@@ -1489,6 +1049,7 @@ mod tests {
     use std::net::Ipv4Addr;
     use std::time::Duration;
 
+    use bytes::Bytes;
     use smoltcp::socket::tcp;
 
     use super::*;
