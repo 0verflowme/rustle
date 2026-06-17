@@ -319,6 +319,11 @@ Required before tagging a release:
   `transport_writer_clears_reused_buffers_between_bursts` pass, proving the
   remote runtime and local controller writers can reuse burst buffers across
   flushes without leaking stale frames.
+- `agent_writer_round_robins_non_priority_frames_inside_burst` and
+  `transport_writer_round_robins_non_priority_frames_inside_burst` pass,
+  proving non-priority data and EOF frames are interleaved across active streams
+  inside each writer burst while preserving per-stream ordering and control
+  frame priority.
 - `credit_window_grows_after_sustained_full_window_consumption`,
   `stream_recv_grows_receive_window_after_sustained_consumption`, and
   `runtime_receive_credit_grows_after_sustained_window_consumption` pass,

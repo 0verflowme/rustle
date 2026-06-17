@@ -762,6 +762,9 @@ Performance work must preserve these invariants:
   instead of relying on callers to respect frame-size limits
 - agent writer tasks must reuse per-task burst frame and encoded-byte buffers
   across flushes instead of allocating them once per burst
+- agent writer bursts round-robin non-priority frames across stream ids while
+  preserving per-stream order, so concurrent response streams share each encoded
+  burst instead of inheriting pure FIFO ordering from the hottest producer
 - agent peers that advertise heartbeat support must answer periodic zero-stream
   pings; missed pongs must trip sticky transport failure and reconnect handling
 - agent streams can be hashed across multiple SSH exec lanes; the public compact

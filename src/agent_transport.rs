@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -744,15 +744,39 @@ where
         for frame in frames.iter().filter(|frame| is_priority_control(frame)) {
             encode_frame_into(frame, &mut *encoded)?;
         }
-        for frame in frames.iter().filter(|frame| !is_priority_control(frame)) {
-            encode_frame_into(frame, &mut *encoded)?;
-        }
+        encode_non_priority_frames_fairly(frames, encoded)?;
     }
 
     writer
         .write_all(encoded)
         .await
         .context("failed to write agent frame")
+}
+
+fn encode_non_priority_frames_fairly(frames: &[AgentFrame], encoded: &mut BytesMut) -> Result<()> {
+    let mut queues: Vec<(u64, VecDeque<&AgentFrame>)> = Vec::new();
+    let mut queued = 0_usize;
+    for frame in frames.iter().filter(|frame| !is_priority_control(frame)) {
+        queued = queued.saturating_add(1);
+        if let Some((_, queue)) = queues
+            .iter_mut()
+            .find(|(stream_id, _)| *stream_id == frame.stream_id)
+        {
+            queue.push_back(frame);
+        } else {
+            queues.push((frame.stream_id, VecDeque::from([frame])));
+        }
+    }
+
+    while queued > 0 {
+        for (_, queue) in &mut queues {
+            if let Some(frame) = queue.pop_front() {
+                encode_frame_into(frame, &mut *encoded)?;
+                queued -= 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_priority_control(frame: &AgentFrame) -> bool {
@@ -1230,6 +1254,52 @@ mod tests {
                 (AgentFrameKind::Pong, 0),
                 (AgentFrameKind::Data, 1),
                 (AgentFrameKind::Data, 3),
+            ]
+        );
+        assert!(failure.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn transport_writer_round_robins_non_priority_frames_inside_burst() {
+        let writer = CountingWriter::default();
+        let bytes = Arc::clone(&writer.bytes);
+        let (outbound, outbound_rx) = mpsc::channel(8);
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let failure = Arc::new(Mutex::new(None));
+
+        for frame in [
+            AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one-a"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one-b"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Data, 3, Bytes::from_static(b"three-a"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Data, 3, Bytes::from_static(b"three-b"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Data, 5, Bytes::from_static(b"five-a"))
+                .expect("data frame"),
+            AgentFrame::new(AgentFrameKind::Eof, 1, Bytes::new()).expect("eof frame"),
+        ] {
+            outbound.send(frame).await.expect("queue frame");
+        }
+        drop(outbound);
+
+        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+
+        let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
+        let mut decoded = Vec::new();
+        while let Some(frame) = try_decode_frame(&mut encoded).expect("decode written frame") {
+            decoded.push((frame.kind, frame.stream_id, frame.payload));
+        }
+        assert_eq!(
+            decoded,
+            vec![
+                (AgentFrameKind::Data, 1, Bytes::from_static(b"one-a")),
+                (AgentFrameKind::Data, 3, Bytes::from_static(b"three-a")),
+                (AgentFrameKind::Data, 5, Bytes::from_static(b"five-a")),
+                (AgentFrameKind::Data, 1, Bytes::from_static(b"one-b")),
+                (AgentFrameKind::Data, 3, Bytes::from_static(b"three-b")),
+                (AgentFrameKind::Eof, 1, Bytes::new()),
             ]
         );
         assert!(failure.lock().await.is_none());
