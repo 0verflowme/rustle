@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use russh::{
@@ -336,7 +336,9 @@ where
 
     let attempt_timeout = quic_data_plane_attempt_timeout(timeout, remote_addrs.len());
     let mut failures = Vec::new();
-    for remote_addr in remote_addrs.iter().copied() {
+    let attempt_count = remote_addrs.len();
+    for (index, remote_addr) in remote_addrs.iter().copied().enumerate() {
+        let attempt_started = Instant::now();
         match connect_quic_data_plane_with_timeout(
             label,
             remote_addr,
@@ -345,8 +347,21 @@ where
         )
         .await
         {
-            Ok(connected) => return Ok(connected),
-            Err(err) => failures.push(format!("{remote_addr}: {err:#}")),
+            Ok(connected) => {
+                eprintln!(
+                    "{label}: UDP data plane connected to {remote_addr} on attempt {}/{} after {}ms",
+                    index + 1,
+                    attempt_count,
+                    attempt_started.elapsed().as_millis()
+                );
+                return Ok(connected);
+            }
+            Err(err) => failures.push(format!(
+                "attempt {}/{} {remote_addr} after {}ms: {err:#}",
+                index + 1,
+                attempt_count,
+                attempt_started.elapsed().as_millis()
+            )),
         }
     }
 
@@ -564,6 +579,8 @@ mod tests {
         assert!(detail
             .contains("quic-agent: failed to establish UDP data plane to any resolved address"));
         assert!(detail.contains("tried=[203.0.113.1:4433,203.0.113.2:4434]"));
+        assert!(detail.contains("attempt 1/2 203.0.113.1:4433 after "));
+        assert!(detail.contains("attempt 2/2 203.0.113.2:4434 after "));
         assert!(detail.contains("failed 203.0.113.1:4433"));
         assert!(detail.contains("failed 203.0.113.2:4434"));
     }
