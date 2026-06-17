@@ -3,10 +3,13 @@ use std::future::Future;
 use anyhow::{bail, Context, Result};
 use russh::client::Handle;
 
-use crate::remote_helper::{bootstrap_helper, BootstrappedHelper, HelperCommandPlan, HelperKind};
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 
-pub(super) async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
+use super::bootstrap::{bootstrap_helper, BootstrappedHelper};
+use super::command::HelperCommandPlan;
+use super::kind::HelperKind;
+
+async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
     helper_plan: &HelperCommandPlan,
     primary: PrimaryFut,
     upload: UploadFn,
@@ -52,7 +55,7 @@ where
     }
 }
 
-pub(super) async fn connect_prepared_helper_with_upload_fallback<
+pub(crate) async fn connect_prepared_helper_with_upload_fallback<
     T,
     PrimaryFn,
     PrimaryFut,
@@ -91,7 +94,7 @@ where
     .await
 }
 
-pub(super) async fn connect_uploaded_helper<T, ConnectFn, ConnectFut>(
+async fn connect_uploaded_helper<T, ConnectFn, ConnectFut>(
     prepared: &PreparedSshConnection,
     helper_plan: &HelperCommandPlan,
     expected: HelperKind,
@@ -273,6 +276,33 @@ mod tests {
 
         assert!(detail
             .contains("helper startup plan kind mismatch: expected StdioAgent, got QuicAgent"));
+        Ok(())
+    }
+
+    #[test]
+    fn helper_plan_kind_must_match_expected_helper_for_each_kind() -> Result<()> {
+        let kinds = [
+            HelperKind::StdioAgent,
+            HelperKind::QuicAgent,
+            HelperKind::QuicBridgeNative,
+        ];
+
+        for plan_kind in kinds {
+            let plan = HelperCommandPlan::from_command_options(plan_kind, None, None)?;
+            for expected in kinds {
+                let result = ensure_helper_plan_kind(&plan, expected);
+                if plan_kind == expected {
+                    result.expect("matching helper kind should be accepted");
+                } else {
+                    let err = result.expect_err("mismatched helper kind should be rejected");
+                    let detail = format!("{err:#}");
+                    assert!(detail.contains(&format!(
+                        "helper startup plan kind mismatch: expected {:?}, got {:?}",
+                        expected, plan_kind
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 

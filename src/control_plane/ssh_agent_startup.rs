@@ -9,15 +9,15 @@ use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
     AgentBridgeTransport,
 };
-use crate::remote_helper::{HelperCommandPlan, HelperKind};
+use crate::remote_helper::{
+    connect_prepared_helper_with_upload_fallback, HelperCommandPlan, HelperKind,
+};
 use crate::ssh_control::{
     connect_prepared_ssh, prepare_ssh_connection, Client, PreparedSshConnection,
 };
 use crate::{agent_transport, SshArgs};
 
-use super::{
-    connect_agent_bridge_transports_from_connector, connect_prepared_helper_with_upload_fallback,
-};
+use super::connect_agent_bridge_transports_from_connector;
 
 const AGENT_TRANSPORT_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 

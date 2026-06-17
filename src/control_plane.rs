@@ -13,7 +13,6 @@ use crate::transport_model::{BridgeTransportKind, Destination, TunnelRuntimeOpti
 use crate::{agent_proto, SshArgs};
 
 mod agent_startup;
-mod helper_startup;
 mod quic_startup;
 mod ssh_agent_startup;
 
@@ -22,7 +21,6 @@ pub(crate) use agent_startup::{
     connect_auto_agent_bridge_transports_from_connector, resolve_agent_session_count,
     should_fast_start_agent_lanes, validate_agent_session_request_count,
 };
-use helper_startup::connect_prepared_helper_with_upload_fallback;
 use quic_startup::{connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector};
 pub(crate) use ssh_agent_startup::SshAgentBridgeConnector;
 

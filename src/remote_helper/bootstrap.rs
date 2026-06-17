@@ -47,20 +47,20 @@ pub(crate) const QUIC_NATIVE_BOOTSTRAP_ROLE: QuicHelperBootstrapRole = QuicHelpe
     decode: quic_agent::QuicAgentBootstrap::decode_bridge_line,
 };
 
-pub(crate) struct BootstrappedHelper {
+pub(super) struct BootstrappedHelper {
     handle: Handle<Client>,
     helper: UploadedHelperCommand,
 }
 
 impl BootstrappedHelper {
-    pub(crate) fn into_connect_parts(self) -> (Handle<Client>, String, String) {
+    pub(super) fn into_connect_parts(self) -> (Handle<Client>, String, String) {
         let command = self.helper.command;
         let remote_path = self.helper.remote_path;
         (self.handle, command, remote_path)
     }
 }
 
-pub(crate) async fn bootstrap_helper(
+pub(super) async fn bootstrap_helper(
     prepared: &PreparedSshConnection,
     plan: &HelperCommandPlan,
 ) -> Result<BootstrappedHelper> {

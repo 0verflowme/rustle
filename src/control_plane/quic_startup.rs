@@ -17,17 +17,15 @@ use crate::agent_bridge::{
 };
 use crate::agent_transport::AgentTransport;
 use crate::remote_helper::{
-    read_quic_helper_bootstrap, HelperCommandPlan, HelperKind, QuicHelperBootstrapRole,
-    QUIC_AGENT_BOOTSTRAP_ROLE, QUIC_NATIVE_BOOTSTRAP_ROLE,
+    connect_prepared_helper_with_upload_fallback, read_quic_helper_bootstrap, HelperCommandPlan,
+    HelperKind, QuicHelperBootstrapRole, QUIC_AGENT_BOOTSTRAP_ROLE, QUIC_NATIVE_BOOTSTRAP_ROLE,
 };
 use crate::ssh_control::{
     connect_prepared_ssh, prepare_ssh_connection, Client, PreparedSshConnection,
 };
 use crate::{quic_agent, SshArgs};
 
-use super::{
-    connect_agent_bridge_transports_from_connector, connect_prepared_helper_with_upload_fallback,
-};
+use super::connect_agent_bridge_transports_from_connector;
 
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIC_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
