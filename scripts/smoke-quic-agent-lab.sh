@@ -61,6 +61,12 @@ if ! grep -q 'quic-agent: connecting UDP data plane role=quic-agent .*bootstrap_
   smoke_die "QUIC agent smoke did not prove UDP data-plane bootstrap"
 fi
 
+if ! grep -q 'quic-agent-protocol: transport=quic-agent .*stage=agent_hello result=ok' "$ERR"; then
+  sed 's/^/rustle stderr: /' "$ERR" >&2 || true
+  sed 's/^/rustle stdout: /' "$OUT" >&2 || true
+  smoke_die "QUIC agent smoke did not prove framed-agent protocol negotiation"
+fi
+
 if ! grep -q 'agent: established 1/1 exec transport(s)' "$ERR"; then
   sed 's/^/rustle stderr: /' "$ERR" >&2 || true
   sed 's/^/rustle stdout: /' "$OUT" >&2 || true

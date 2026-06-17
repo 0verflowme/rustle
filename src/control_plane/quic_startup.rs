@@ -9,7 +9,7 @@ use russh::{
     client::{Handle, Msg},
     ChannelStream,
 };
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 
 use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
@@ -28,6 +28,7 @@ use super::{
 
 const QUIC_AGENT_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(15);
 const QUIC_DATA_PLANE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const QUIC_AGENT_PROTOCOL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 struct QuicHelperBootstrapRole {
@@ -186,9 +187,8 @@ async fn connect_quic_agent_bridge_transport_on_handle(
         |remote_addr| quic_agent::connect_quic_agent_stream(remote_addr, &started.bootstrap),
     )
     .await?;
-    let transport = AgentTransport::connect(recv, send, mtu)
-        .await
-        .context("failed to negotiate Rustle agent protocol over QUIC")?;
+    let remote_addrs = format_socket_addrs(&started.remote_addrs);
+    let transport = negotiate_quic_agent_transport(recv, send, mtu, &remote_addrs).await?;
 
     Ok(AgentBridgeTransport::quic(
         handle,
@@ -197,6 +197,82 @@ async fn connect_quic_agent_bridge_transport_on_handle(
         transport,
         agent_command,
     ))
+}
+
+async fn negotiate_quic_agent_transport<R, W>(
+    reader: R,
+    writer: W,
+    mtu: u16,
+    remote: &str,
+) -> Result<AgentTransport>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    negotiate_quic_agent_transport_with_timeout(
+        reader,
+        writer,
+        mtu,
+        remote,
+        QUIC_AGENT_PROTOCOL_NEGOTIATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn negotiate_quic_agent_transport_with_timeout<R, W>(
+    reader: R,
+    writer: W,
+    mtu: u16,
+    remote: &str,
+    timeout: Duration,
+) -> Result<AgentTransport>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let started_at = Instant::now();
+    log_quic_agent_protocol_stage(remote, "agent_hello", "start", started_at, timeout, mtu);
+    match tokio::time::timeout(timeout, AgentTransport::connect(reader, writer, mtu)).await {
+        Ok(Ok(transport)) => {
+            log_quic_agent_protocol_stage(remote, "agent_hello", "ok", started_at, timeout, mtu);
+            Ok(transport)
+        }
+        Ok(Err(err)) => {
+            log_quic_agent_protocol_stage(remote, "agent_hello", "error", started_at, timeout, mtu);
+            Err(err).context(
+                "failed to negotiate Rustle agent protocol over QUIC after successful QUIC auth",
+            )
+        }
+        Err(_) => {
+            log_quic_agent_protocol_stage(
+                remote,
+                "agent_hello",
+                "timeout",
+                started_at,
+                timeout,
+                mtu,
+            );
+            bail!(
+                "timed out after {}ms negotiating Rustle agent protocol over QUIC after successful QUIC auth",
+                timeout.as_millis()
+            )
+        }
+    }
+}
+
+fn log_quic_agent_protocol_stage(
+    remote: &str,
+    stage: &'static str,
+    result: &'static str,
+    started_at: Instant,
+    timeout: Duration,
+    mtu: u16,
+) {
+    eprintln!(
+        "quic-agent-protocol: transport=quic-agent remote={remote} stage={stage} result={result} elapsed_ms={} timeout_ms={} mtu={mtu}",
+        started_at.elapsed().as_millis(),
+        timeout.as_millis()
+    );
 }
 
 pub(super) async fn connect_quic_native_bridge_fresh_ssh_command(
@@ -518,8 +594,9 @@ mod tests {
 
     use super::{
         connect_quic_data_plane_any_with_timeout, connect_quic_data_plane_with_timeout,
-        quic_data_plane_attempt_timeout, read_quic_helper_bootstrap, resolve_quic_helper_addrs,
-        QUIC_AGENT_BOOTSTRAP_ROLE, QUIC_NATIVE_BOOTSTRAP_ROLE,
+        negotiate_quic_agent_transport_with_timeout, quic_data_plane_attempt_timeout,
+        read_quic_helper_bootstrap, resolve_quic_helper_addrs, QUIC_AGENT_BOOTSTRAP_ROLE,
+        QUIC_NATIVE_BOOTSTRAP_ROLE,
     };
     use crate::quic_agent::QuicAgentBootstrap;
 
@@ -698,6 +775,27 @@ mod tests {
         assert!(detail.contains("198.51.100.9:4444"));
         assert!(detail.contains("after SSH bootstrap"));
         assert!(detail.contains("advertised address may be unreachable"));
+    }
+
+    #[tokio::test]
+    async fn quic_agent_transport_negotiation_times_out_without_remote_hello() {
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(client_io);
+
+        let err = negotiate_quic_agent_transport_with_timeout(
+            reader,
+            writer,
+            crate::defaults::DEFAULT_MTU,
+            "203.0.113.9:4433",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("hung QUIC agent negotiation should time out");
+        let detail = format!("{err:#}");
+
+        assert!(detail.contains(
+            "timed out after 10ms negotiating Rustle agent protocol over QUIC after successful QUIC auth"
+        ));
     }
 
     #[tokio::test]

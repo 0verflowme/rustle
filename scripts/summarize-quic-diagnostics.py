@@ -37,9 +37,16 @@ STRUCTURED_AUTH_RE = re.compile(
     r"remote=(?P<remote>\S+) stage=(?P<stage>[a-z_]+) result=(?P<result>[a-z_]+) "
     r"elapsed_ms=(?P<elapsed>\d+)"
 )
+PROTOCOL_RE = re.compile(
+    r"quic-agent-protocol: transport=(?P<transport>quic-agent) "
+    r"remote=(?P<remote>\S+) stage=(?P<stage>[a-z_]+) "
+    r"result=(?P<result>[a-z_]+) elapsed_ms=(?P<elapsed>\d+) "
+    r"timeout_ms=(?P<timeout>\d+) mtu=(?P<mtu>\d+)"
+)
 QUIC_DIAGNOSTIC_HINTS = (
     "quic-auth:",
     "quic-connect:",
+    "quic-agent-protocol:",
     "UDP data plane connected",
     "failed to establish UDP data plane",
     "auth_token_sha256_prefix",
@@ -65,7 +72,7 @@ def event_status(line: str) -> str:
 
 
 def result_status(result: str) -> str:
-    return "ok" if result == "ok" else "failure"
+    return "failure" if result in ("error", "failed", "timeout", "timed_out") else "ok"
 
 
 def auth_category(match: re.Match[str]) -> str:
@@ -150,6 +157,19 @@ def parse_line(line: str, path: str) -> list[dict[str, object]]:
             }
         )
 
+    protocol = PROTOCOL_RE.search(line)
+    if protocol:
+        events.append(
+            {
+                "category": f"{protocol.group('transport')}/protocol",
+                "status": result_status(protocol.group("result")),
+                "elapsed_ms": int(protocol.group("elapsed")),
+                "stage": protocol.group("stage"),
+                "remote": protocol.group("remote"),
+                "path": path,
+            }
+        )
+
     auth = AUTH_RE.search(line)
     if auth:
         events.append(
@@ -227,6 +247,8 @@ def self_test() -> None:
             "quic-connect: transport=quic-native remote=203.0.113.12:4444 local_udp_addr=0.0.0.0:51234 server_name=rustle-quic-agent.local stage=connect_establish result=ok elapsed_ms=44 cert_sha256=abc cert_der_len=256 auth_token_sha256_prefix=abcdef123456",
             "quic-auth: transport=quic-native side=client remote=203.0.113.12:4444 stage=read_ack result=ok elapsed_ms=2 timeout_ms=5000 auth_token_sha256_prefix=abcdef123456",
             "quic-auth: transport=quic-native side=server remote=198.51.100.8:5354 stage=finish_send result=timeout elapsed_ms=5001 timeout_ms=5000 auth_token_sha256_prefix=abcdef123456",
+            "quic-agent-protocol: transport=quic-agent remote=203.0.113.9:4433 stage=agent_hello result=start elapsed_ms=0 timeout_ms=15000 mtu=1500",
+            "quic-agent-protocol: transport=quic-agent remote=203.0.113.9:4433 stage=agent_hello result=timeout elapsed_ms=15000 timeout_ms=15000 mtu=1500",
         ]
     )
     tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
@@ -251,6 +273,10 @@ def self_test() -> None:
     assert summaries["quic-native/server-auth"]["remotes"] == "198.51.100.7:5353,198.51.100.8:5354"
     assert summaries["quic-native/client-auth"]["events"] == 1
     assert summaries["quic-native/client-auth"]["failures"] == 0
+    assert summaries["quic-agent/protocol"]["events"] == 2
+    assert summaries["quic-agent/protocol"]["failures"] == 1
+    assert summaries["quic-agent/protocol"]["max_elapsed_ms"] == 15000
+    assert summaries["quic-agent/protocol"]["stages"] == "agent_hello"
     assert_rejects("ordinary rustle log line without QUIC diagnostics\n")
 
 

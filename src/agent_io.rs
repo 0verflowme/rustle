@@ -11,7 +11,7 @@ use crate::agent_proto::{
 };
 
 pub(crate) const AGENT_FRAME_WRITE_BURST: usize = 64;
-pub(crate) const AGENT_FRAME_WRITE_BURST_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const AGENT_FRAME_WRITE_BURST_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct AgentFrameReader {
     input: BytesMut,

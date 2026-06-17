@@ -651,9 +651,13 @@ SSH-bootstrapped UDP/QUIC helper data plane; that run should fail clearly when
 inbound UDP to the helper port is blocked.
 QUIC-native live runs emit structured `quic-connect:` and `quic-auth:` lines
 with stage, result, elapsed time, local UDP bind, certificate fingerprint, and
-auth-token SHA-256 prefix. Summarize them with
+auth-token SHA-256 prefix. QUIC-agent live runs also emit
+`quic-agent-protocol:` lines after UDP/QUIC auth succeeds, so a hang in framed
+agent Hello negotiation is separated from UDP reachability and auth failures.
+Summarize them with
 `scripts/summarize-quic-diagnostics.py` to distinguish UDP reachability,
-certificate/bootstrap, and auth-stream failures without exposing raw tokens.
+certificate/bootstrap, auth-stream, and framed-agent protocol failures without
+exposing raw tokens.
 When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
 alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific

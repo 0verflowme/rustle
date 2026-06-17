@@ -1084,6 +1084,7 @@ mod tests {
         let writes = Arc::clone(&writer.writes);
         let frames_until_byte_cap =
             AGENT_FRAME_WRITE_BURST_BYTES / (AGENT_MAX_FRAME_PAYLOAD + AGENT_FRAME_HEADER_LEN) + 1;
+        assert_eq!(frames_until_byte_cap, 4);
         assert!(frames_until_byte_cap < AGENT_FRAME_WRITE_BURST);
         let total_frames = frames_until_byte_cap + 1;
         let (outbound, outbound_rx) = mpsc::channel(total_frames);
