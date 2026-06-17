@@ -136,6 +136,7 @@ impl TunnelEngine {
                 ssh_channels: self.bridges.len(),
                 backlog_flows: self.remote_backlogs.active_flow_count(),
                 backlog_bytes: self.remote_backlogs.total_bytes(),
+                backlog_bytes_max: self.remote_backlogs.total_bytes_max(),
             },
             dns: self.dns_admission.snapshot(),
             udp: self.udp_admission.snapshot(),

@@ -961,7 +961,7 @@ rustle_extra_stats() {
   local final_stats
   final_stats="$(grep 'stats: final' "$log" | tail -n 1 || true)"
   if [[ -z "$final_stats" ]]; then
-    printf '\t\t\t\t\t\t\t'
+    printf '\t\t\t\t\t\t\t\t\t'
     return
   fi
   local ssh_opened
@@ -970,6 +970,8 @@ rustle_extra_stats() {
   local agent_reconnect_ok
   local agent_reconnect_failed
   local backlog_overflow
+  local remote_backlog_bytes
+  local remote_backlog_bytes_max
   local bridge_event_queue_remote_bytes
   local bridge_event_queue_remote_bytes_max
   ssh_opened="$(smoke_stat_value "$final_stats" '.*ssh=open:([0-9]+) fail:.*')"
@@ -978,15 +980,18 @@ rustle_extra_stats() {
   agent_reconnect_ok="$(smoke_stat_value "$final_stats" '.*agent_reconnect=attempt:[0-9]+ ok:([0-9]+) fail:.*')"
   agent_reconnect_failed="$(smoke_stat_value "$final_stats" '.*agent_reconnect=attempt:[0-9]+ ok:[0-9]+ fail:([0-9]+).*')"
   backlog_overflow="$(smoke_stat_value "$final_stats" '.*backlog_overflow:([0-9]+).*')"
+  remote_backlog_bytes="$(smoke_stat_value "$final_stats" '.*backlog_bytes=[^ ]* max:[^ ]* raw:([0-9]+) max_raw:.*')"
+  remote_backlog_bytes_max="$(smoke_stat_value "$final_stats" '.*backlog_bytes=[^ ]* max:[^ ]* raw:[0-9]+ max_raw:([0-9]+) bridge_event_queue=.*')"
   bridge_event_queue_remote_bytes="$(smoke_stat_value "$final_stats" '.*bridge_event_queue=.* remote_bytes_raw:([0-9]+) max_raw:.*')"
   bridge_event_queue_remote_bytes_max="$(smoke_stat_value "$final_stats" '.*bridge_event_queue=.* max_raw:([0-9]+) tun_rx=.*')"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
     "$ssh_opened" "$ssh_failed" \
     "$agent_reconnect_attempts" "$agent_reconnect_ok" "$agent_reconnect_failed" \
-    "$backlog_overflow" "$bridge_event_queue_remote_bytes" "$bridge_event_queue_remote_bytes_max"
+    "$backlog_overflow" "$remote_backlog_bytes" "$remote_backlog_bytes_max" \
+    "$bridge_event_queue_remote_bytes" "$bridge_event_queue_remote_bytes_max"
 }
 
-printf 'tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\tp95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\tssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\tagent_reconnect_failed\tbacklog_overflow\tbridge_event_queue_remote_bytes\tbridge_event_queue_remote_bytes_max\n'
+printf 'tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\tp95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\tssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\tagent_reconnect_failed\tbacklog_overflow\tremote_backlog_bytes\tremote_backlog_bytes_max\tbridge_event_queue_remote_bytes\tbridge_event_queue_remote_bytes_max\n'
 
 for tool in $TOOLS; do
   case "$tool" in
@@ -1060,7 +1065,7 @@ for tool in $TOOLS; do
       else
         stop_sshuttle
         CURRENT_STOPPER=""
-        extra=$'\t\t\t\t\t\t\t'
+        extra=$'\t\t\t\t\t\t\t\t\t'
       fi
       if [[ -n "$CURRENT_PASSWORD_FILE" ]]; then
         rm -f "$CURRENT_PASSWORD_FILE"

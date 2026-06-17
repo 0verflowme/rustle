@@ -17,6 +17,7 @@ pub(crate) struct RemoteBacklogs {
     max_bytes_per_flow: usize,
     max_total_bytes: usize,
     total_bytes: usize,
+    total_bytes_max: usize,
     pub(crate) flows: HashMap<tcp_core::FlowId, RemoteBacklog>,
 }
 
@@ -46,6 +47,7 @@ impl RemoteBacklogs {
             max_bytes_per_flow,
             max_total_bytes,
             total_bytes: 0,
+            total_bytes_max: 0,
             flows: HashMap::new(),
         }
     }
@@ -64,6 +66,10 @@ impl RemoteBacklogs {
 
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes as u64
+    }
+
+    pub(crate) fn total_bytes_max(&self) -> u64 {
+        self.total_bytes_max as u64
     }
 
     pub(crate) fn should_pause_bridge_events(&self) -> bool {
@@ -102,6 +108,7 @@ impl RemoteBacklogs {
         }
         backlog.bytes += bytes.len();
         self.total_bytes += bytes.len();
+        self.total_bytes_max = self.total_bytes_max.max(self.total_bytes);
         backlog.chunks.push_back(bytes);
         if backlog.close_after_flush {
             backlog.close_defer_flushes = REMOTE_CLOSE_DEFER_FLUSHES;
@@ -273,6 +280,7 @@ mod tests {
         assert!(!backlogs.flows.contains_key(&id));
         assert_eq!(backlogs.active_flow_count(), 0);
         assert_eq!(backlogs.total_bytes(), 0);
+        assert_eq!(backlogs.total_bytes_max(), 5);
     }
 
     #[test]
@@ -444,6 +452,51 @@ mod tests {
         assert_eq!(REMOTE_BACKLOG_BYTES_TOTAL, 512 * 1024 * 1024);
         assert!(backlogs.max_bytes_per_flow() > agent_window::AGENT_STREAM_MAX_WINDOW_BYTES);
         assert!(backlogs.max_bytes_per_flow() < REMOTE_BACKLOG_BYTES_TOTAL);
+    }
+
+    #[test]
+    fn remote_backlog_high_water_survives_flush() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"first")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"second")),
+            RemoteBacklogPush::Accepted
+        );
+
+        let mut flow_ids = Vec::new();
+        let mut closed_flows = Vec::new();
+        backlogs
+            .flush_all_into(
+                &mut manager,
+                SmolInstant::from_millis(1),
+                &mut flow_ids,
+                &mut closed_flows,
+            )
+            .expect("flush queued backlog");
+
+        assert_eq!(backlogs.total_bytes(), 0);
+        assert_eq!(backlogs.total_bytes_max(), 11);
     }
 
     #[test]

@@ -235,12 +235,15 @@ impl TunnelStats {
             .unwrap_or(0);
 
         format!(
-            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} bridge_event_queue=remote_bytes:{} max:{} remote_bytes_raw:{} max_raw:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
+            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} max:{} raw:{} max_raw:{} bridge_event_queue=remote_bytes:{} max:{} remote_bytes_raw:{} max_raw:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
             format_duration(self.started_at.elapsed()),
             snapshot.tcp.active_flows,
             snapshot.tcp.ssh_channels,
             snapshot.tcp.backlog_flows,
             format_bytes(snapshot.tcp.backlog_bytes),
+            format_bytes(snapshot.tcp.backlog_bytes_max),
+            snapshot.tcp.backlog_bytes,
+            snapshot.tcp.backlog_bytes_max,
             format_bytes(snapshot.bridge_events.remote_bytes),
             format_bytes(snapshot.bridge_events.remote_bytes_max),
             snapshot.bridge_events.remote_bytes,
@@ -312,6 +315,7 @@ pub(crate) struct TcpRuntimeSnapshot {
     pub(crate) ssh_channels: usize,
     pub(crate) backlog_flows: usize,
     pub(crate) backlog_bytes: u64,
+    pub(crate) backlog_bytes_max: u64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -409,7 +413,8 @@ mod tests {
                 active_flows: 1,
                 ssh_channels: 1,
                 backlog_flows: 0,
-                backlog_bytes: 0,
+                backlog_bytes: 4096,
+                backlog_bytes_max: 8192,
             },
             bridge_events: ssh_bridge::BridgeEventQueueSnapshot {
                 remote_bytes: 4096,
@@ -443,6 +448,7 @@ mod tests {
         });
 
         assert!(line.contains("active_flows=1 ssh_channels=1 backlog_flows=0"));
+        assert!(line.contains("backlog_bytes=4.0KiB max:8.0KiB raw:4096 max_raw:8192"));
         assert!(line.contains(
             "bridge_event_queue=remote_bytes:4.0KiB max:8.0KiB remote_bytes_raw:4096 max_raw:8192"
         ));

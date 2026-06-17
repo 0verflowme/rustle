@@ -8,15 +8,17 @@ import sys
 import tempfile
 import argparse
 
-EXPECTED_COLUMNS = 22
+EXPECTED_COLUMNS = 24
 DIAGNOSTIC_FAILURE_COLUMNS = (
     ("ssh_failed", 15),
     ("agent_reconnect_failed", 18),
     ("backlog_overflow", 19),
-    ("bridge_event_queue_remote_bytes", 20),
+    ("remote_backlog_bytes", 20),
+    ("bridge_event_queue_remote_bytes", 22),
 )
 DIAGNOSTIC_NUMERIC_COLUMNS = (
-    ("bridge_event_queue_remote_bytes_max", 21),
+    ("remote_backlog_bytes_max", 21),
+    ("bridge_event_queue_remote_bytes_max", 23),
 )
 
 
@@ -97,12 +99,13 @@ def self_test() -> None:
         "tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\t"
         "p95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\t"
         "ssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\t"
-        "agent_reconnect_failed\tbacklog_overflow\tbridge_event_queue_remote_bytes\t"
+        "agent_reconnect_failed\tbacklog_overflow\tremote_backlog_bytes\t"
+        "remote_backlog_bytes_max\tbridge_event_queue_remote_bytes\t"
         "bridge_event_queue_remote_bytes_max\n"
     )
     good = header + (
         "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
         handle.write(good)
@@ -111,7 +114,7 @@ def self_test() -> None:
 
     allowed_failed = header + (
         "sshuttle\t1\t1\t1\t0\t1\t1000\t1000.0\t1000.0\t512\t0.00\t"
-        "0.00\t1.0\t2.0\t\t\t\t\t\t\t\t\n"
+        "0.00\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t\n"
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
         handle.write(allowed_failed)
@@ -122,28 +125,42 @@ def self_test() -> None:
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t3072\t29.30\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n",
         1024,
         "produced invalid benchmark rows",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t1\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n",
         1024,
         "produced invalid benchmark rows",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t1024\t1024\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t1024\t1024\t0\t2048\n",
+        1024,
+        "remote_backlog_bytes=1024",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\tnot-a-number\t0\t2048\n",
+        1024,
+        "remote_backlog_bytes_max is not numeric",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t1024\t1024\t1024\n",
         1024,
         "bridge_event_queue_remote_bytes=1024",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t4096\t39.06\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\tnot-a-number\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t1024\t0\tnot-a-number\n",
         1024,
         "bridge_event_queue_remote_bytes_max is not numeric",
     )

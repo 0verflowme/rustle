@@ -174,11 +174,11 @@ def write_sample_live_results(path: pathlib.Path, body_bytes: int = 1024) -> Non
             [
                 (
                     "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t"
-                    f"{body_bytes * 4}\t39.06\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048"
+                    f"{body_bytes * 4}\t39.06\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048"
                 ),
                 (
                     "sshuttle\t1\t4\t2\t4\t0\t120\t12.0\t22.0\t"
-                    f"{body_bytes * 4}\t32.55\t33.33\t1.0\t2.0\t\t\t\t\t\t\t\t"
+                    f"{body_bytes * 4}\t32.55\t33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t"
                 ),
             ]
         )
@@ -196,11 +196,12 @@ def write_sample_fixture_results(path: pathlib.Path, body_bytes: int) -> None:
                     "p50_ms\tp95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\t"
                     "max_cpu_pct\tssh_opened\tssh_failed\tagent_reconnect_attempts\t"
                     "agent_reconnect_ok\tagent_reconnect_failed\tbacklog_overflow\t"
+                    "remote_backlog_bytes\tremote_backlog_bytes_max\t"
                     "bridge_event_queue_remote_bytes\tbridge_event_queue_remote_bytes_max"
                 ),
                 (
                     "rustle-agent\t1\t4\t2\t4\t0\t100\t10.0\t20.0\t"
-                    f"{body_bytes * 4}\t39.06\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048"
+                    f"{body_bytes * 4}\t39.06\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048"
                 ),
             ]
         )

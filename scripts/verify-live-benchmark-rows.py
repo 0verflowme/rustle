@@ -11,15 +11,17 @@ import sys
 import tempfile
 
 
-EXPECTED_COLUMNS = 22
+EXPECTED_COLUMNS = 24
 DIAGNOSTIC_FAILURE_COLUMNS = (
     ("ssh_failed", 15),
     ("agent_reconnect_failed", 18),
     ("backlog_overflow", 19),
-    ("bridge_event_queue_remote_bytes", 20),
+    ("remote_backlog_bytes", 20),
+    ("bridge_event_queue_remote_bytes", 22),
 )
 DIAGNOSTIC_NUMERIC_COLUMNS = (
-    ("bridge_event_queue_remote_bytes_max", 21),
+    ("remote_backlog_bytes_max", 21),
+    ("bridge_event_queue_remote_bytes_max", 23),
 )
 
 
@@ -308,16 +310,17 @@ def self_test() -> None:
         "tool\trun\trequests\tconcurrency\tsuccess\tfailed\twall_ms\tp50_ms\t"
         "p95_ms\tbytes\tthroughput_mib_s\treq_s\tavg_cpu_pct\tmax_cpu_pct\t"
         "ssh_opened\tssh_failed\tagent_reconnect_attempts\tagent_reconnect_ok\t"
-        "agent_reconnect_failed\tbacklog_overflow\tbridge_event_queue_remote_bytes\t"
+        "agent_reconnect_failed\tbacklog_overflow\tremote_backlog_bytes\t"
+        "remote_backlog_bytes_max\tbridge_event_queue_remote_bytes\t"
         "bridge_event_queue_remote_bytes_max\n"
     )
     good = header + (
         "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
         "rustle-quic-native\t1\t4\t2\t4\t0\t90\t7.0\t18.0\t4096\t50.00\t"
-        "44.44\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t1024\n"
+        "44.44\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t4096\t0\t1024\n"
         "sshuttle\t1\t4\t2\t4\t0\t120\t10.0\t22.0\t4096\t30.00\t"
-        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\n"
+        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t\n"
     )
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
         handle.write(good)
@@ -337,36 +340,36 @@ def self_test() -> None:
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t20.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
         + "sshuttle\t1\t4\t2\t4\t0\t120\t10.0\t22.0\t4096\t30.00\t"
-        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\n",
+        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t\n",
         "throughput below configured sshuttle ratio",
         min_agent_sshuttle_throughput_ratio=1.0,
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t12.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
         + "sshuttle\t1\t4\t2\t4\t0\t120\t10.0\t22.0\t4096\t30.00\t"
-        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\n",
+        "33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t\n",
         "p50 latency above configured sshuttle ratio",
         max_agent_sshuttle_p50_ratio=1.0,
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
         + "rustle-quic-native\t1\t4\t2\t4\t0\t120\t7.0\t18.0\t4096\t30.00\t"
-        "33.33\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t1024\n",
+        "33.33\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t4096\t0\t1024\n",
         "quic-native throughput below configured rustle-agent ratio",
         min_quic_native_agent_throughput_ratio=1.0,
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2048\n"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048\n"
         + "rustle-quic-native\t1\t4\t2\t4\t0\t120\t10.0\t18.0\t4096\t50.00\t"
-        "33.33\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t1024\n",
+        "33.33\t1.0\t2.0\t1\t0\t0\t0\t0\t0\t0\t4096\t0\t1024\n",
         "quic-native p50 latency above configured rustle-agent ratio",
         max_quic_native_agent_p50_ratio=1.0,
     )
@@ -377,31 +380,43 @@ def self_test() -> None:
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t1\t0\t0\t0\t0\t0\t2048\n",
+        "40.00\t1.0\t2.0\t4\t1\t0\t0\t0\t0\t0\t8192\t0\t2048\n",
         "ssh_failed=1",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t1\t0\t1\t0\t0\t2048\n",
+        "40.00\t1.0\t2.0\t4\t0\t1\t0\t1\t0\t0\t8192\t0\t2048\n",
         "agent_reconnect_failed=1",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t1\t0\t2048\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t1\t0\t8192\t0\t2048\n",
         "backlog_overflow=1",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t4096\t4096\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t1024\t1024\t0\t2048\n",
+        "remote_backlog_bytes=1024",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\tnot-a-number\t0\t2048\n",
+        "remote_backlog_bytes_max is not numeric",
+    )
+    assert_rejects(
+        header
+        + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t4096\t4096\t4096\n",
         "bridge_event_queue_remote_bytes=4096",
     )
     assert_rejects(
         header
         + "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t40.00\t"
-        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\tnot-a-number\n",
+        "40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t4096\t0\tnot-a-number\n",
         "bridge_event_queue_remote_bytes_max is not numeric",
     )
     assert_rejects(
