@@ -590,6 +590,8 @@ keep the raw per-run `rustle.log` files.
 
 The regular `stats:` line also carries live drain counters for untraced runs:
 `tun_write=calls:<n> total_us:<n> max_us:<n>` reports TUN write pressure, and
+`bridge_event_queue=remote_bytes:<n> max:<n>` reports remote `RemoteData` bytes
+already queued by bridge tasks but not yet dequeued by the packet engine.
 `bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
 supervisor bridge-event batch pressure and backlog pauses.
 Use those fields with hotpath `pre_bridge_queue_wait`, `remote_event_wait`, and

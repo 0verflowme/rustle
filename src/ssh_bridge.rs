@@ -102,6 +102,87 @@ pub enum BridgeEvent {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct BridgeEventAccounting {
+    queued_remote_bytes: Arc<AtomicUsize>,
+    max_queued_remote_bytes: Arc<AtomicUsize>,
+}
+
+impl BridgeEventAccounting {
+    pub(crate) fn new() -> Self {
+        Self {
+            queued_remote_bytes: Arc::new(AtomicUsize::new(0)),
+            max_queued_remote_bytes: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> BridgeEventQueueSnapshot {
+        BridgeEventQueueSnapshot {
+            remote_bytes: usize_to_u64(self.queued_remote_bytes.load(Ordering::Acquire)),
+            remote_bytes_max: usize_to_u64(self.max_queued_remote_bytes.load(Ordering::Acquire)),
+        }
+    }
+
+    pub(crate) fn record_dequeued(&self, event: &BridgeEvent) {
+        self.record_dequeued_remote_bytes(remote_data_len(event));
+    }
+
+    fn record_queued_remote_bytes(&self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let queued = self
+            .queued_remote_bytes
+            .fetch_add(len, Ordering::AcqRel)
+            .saturating_add(len);
+        update_max(&self.max_queued_remote_bytes, queued);
+    }
+
+    fn record_dequeued_remote_bytes(&self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let _ =
+            self.queued_remote_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current.saturating_sub(len))
+                });
+    }
+}
+
+impl Default for BridgeEventAccounting {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BridgeEventQueueSnapshot {
+    pub(crate) remote_bytes: u64,
+    pub(crate) remote_bytes_max: u64,
+}
+
+fn remote_data_len(event: &BridgeEvent) -> usize {
+    match event {
+        BridgeEvent::RemoteData { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
+}
+
+fn update_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::Acquire);
+    while value > current {
+        match max.compare_exchange_weak(current, value, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BridgeEventSendError {
     Closed,
@@ -110,6 +191,16 @@ enum BridgeEventSendError {
 
 pub async fn send_bridge_event(event_tx: &mpsc::Sender<BridgeEvent>, event: BridgeEvent) -> bool {
     send_bridge_event_with_timeout(event_tx, event, BRIDGE_EVENT_SEND_TIMEOUT)
+        .await
+        .is_ok()
+}
+
+pub(crate) async fn send_bridge_event_accounted(
+    event_tx: &mpsc::Sender<BridgeEvent>,
+    accounting: &BridgeEventAccounting,
+    event: BridgeEvent,
+) -> bool {
+    send_bridge_event_accounted_with_timeout(event_tx, accounting, event, BRIDGE_EVENT_SEND_TIMEOUT)
         .await
         .is_ok()
 }
@@ -124,6 +215,21 @@ async fn send_bridge_event_with_timeout(
         Ok(Err(_)) => Err(BridgeEventSendError::Closed),
         Err(_) => Err(BridgeEventSendError::Timeout),
     }
+}
+
+async fn send_bridge_event_accounted_with_timeout(
+    event_tx: &mpsc::Sender<BridgeEvent>,
+    accounting: &BridgeEventAccounting,
+    event: BridgeEvent,
+    timeout: Duration,
+) -> std::result::Result<(), BridgeEventSendError> {
+    let remote_data_len = remote_data_len(&event);
+    accounting.record_queued_remote_bytes(remote_data_len);
+    let result = send_bridge_event_with_timeout(event_tx, event, timeout).await;
+    if result.is_err() {
+        accounting.record_dequeued_remote_bytes(remote_data_len);
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -666,6 +772,74 @@ mod tests {
         .await;
 
         assert_eq!(result, Err(BridgeEventSendError::Timeout));
+        assert_eq!(
+            event_rx.try_recv().expect("prefilled event"),
+            BridgeEvent::Opened { id, open_ms: 0 }
+        );
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn accounted_bridge_event_tracks_remote_data_until_dequeue() {
+        let flow = crate::tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(172, 16, 0, 9),
+            443,
+        );
+        let id = FlowId::new(flow, 1);
+        let accounting = BridgeEventAccounting::new();
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+
+        assert!(
+            send_bridge_event_accounted(
+                &event_tx,
+                &accounting,
+                BridgeEvent::RemoteData {
+                    id,
+                    bytes: Bytes::from_static(b"remote payload"),
+                },
+            )
+            .await
+        );
+
+        assert_eq!(accounting.snapshot().remote_bytes, 14);
+        assert_eq!(accounting.snapshot().remote_bytes_max, 14);
+        let event = event_rx.recv().await.expect("accounted event");
+        accounting.record_dequeued(&event);
+        assert_eq!(accounting.snapshot().remote_bytes, 0);
+        assert_eq!(accounting.snapshot().remote_bytes_max, 14);
+    }
+
+    #[tokio::test]
+    async fn accounted_bridge_event_releases_remote_data_on_send_timeout() {
+        let flow = crate::tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(172, 16, 0, 9),
+            443,
+        );
+        let id = FlowId::new(flow, 1);
+        let accounting = BridgeEventAccounting::new();
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .try_send(BridgeEvent::Opened { id, open_ms: 0 })
+            .expect("prefill event queue");
+
+        let result = send_bridge_event_accounted_with_timeout(
+            &event_tx,
+            &accounting,
+            BridgeEvent::RemoteData {
+                id,
+                bytes: Bytes::from_static(b"blocked remote payload"),
+            },
+            std::time::Duration::from_millis(25),
+        )
+        .await;
+
+        assert_eq!(result, Err(BridgeEventSendError::Timeout));
+        assert_eq!(accounting.snapshot().remote_bytes, 0);
+        assert_eq!(accounting.snapshot().remote_bytes_max, 22);
         assert_eq!(
             event_rx.try_recv().expect("prefilled event"),
             BridgeEvent::Opened { id, open_ms: 0 }

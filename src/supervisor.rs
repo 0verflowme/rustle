@@ -176,6 +176,7 @@ impl TunnelSupervisor {
         let mut buf = vec![0_u8; PACKET_BUF_SIZE];
         let mut tcp_bridge_starts = Vec::new();
         let mut udp_actions = Vec::new();
+        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
         let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel(DNS_EVENT_CHANNEL_DEPTH);
         let (udp_response_tx, mut udp_response_rx) =
@@ -198,7 +199,10 @@ impl TunnelSupervisor {
                     eprintln!("signal: {} received", signal?);
                     eprintln!(
                         "stats: final {}",
-                        engine.status_line(data_plane.snapshot().await)
+                        engine.status_line(
+                            data_plane.snapshot().await,
+                            bridge_event_accounting.snapshot(),
+                        )
                     );
                     return Ok(());
                 }
@@ -275,6 +279,7 @@ impl TunnelSupervisor {
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
+                        &bridge_event_accounting,
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.flush_remote_backlogs()?;
@@ -314,7 +319,11 @@ impl TunnelSupervisor {
                     let Some(event) = event else {
                         bail!("SSH bridge event channel closed");
                     };
-                    engine.handle_bridge_event_batch(event, &mut event_rx)?;
+                    engine.handle_bridge_event_batch(
+                        event,
+                        &mut event_rx,
+                        &bridge_event_accounting,
+                    )?;
                     engine.poll_tcp();
                     tun.write_engine_packets(engine).await?;
                     engine.flush_remote_backlogs()?;
@@ -324,7 +333,10 @@ impl TunnelSupervisor {
                 _ = stats_tick.tick() => {
                     eprintln!(
                         "stats: {}",
-                        engine.status_line(data_plane.snapshot().await)
+                        engine.status_line(
+                            data_plane.snapshot().await,
+                            bridge_event_accounting.snapshot(),
+                        )
                     );
                 }
                 _ = tick.tick() => {
@@ -341,6 +353,7 @@ impl TunnelSupervisor {
                         &mut tcp_bridge_starts,
                         &data_plane,
                         &event_tx,
+                        &bridge_event_accounting,
                     )?;
                     engine.drain_local_bytes_to_bridges()?;
                     engine.expire_and_prune()?;
@@ -355,6 +368,7 @@ fn execute_tcp_bridge_starts(
     starts: &mut Vec<TcpBridgeStart>,
     data_plane: &Arc<dyn DataPlane>,
     event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
+    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
 ) -> Result<()> {
     for start in starts.drain(..) {
         let bridge = spawn_tcp_bridge_on_data_plane(
@@ -362,6 +376,7 @@ fn execute_tcp_bridge_starts(
             start.id,
             start.ready_wait_ms,
             event_tx.clone(),
+            bridge_event_accounting.clone(),
         );
         engine.register_tcp_bridge(start, bridge)?;
     }

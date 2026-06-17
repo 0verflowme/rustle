@@ -31,6 +31,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
     spawn_data_plane_tcp_bridge_with_open(
         id,
         event_tx,
+        ssh_bridge::BridgeEventAccounting::new(),
         0,
         "agent",
         open_agent_tcp_stream(agent, open),
@@ -40,6 +41,7 @@ pub(crate) fn spawn_agent_tcp_bridge(
 pub(super) fn spawn_data_plane_tcp_bridge_with_open<Fut>(
     id: tcp_core::FlowId,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    event_accounting: ssh_bridge::BridgeEventAccounting,
     ready_wait_ms: u64,
     transport_label: &'static str,
     open_stream: Fut,
@@ -143,8 +145,9 @@ where
                                 }
                                 trace.remote_bytes(frame.payload.len());
                                 let event_started_at = StdInstant::now();
-                                let event_sent = ssh_bridge::send_bridge_event(
+                                let event_sent = ssh_bridge::send_bridge_event_accounted(
                                     &event_tx,
+                                    &event_accounting,
                                     ssh_bridge::BridgeEvent::RemoteData {
                                         id,
                                         bytes: frame.payload,

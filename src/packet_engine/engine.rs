@@ -125,7 +125,11 @@ impl TunnelEngine {
         self.remote_backlogs.should_pause_bridge_events()
     }
 
-    pub(crate) fn status_line(&self, agent: DataPlaneRuntimeSnapshot) -> String {
+    pub(crate) fn status_line(
+        &self,
+        agent: DataPlaneRuntimeSnapshot,
+        bridge_events: ssh_bridge::BridgeEventQueueSnapshot,
+    ) -> String {
         self.stats.status_line(TunnelStatusSnapshot {
             tcp: TcpRuntimeSnapshot {
                 active_flows: self.flow_manager.active_flow_count(),
@@ -136,6 +140,7 @@ impl TunnelEngine {
             dns: self.dns_admission.snapshot(),
             udp: self.udp_admission.snapshot(),
             agent,
+            bridge_events,
         })
     }
 
@@ -254,6 +259,7 @@ impl TunnelEngine {
         &mut self,
         first: ssh_bridge::BridgeEvent,
         event_rx: &mut tokio::sync::mpsc::Receiver<ssh_bridge::BridgeEvent>,
+        bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
     ) -> Result<usize> {
         let started_at = StdInstant::now();
         let mut handled = 0_usize;
@@ -269,6 +275,7 @@ impl TunnelEngine {
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
                 }
             };
+            bridge_event_accounting.record_dequeued(&event);
             self.handle_bridge_event(event)?;
             handled += 1;
             if self.should_pause_bridge_events() {
@@ -355,6 +362,7 @@ mod tests {
     fn bridge_event_batch_is_bounded() {
         let mut engine = test_engine();
         let id = test_flow_id();
+        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(BRIDGE_EVENT_BATCH_LIMIT + 1);
         for _ in 0..BRIDGE_EVENT_BATCH_LIMIT {
             tx.try_send(ssh_bridge::BridgeEvent::Closed { id })
@@ -362,7 +370,11 @@ mod tests {
         }
 
         let handled = engine
-            .handle_bridge_event_batch(ssh_bridge::BridgeEvent::Closed { id }, &mut rx)
+            .handle_bridge_event_batch(
+                ssh_bridge::BridgeEvent::Closed { id },
+                &mut rx,
+                &bridge_event_accounting,
+            )
             .expect("handle bridge event batch");
 
         assert_eq!(handled, BRIDGE_EVENT_BATCH_LIMIT);
@@ -380,12 +392,17 @@ mod tests {
     fn bridge_event_batch_records_stats() {
         let mut engine = test_engine();
         let id = test_flow_id();
+        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         tx.try_send(ssh_bridge::BridgeEvent::Closed { id })
             .expect("queue bridge event");
 
         let handled = engine
-            .handle_bridge_event_batch(ssh_bridge::BridgeEvent::Closed { id }, &mut rx)
+            .handle_bridge_event_batch(
+                ssh_bridge::BridgeEvent::Closed { id },
+                &mut rx,
+                &bridge_event_accounting,
+            )
             .expect("handle bridge event batch");
 
         assert_eq!(handled, 2);
@@ -394,5 +411,43 @@ mod tests {
         assert_eq!(engine.stats.bridge_event_batch_max, 2);
         assert_eq!(engine.stats.ssh_closed, 2);
         assert_eq!(engine.stats.stale_bridge_events, 2);
+    }
+
+    #[tokio::test]
+    async fn bridge_event_batch_releases_accounted_remote_data_on_dequeue() {
+        let mut engine = test_engine();
+        let id = test_flow_id();
+        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let first = ssh_bridge::BridgeEvent::RemoteData {
+            id,
+            bytes: bytes::Bytes::from_static(b"first"),
+        };
+        let second = ssh_bridge::BridgeEvent::RemoteData {
+            id,
+            bytes: bytes::Bytes::from_static(b"second"),
+        };
+
+        assert!(
+            ssh_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, first).await
+        );
+        assert!(
+            ssh_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, second).await
+        );
+        assert_eq!(bridge_event_accounting.snapshot().remote_bytes, 11);
+        assert_eq!(bridge_event_accounting.snapshot().remote_bytes_max, 11);
+        let first = rx
+            .recv()
+            .await
+            .expect("first bridge event should be queued");
+
+        let handled = engine
+            .handle_bridge_event_batch(first, &mut rx, &bridge_event_accounting)
+            .expect("handle bridge event batch");
+
+        assert_eq!(handled, 2);
+        assert_eq!(bridge_event_accounting.snapshot().remote_bytes, 0);
+        assert_eq!(bridge_event_accounting.snapshot().remote_bytes_max, 11);
+        assert_eq!(engine.stats.remote_to_local_bytes, 11);
     }
 }

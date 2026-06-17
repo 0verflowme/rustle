@@ -376,6 +376,11 @@ Required before tagging a release:
 - `bridge_event_handler_into_reuses_closed_flow_scratch_vector` passes, proving
   remote-data bridge events reuse caller-owned closed-flow scratch storage while
   flushing remote bytes toward smoltcp.
+- `accounted_bridge_event_tracks_remote_data_until_dequeue`,
+  `accounted_bridge_event_releases_remote_data_on_send_timeout`, and
+  `bridge_event_batch_releases_accounted_remote_data_on_dequeue` pass, proving
+  remote `RemoteData` bytes are visible in bridge-event queue accounting before
+  packet-engine backlog ingestion and are released on dequeue or send timeout.
 - `stale_remote_data_storm_after_flow_removal_is_bounded` passes, proving
   high-rate stale `RemoteData` after a flow has been removed does not recreate
   remote backlog state or emit closed-flow cleanup work.

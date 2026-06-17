@@ -57,6 +57,7 @@ pub(crate) fn spawn_tcp_bridge_on_data_plane(
     id: tcp_core::FlowId,
     ready_wait_ms: u64,
     event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    event_accounting: ssh_bridge::BridgeEventAccounting,
 ) -> ssh_bridge::FlowBridge {
     let flow = id.key;
     let label = data_plane.udp_label().unwrap_or_else(|| data_plane.label());
@@ -81,6 +82,7 @@ pub(crate) fn spawn_tcp_bridge_on_data_plane(
     spawn_data_plane_tcp_bridge_with_open(
         id,
         event_tx,
+        event_accounting,
         ready_wait_ms,
         label,
         data_plane.open_tcp(
@@ -924,7 +926,13 @@ mod tests {
             1,
         );
         let (event_tx, mut event_rx) = mpsc::channel(8);
-        let flow = spawn_tcp_bridge_on_data_plane(Arc::new(data_plane.clone()), id, 0, event_tx);
+        let flow = spawn_tcp_bridge_on_data_plane(
+            Arc::new(data_plane.clone()),
+            id,
+            0,
+            event_tx,
+            crate::ssh_bridge::BridgeEventAccounting::new(),
+        );
 
         assert!(
             flow.try_send_local_data(Bytes::from_static(b"bridge-tcp"))

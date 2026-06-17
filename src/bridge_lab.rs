@@ -223,6 +223,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         });
     }
 
+    let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
     let (event_tx, mut event_rx) = mpsc::channel(1024);
     let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
     let mut pending_bridge_events = VecDeque::<ssh_bridge::BridgeEvent>::new();
@@ -269,6 +270,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                     start.id,
                     start.ready_wait_ms,
                     event_tx,
+                    bridge_event_accounting.clone(),
                 )
             },
             event_tx.clone(),
@@ -312,6 +314,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
                 let Ok(event) = event_rx.try_recv() else {
                     break;
                 };
+                bridge_event_accounting.record_dequeued(&event);
                 event
             };
             processed_bridge_events += 1;
@@ -397,6 +400,7 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             tokio::select! {
                 event = event_rx.recv() => {
                     if let Some(event) = event {
+                        bridge_event_accounting.record_dequeued(&event);
                         pending_bridge_events.push_back(event);
                     }
                 }
