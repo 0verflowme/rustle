@@ -398,3 +398,404 @@ pub(crate) fn prune_closed_flows(
     }
     Ok(count)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+
+    use smoltcp::time::Instant as SmolInstant;
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::bridge_lab::{
+        drain_lab_client_to_manager, pump_lab_manager_to_clients, route_lab_packets_to_clients,
+        synthetic_lab_client, BridgeLabClient,
+    };
+    use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
+    use crate::transport_model::{
+        bridge_admission_decision, BridgeAdmissionDecision, MAX_AGENT_ACTIVE_STREAMS,
+        MAX_AGENT_OPENING_STREAMS, MAX_DIRECT_ACTIVE_CHANNELS, MAX_DIRECT_OPENING_CHANNELS,
+    };
+
+    #[test]
+    fn agent_bridge_admission_budget_exceeds_direct_tcpip_channel_budget() {
+        let direct = BridgeAdmissionLimits::direct_tcpip();
+        let agent = BridgeAdmissionLimits::agent();
+
+        assert_eq!(direct.active, MAX_DIRECT_ACTIVE_CHANNELS);
+        assert_eq!(direct.opening, MAX_DIRECT_OPENING_CHANNELS);
+        assert_eq!(agent.active, tcp_core::DEFAULT_MAX_ACTIVE_FLOWS);
+        assert!(agent.active > direct.active);
+        assert!(agent.opening > direct.opening);
+    }
+
+    #[test]
+    fn bridge_admission_decision_uses_transport_specific_opening_budget() {
+        let direct = BridgeAdmissionLimits::direct_tcpip();
+        let agent = BridgeAdmissionLimits::agent();
+
+        assert_eq!(
+            bridge_admission_decision(0, MAX_DIRECT_OPENING_CHANNELS - 1, direct),
+            BridgeAdmissionDecision::Admit
+        );
+        assert_eq!(
+            bridge_admission_decision(0, MAX_DIRECT_OPENING_CHANNELS, direct),
+            BridgeAdmissionDecision::DeferOpening
+        );
+        assert_eq!(
+            bridge_admission_decision(0, MAX_DIRECT_OPENING_CHANNELS, agent),
+            BridgeAdmissionDecision::Admit
+        );
+        assert_eq!(
+            bridge_admission_decision(0, MAX_AGENT_OPENING_STREAMS, agent),
+            BridgeAdmissionDecision::DeferOpening
+        );
+        assert_eq!(
+            bridge_admission_decision(MAX_AGENT_ACTIVE_STREAMS, 0, agent),
+            BridgeAdmissionDecision::DeferActive
+        );
+    }
+
+    #[test]
+    fn planned_bridge_start_marks_flow_ssh_opening() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("plan bridge starts");
+
+        assert_eq!(stats, BridgeAdmissionStats::default());
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].id, id);
+        assert!(starts[0].ready_wait_ms <= 10);
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::SshOpening
+        );
+        assert!(bridges.is_empty());
+    }
+
+    #[test]
+    fn planned_bridge_start_records_ready_wait_after_deferred_admission() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let deferred = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 0,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("defer bridge starts");
+
+        assert_eq!(
+            deferred,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert!(starts.is_empty());
+        assert_eq!(
+            manager.flow_state(flow).expect("flow state"),
+            tcp_core::FlowState::TcpEstablished
+        );
+
+        let plan_now = SmolInstant::from_millis(25);
+        let expected_ready_wait_ms = manager
+            .flow_state_elapsed_ms(flow, plan_now)
+            .expect("flow ready age");
+        let admitted = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            plan_now,
+            &mut starts,
+        )
+        .expect("admit bridge starts");
+
+        assert_eq!(admitted, BridgeAdmissionStats::default());
+        assert_eq!(
+            starts,
+            vec![TcpBridgeStart {
+                id,
+                ready_wait_ms: expected_ready_wait_ms,
+            }]
+        );
+        assert!(starts[0].ready_wait_ms >= 15);
+    }
+
+    #[tokio::test]
+    async fn planned_bridge_registration_inserts_spawned_bridge() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            client_port,
+        );
+        let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+        plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            BridgeAdmissionLimits {
+                active: 16,
+                opening: 16,
+            },
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("plan bridge starts");
+        let start = starts.pop().expect("planned start");
+        assert_eq!(start.id, id);
+
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let bridge =
+            ssh_bridge::spawn_bridge_task(start.id, event_tx, |_id, _local_rx, _event_tx| async {
+                std::future::pending::<()>().await;
+            });
+        register_tcp_bridge(&mut manager, &mut bridges, start, bridge)
+            .expect("register planned bridge");
+
+        assert_eq!(bridges.len(), 1);
+        assert!(bridges.contains_key(&flow));
+    }
+
+    #[test]
+    fn unregistered_opening_start_reserves_active_admission_slot() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let first_client_port = 49152;
+        let second_client_port = 49153;
+        let first_flow = tcp_core::FlowKey::tcp(
+            client_ip,
+            first_client_port,
+            destination_ip,
+            destination_port,
+        );
+        let second_flow = tcp_core::FlowKey::tcp(
+            client_ip,
+            second_client_port,
+            destination_ip,
+            destination_port,
+        );
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            first_client_port,
+        );
+        establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            second_client_port,
+        );
+        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let limits = BridgeAdmissionLimits {
+            active: 1,
+            opening: 128,
+        };
+        let mut ready_flow_ids = Vec::new();
+        let mut opening_flow_keys = Vec::new();
+        let mut starts = Vec::new();
+
+        let first_stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            limits,
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(10),
+            &mut starts,
+        )
+        .expect("first bridge start plan");
+
+        assert_eq!(starts.len(), 1);
+        assert_eq!(
+            first_stats,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert_eq!(manager.opening_flow_count(), 1);
+        assert!(matches!(
+            manager.flow_state(first_flow).expect("first flow state"),
+            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+        ));
+        assert!(matches!(
+            manager.flow_state(second_flow).expect("second flow state"),
+            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+        ));
+
+        starts.clear();
+        let second_stats = plan_bridge_starts(
+            &mut manager,
+            &bridges,
+            limits,
+            &mut ready_flow_ids,
+            &mut opening_flow_keys,
+            SmolInstant::from_millis(11),
+            &mut starts,
+        )
+        .expect("second bridge start plan");
+
+        assert!(starts.is_empty());
+        assert_eq!(
+            second_stats,
+            BridgeAdmissionStats {
+                deferred_active_limit: 1,
+                deferred_open_limit: 0,
+            }
+        );
+        assert_eq!(manager.opening_flow_count(), 1);
+    }
+
+    fn establish_lab_flow(
+        manager: &mut tcp_core::FlowManager,
+        client_ip: Ipv4Addr,
+        destination_ip: Ipv4Addr,
+        destination_port: u16,
+        client_port: u16,
+    ) -> tcp_core::FlowId {
+        let (iface, device, sockets, handle) = synthetic_lab_client(
+            client_ip,
+            DEFAULT_TUN_IP,
+            destination_ip,
+            destination_port,
+            client_port,
+        )
+        .expect("synthetic client");
+        let flow = tcp_core::FlowKey::tcp(client_ip, client_port, destination_ip, destination_port);
+        let mut clients = vec![BridgeLabClient {
+            flow,
+            client_ip,
+            client_port,
+            iface,
+            device,
+            sockets,
+            handle,
+            sent_request: false,
+            request_sent_at: None,
+            response_complete_at: None,
+            saw_bridge_close: false,
+            response: Vec::new(),
+        }];
+        let mut now = SmolInstant::from_millis(0);
+
+        for _ in 0..256 {
+            let packets = {
+                let client = &mut clients[0];
+                client
+                    .iface
+                    .poll(now, &mut client.device, &mut client.sockets);
+                drain_lab_client_to_manager(now, client, manager).expect("drain client")
+            };
+            route_lab_packets_to_clients(now, packets, &mut clients, manager)
+                .expect("route packets");
+            pump_lab_manager_to_clients(now, manager, &mut clients).expect("pump manager");
+
+            if manager.snapshots().iter().any(|snapshot| {
+                snapshot.key == flow && snapshot.state == tcp_core::FlowState::TcpEstablished
+            }) {
+                return manager.flow_id(flow).expect("flow id");
+            }
+            now += smoltcp::time::Duration::from_millis(1);
+        }
+
+        panic!("synthetic flow did not reach TcpEstablished");
+    }
+}
