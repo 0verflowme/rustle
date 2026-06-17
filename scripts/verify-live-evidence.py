@@ -41,6 +41,17 @@ QUIC_DIAGNOSTIC_COLUMNS = {
     "max_elapsed_ms",
     "stages",
 }
+LIVE_DIAGNOSIS_COLUMNS = {
+    "path",
+    "rows",
+    "rustle_success_rows",
+    "rustle_failed_rows",
+    "max_remote_backlog_bytes",
+    "max_bridge_event_queue_remote_bytes",
+    "hotpath_bottleneck",
+    "quic_failures",
+    "diagnosis",
+}
 
 
 def load_module(path: pathlib.Path, name: str) -> ModuleType:
@@ -124,6 +135,42 @@ def verify_optional_quic_diagnostics(directory: pathlib.Path) -> None:
         verify_quic_diagnostics(diagnostics)
 
 
+def verify_live_diagnosis(path: pathlib.Path) -> None:
+    header, rows = read_tsv(require_file(path))
+    missing = sorted(LIVE_DIAGNOSIS_COLUMNS.difference(header))
+    if missing:
+        raise SystemExit(f"live diagnosis {path} missing columns {missing!r}")
+    rows_index = header.index("rows")
+    success_index = header.index("rustle_success_rows")
+    failed_index = header.index("rustle_failed_rows")
+    remote_backlog_index = header.index("max_remote_backlog_bytes")
+    bridge_queue_index = header.index("max_bridge_event_queue_remote_bytes")
+    quic_failures_index = header.index("quic_failures")
+    diagnosis_index = header.index("diagnosis")
+    for row in rows:
+        row_count = int(row[rows_index])
+        success_count = int(row[success_index])
+        failed_count = int(row[failed_index])
+        remote_backlog = int(row[remote_backlog_index])
+        bridge_queue = int(row[bridge_queue_index])
+        quic_failures = int(row[quic_failures_index])
+        diagnosis = row[diagnosis_index]
+        if row_count < 1:
+            raise SystemExit(f"live diagnosis {path} has non-positive row count")
+        if success_count < 0 or failed_count < 0:
+            raise SystemExit(f"live diagnosis {path} has negative Rustle row counts")
+        if remote_backlog < 0 or bridge_queue < 0 or quic_failures < 0:
+            raise SystemExit(f"live diagnosis {path} has negative diagnostic counters")
+        if not diagnosis or diagnosis == "-":
+            raise SystemExit(f"live diagnosis {path} has empty diagnosis")
+
+
+def verify_optional_live_diagnosis(directory: pathlib.Path) -> None:
+    diagnosis = directory / "live-diagnosis.tsv"
+    if diagnosis.exists():
+        verify_live_diagnosis(diagnosis)
+
+
 def verify_live_compare(directory: pathlib.Path, require_hotpath: bool) -> None:
     live_compare = directory / "live-compare"
     if not live_compare.is_dir():
@@ -132,6 +179,7 @@ def verify_live_compare(directory: pathlib.Path, require_hotpath: bool) -> None:
     if require_hotpath:
         verify_hotpath_summary(live_compare / "hotpath-summary.tsv")
     verify_optional_quic_diagnostics(live_compare)
+    verify_optional_live_diagnosis(live_compare)
 
 
 def fixture_dirs(directory: pathlib.Path) -> list[tuple[int, pathlib.Path]]:
@@ -159,6 +207,7 @@ def verify_fixtures(directory: pathlib.Path, require_hotpath: bool) -> None:
         if require_hotpath:
             verify_hotpath_summary(fixture_dir / "hotpath-summary.tsv")
         verify_optional_quic_diagnostics(fixture_dir)
+        verify_optional_live_diagnosis(fixture_dir)
 
 
 def verify(directory: pathlib.Path, require_hotpath: bool) -> None:
@@ -279,6 +328,28 @@ def write_sample_quic_diagnostics(path: pathlib.Path) -> None:
     )
 
 
+def write_sample_live_diagnosis(path: pathlib.Path, relative_path: str) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                (
+                    "path\trows\trustle_success_rows\trustle_failed_rows\t"
+                    "agent_p50_ms\tsshuttle_p50_ms\tagent_sshuttle_p50_ratio\t"
+                    "agent_throughput_mib_s\tmax_remote_backlog_bytes\t"
+                    "max_bridge_event_queue_remote_bytes\thotpath_bottleneck\t"
+                    "quic_failures\tdiagnosis"
+                ),
+                (
+                    f"{relative_path}\t2\t1\t0\t10.00\t12.00\t0.83\t39.06\t"
+                    "8192\t2048\tbody_drain\t0\tpacket_engine_backlog_pressure"
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def populate_sample_evidence(directory: pathlib.Path) -> None:
     live_compare = directory / "live-compare"
     fixture = directory / "fixture-1048576-bytes"
@@ -287,9 +358,11 @@ def populate_sample_evidence(directory: pathlib.Path) -> None:
     write_sample_live_results(live_compare / "live-results.tsv")
     write_sample_hotpath(live_compare / "hotpath-summary.tsv")
     write_sample_quic_diagnostics(live_compare / "quic-diagnostics.tsv")
+    write_sample_live_diagnosis(live_compare / "live-diagnosis.tsv", ".")
     write_sample_live_results(fixture / "live-results.tsv", body_bytes=1048576)
     write_sample_fixture_results(fixture / "fixture-results.tsv", body_bytes=1048576)
     write_sample_hotpath(fixture / "hotpath-summary.tsv")
+    write_sample_live_diagnosis(fixture / "live-diagnosis.tsv", ".")
 
 
 def assert_rejects(directory: pathlib.Path, expected_message: str) -> None:

@@ -27,6 +27,7 @@ LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
 QUIC_DIAGNOSTIC_SUMMARY = REPO / "scripts" / "summarize-quic-diagnostics.py"
+LIVE_DIAGNOSIS_SUMMARY = REPO / "scripts" / "summarize-live-evidence.py"
 RELEASE_ARCHIVES = REPO / "scripts" / "verify-release-archives.py"
 BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
 AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
@@ -755,6 +756,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "live-results.tsv",
     "hotpath-summary.tsv",
     "quic-diagnostics.tsv",
+    "live-diagnosis.tsv",
     "RUSTLE_BENCH_AGENT_PATH",
     "smoke_wait_for_rustle_target_route_logs",
     "sshuttle",
@@ -777,6 +779,8 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "summarize-hotpath-trace.py",
     "summarize_quic_diagnostic_logs",
     "summarize-quic-diagnostics.py",
+    "summarize_live_evidence_artifacts",
+    "summarize-live-evidence.py",
 ]
 
 REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
@@ -1030,6 +1034,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        "summarize-live-evidence.py",
+    ),
+    (
+        VERIFY_LOCAL,
         "summarize-hotpath-trace.py",
     ),
     (
@@ -1265,13 +1273,19 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
     "live-results.tsv",
     "hotpath-summary.tsv",
     "quic-diagnostics.tsv",
+    "live-diagnosis.tsv",
+    "LIVE_DIAGNOSIS_COLUMNS",
+    "verify_optional_live_diagnosis",
     "--require-hotpath",
     "--self-test",
     "assert_rejects",
     "verify_live_benchmark_rows",
     "verify_live_fixture_rows",
     "remote_backlog_bytes",
+    "max_remote_backlog_bytes",
     "bridge_event_queue_remote_bytes",
+    "max_bridge_event_queue_remote_bytes",
+    "diagnosis",
     "no controlled fixture evidence",
     "missing required live evidence file",
 ]
@@ -1331,6 +1345,23 @@ REQUIRED_QUIC_DIAGNOSTIC_SUMMARY_SNIPPETS = [
     "paths",
     "--self-test",
     "assert_rejects",
+]
+
+REQUIRED_LIVE_DIAGNOSIS_SUMMARY_SNIPPETS = [
+    "BENCH_COLUMNS",
+    "OUTPUT_COLUMNS",
+    "live-results.tsv",
+    "hotpath-summary.tsv",
+    "quic-diagnostics.tsv",
+    "remote_backlog_bytes_max",
+    "bridge_event_queue_remote_bytes_max",
+    "supervisor_event_queue_pressure",
+    "packet_engine_backlog_pressure",
+    "quic_startup_or_auth_failure",
+    "agent_latency_lags_sshuttle",
+    "diagnostic_failure:",
+    "--self-test",
+    "assert row[\"diagnosis\"]",
 ]
 
 REQUIRED_RELEASE_ARCHIVE_SNIPPETS = [
@@ -1607,6 +1638,10 @@ REQUIRED_PERFORMANCE_NOTE_SNIPPETS = [
     "quic-auth:",
     "quic-connect:",
     "scripts/summarize-quic-diagnostics.py",
+    "live-diagnosis.tsv",
+    "scripts/summarize-live-evidence.py",
+    "supervisor_event_queue_pressure",
+    "packet_engine_backlog_pressure",
     "100 MiB single-flow throughput gate",
     "same 100 MiB gate through `quic-agent`",
     "RUSTLE_BENCH_BODY_BYTES=104857600",
@@ -1811,6 +1846,7 @@ def main() -> None:
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
     quic_diagnostic_summary = QUIC_DIAGNOSTIC_SUMMARY.read_text(encoding="utf-8")
+    live_diagnosis_summary = LIVE_DIAGNOSIS_SUMMARY.read_text(encoding="utf-8")
     release_archives = RELEASE_ARCHIVES.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
@@ -1985,6 +2021,17 @@ def main() -> None:
         fail(
             "scripts/summarize-quic-diagnostics.py is missing required snippets: "
             f"{missing_quic_diagnostic_summary!r}"
+        )
+
+    missing_live_diagnosis_summary = [
+        snippet
+        for snippet in REQUIRED_LIVE_DIAGNOSIS_SUMMARY_SNIPPETS
+        if snippet not in live_diagnosis_summary
+    ]
+    if missing_live_diagnosis_summary:
+        fail(
+            "scripts/summarize-live-evidence.py is missing required snippets: "
+            f"{missing_live_diagnosis_summary!r}"
         )
 
     missing_release_archives = [

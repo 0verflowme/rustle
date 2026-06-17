@@ -609,8 +609,14 @@ default and writes compact live benchmark artifacts under
 `target/live-evidence/release-candidate-<timestamp>` unless
 `RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison uses a
 `live-compare` subdirectory, and controlled fixture runs use one
-`fixture-<bytes>-bytes` subdirectory per body size. Validate a collected
-artifact tree with:
+`fixture-<bytes>-bytes` subdirectory per body size. `bench-live-compare.sh` also
+writes `live-diagnosis.tsv` through `scripts/summarize-live-evidence.py` when
+live results exist. That file is a first-look triage row, not a gate: it maps
+nonzero final counters to `diagnostic_failure:*`, max packet-engine backlog to
+`packet_engine_backlog_pressure`, max supervisor bridge queue pressure to
+`supervisor_event_queue_pressure`, hotpath labels to `hotpath:*`, and QUIC
+diagnostic failures to `quic_startup_or_auth_failure`.
+Validate a collected artifact tree with:
 
 ```sh
 scripts/verify-live-evidence.py --require-hotpath target/live-evidence/release-candidate-YYYYMMDDTHHMMSSZ

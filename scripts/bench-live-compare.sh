@@ -360,6 +360,18 @@ summarize_quic_diagnostic_logs() {
   fi
 }
 
+summarize_live_evidence_artifacts() {
+  [[ -x "${SCRIPT_DIR}/summarize-live-evidence.py" ]] || return 0
+  [[ -s "$RESULTS_TSV" ]] || return 0
+
+  local summary="${TMPDIR}/live-diagnosis.tsv"
+  smoke_info "live evidence diagnosis"
+  if "${SCRIPT_DIR}/summarize-live-evidence.py" "$TMPDIR" >"$summary"; then
+    cat "$summary" >&2
+    publish_live_artifact "$summary" "live-diagnosis.tsv"
+  fi
+}
+
 cleanup() {
   local status="${1:-0}"
   if [[ -n "$CURRENT_STOPPER" ]]; then
@@ -375,6 +387,7 @@ cleanup() {
   fi
   summarize_hotpath_trace_logs
   summarize_quic_diagnostic_logs
+  summarize_live_evidence_artifacts
   publish_live_artifact "$RESULTS_TSV" "live-results.tsv"
   if [[ "$status" -ne 0 || "$KEEP_LOGS" == "1" ]]; then
     smoke_info "kept live benchmark logs in ${TMPDIR}"
