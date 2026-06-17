@@ -24,27 +24,26 @@ pub(crate) fn parse_udp_request_for_agent_tunnel(packet: &[u8]) -> Option<dns::U
     }
 }
 
-pub(crate) struct UdpAssociationTransportPlan<T> {
+pub(crate) struct UdpAssociationTransportPlan {
     pub(crate) label: &'static str,
-    pub(crate) transport: T,
 }
 
-impl<T> UdpAssociationTransportPlan<T> {
-    pub(crate) fn new(label: &'static str, transport: T) -> Self {
-        Self { label, transport }
+impl UdpAssociationTransportPlan {
+    pub(crate) fn new(label: &'static str) -> Self {
+        Self { label }
     }
 }
 
-pub(crate) struct UdpAssociationStart<T> {
-    pub(crate) transport: T,
+pub(crate) struct UdpAssociationStart {
+    pub(crate) transport_label: &'static str,
     pub(crate) key: UdpFlowKey,
     pub(crate) from_local: mpsc::Receiver<Bytes>,
     pub(crate) events: UdpAssociationEvents,
     pub(crate) idle_timeout: Duration,
 }
 
-pub(crate) enum UdpIngressAction<T> {
-    StartAssociation(UdpAssociationStart<T>),
+pub(crate) enum UdpIngressAction {
+    StartAssociation(UdpAssociationStart),
     SendDatagram {
         key: UdpFlowKey,
         to_remote: mpsc::Sender<Bytes>,
@@ -57,16 +56,16 @@ pub(crate) enum UdpIngressAction<T> {
     },
 }
 
-impl<T> UdpIngressAction<T> {
+impl UdpIngressAction {
     fn start_association(
-        transport: T,
+        transport_label: &'static str,
         key: UdpFlowKey,
         from_local: mpsc::Receiver<Bytes>,
         events: UdpAssociationEvents,
         idle_timeout: Duration,
     ) -> Self {
         Self::StartAssociation(UdpAssociationStart {
-            transport,
+            transport_label,
             key,
             from_local,
             events,
@@ -83,14 +82,14 @@ pub(crate) enum UdpDropReason {
     AssociationClosed,
 }
 
-pub(crate) fn plan_udp_datagram_actions<T>(
-    transport: Option<UdpAssociationTransportPlan<T>>,
+pub(crate) fn plan_udp_datagram_actions(
+    transport: Option<UdpAssociationTransportPlan>,
     request: dns::UdpPacket,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut AdmissionCounter,
     events: UdpAssociationEvents,
     idle_timeout: Duration,
-    actions: &mut Vec<UdpIngressAction<T>>,
+    actions: &mut Vec<UdpIngressAction>,
 ) {
     let key = UdpFlowKey::from_packet(&request);
     let Some(transport) = transport else {
@@ -116,7 +115,7 @@ pub(crate) fn plan_udp_datagram_actions<T>(
 
             let (to_remote, from_local) = mpsc::channel(UDP_DATAGRAMS_PER_ASSOCIATION);
             actions.push(UdpIngressAction::start_association(
-                transport.transport,
+                transport_label,
                 key,
                 from_local,
                 events.clone(),
@@ -137,12 +136,12 @@ pub(crate) fn plan_udp_datagram_actions<T>(
 }
 
 #[cfg(test)]
-pub(crate) fn apply_udp_ingress_actions<T>(
-    actions: &mut Vec<UdpIngressAction<T>>,
+pub(crate) fn apply_udp_ingress_actions(
+    actions: &mut Vec<UdpIngressAction>,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut AdmissionCounter,
     stats: &mut TunnelStats,
-    starts: &mut Vec<UdpAssociationStart<T>>,
+    starts: &mut Vec<UdpAssociationStart>,
 ) {
     for action in actions.drain(..) {
         if let Some(start) =
@@ -153,12 +152,12 @@ pub(crate) fn apply_udp_ingress_actions<T>(
     }
 }
 
-pub(crate) fn apply_udp_ingress_action<T>(
-    action: UdpIngressAction<T>,
+pub(crate) fn apply_udp_ingress_action(
+    action: UdpIngressAction,
     associations: &mut HashMap<UdpFlowKey, UdpAssociation>,
     association_limit: &mut AdmissionCounter,
     stats: &mut TunnelStats,
-) -> Option<UdpAssociationStart<T>> {
+) -> Option<UdpAssociationStart> {
     match action {
         UdpIngressAction::StartAssociation(start) => {
             return Some(start);
@@ -202,7 +201,7 @@ pub(crate) fn apply_udp_ingress_action<T>(
 pub(crate) fn drop_unsupported_direct_udp(request: &dns::UdpPacket, stats: &mut TunnelStats) {
     let mut associations = HashMap::new();
     let mut association_limit = AdmissionCounter::new(1);
-    let start = apply_udp_ingress_action::<()>(
+    let start = apply_udp_ingress_action(
         UdpIngressAction::DropDatagram {
             key: UdpFlowKey::from_packet(request),
             reason: UdpDropReason::UnsupportedTransport,

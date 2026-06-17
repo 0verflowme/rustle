@@ -59,21 +59,22 @@ pub(crate) trait DataPlane: Send + Sync {
     ) -> DataPlaneDnsFuture<'_>;
     fn open_tcp_ipv4_optimistic(&self, open: DataPlaneIpv4Open) -> OpenTcpFuture<'static>;
     fn open_udp_ipv4(&self, open: DataPlaneIpv4Open) -> OpenUdpFuture<'static>;
-    fn spawn_udp_association(
-        &self,
-        key: UdpFlowKey,
-        from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        idle_timeout: Duration,
-    ) {
-        udp::spawn_udp_association_with_idle_timeout(
-            self.open_udp_ipv4(udp::udp_open_request(key)),
-            key,
-            from_local,
-            events,
-            idle_timeout,
-        );
-    }
+}
+
+pub(crate) fn spawn_udp_association(
+    open_stream: OpenUdpFuture<'static>,
+    key: UdpFlowKey,
+    from_local: mpsc::Receiver<Bytes>,
+    events: UdpAssociationEvents,
+    idle_timeout: Duration,
+) {
+    udp::spawn_udp_association_with_idle_timeout(
+        open_stream,
+        key,
+        from_local,
+        events,
+        idle_timeout,
+    );
 }
 
 #[derive(Clone)]
@@ -202,19 +203,6 @@ impl DataPlane for DirectTcpipDataPlane {
                 open.destination_port
             )
         })
-    }
-
-    fn spawn_udp_association(
-        &self,
-        key: UdpFlowKey,
-        _from_local: mpsc::Receiver<Bytes>,
-        events: UdpAssociationEvents,
-        _idle_timeout: Duration,
-    ) {
-        let _ = events.try_send_closed(
-            key,
-            Some("data plane does not support generic UDP associations".to_owned()),
-        );
     }
 }
 
@@ -535,7 +523,8 @@ mod tests {
             close_tx,
         };
 
-        data_plane.spawn_udp_association(
+        spawn_udp_association(
+            data_plane.open_udp_ipv4(key.into_open_request()),
             key,
             from_local,
             events,
@@ -744,7 +733,8 @@ mod tests {
             close_tx,
         };
 
-        data_plane.spawn_udp_association(
+        spawn_udp_association(
+            data_plane.open_udp_ipv4(key.into_open_request()),
             key,
             from_local,
             events,

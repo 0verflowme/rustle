@@ -264,13 +264,13 @@ impl TunnelEngine {
         Ok(outcome)
     }
 
-    pub(crate) fn plan_udp_datagram<T>(
+    pub(crate) fn plan_udp_datagram(
         &mut self,
-        transport: Option<UdpAssociationTransportPlan<T>>,
+        transport: Option<UdpAssociationTransportPlan>,
         request: dns::UdpPacket,
         events: UdpAssociationEvents,
         idle_timeout: Duration,
-        actions: &mut Vec<UdpIngressAction<T>>,
+        actions: &mut Vec<UdpIngressAction>,
     ) {
         plan_udp_datagram_actions(
             transport,
@@ -283,10 +283,10 @@ impl TunnelEngine {
         );
     }
 
-    pub(crate) fn apply_udp_ingress_action<T>(
+    pub(crate) fn apply_udp_ingress_action(
         &mut self,
-        action: UdpIngressAction<T>,
-    ) -> Option<UdpAssociationStart<T>> {
+        action: UdpIngressAction,
+    ) -> Option<UdpAssociationStart> {
         apply_udp_ingress_action(
             action,
             &mut self.udp_associations,
@@ -417,7 +417,7 @@ mod tests {
         let (close_tx, _close_rx) = mpsc::channel(1);
         let mut associations = HashMap::new();
         let mut association_limit = AdmissionCounter::new(1);
-        let mut actions: Vec<UdpIngressAction<()>> = Vec::new();
+        let mut actions: Vec<UdpIngressAction> = Vec::new();
 
         plan_udp_datagram_actions(
             None,
@@ -463,7 +463,7 @@ mod tests {
     ) {
         let mut actions = Vec::new();
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new("agent", ())),
+            Some(UdpAssociationTransportPlan::new("agent")),
             request,
             associations,
             association_limit,
@@ -541,7 +541,7 @@ mod tests {
         let mut actions = Vec::new();
 
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new("agent", ())),
+            Some(UdpAssociationTransportPlan::new("agent")),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -601,7 +601,7 @@ mod tests {
         let mut stats = TunnelStats::new();
 
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new("agent", ())),
+            Some(UdpAssociationTransportPlan::new("agent")),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -661,7 +661,7 @@ mod tests {
         let mut actions = Vec::new();
 
         plan_udp_datagram_actions(
-            Some(UdpAssociationTransportPlan::new("agent", ())),
+            Some(UdpAssociationTransportPlan::new("agent")),
             dns::UdpPacket {
                 src_ip: key.src_ip,
                 src_port: key.src_port,
@@ -714,7 +714,7 @@ mod tests {
         let mut association_limit = AdmissionCounter::new(1);
         assert!(association_limit.try_admit());
         let mut stats = TunnelStats::new();
-        let start = apply_udp_ingress_action::<()>(
+        let start = apply_udp_ingress_action(
             UdpIngressAction::SendDatagram {
                 key,
                 to_remote,

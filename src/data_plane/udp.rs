@@ -55,10 +55,6 @@ where
     run_udp_association_stream(stream, key, &mut from_local, events, idle_timeout).await
 }
 
-pub(super) fn udp_open_request(key: UdpFlowKey) -> DataPlaneIpv4Open {
-    key.into_open_request()
-}
-
 pub(super) async fn open_agent_udp_association(
     agent: ReconnectingAgentBridge,
     open: DataPlaneIpv4Open,
@@ -100,7 +96,7 @@ async fn run_quic_native_udp_association(
     idle_timeout: Duration,
 ) -> Result<()> {
     run_udp_association(
-        open_quic_native_udp_association(bridge, udp_open_request(key)),
+        open_quic_native_udp_association(bridge, key.into_open_request()),
         key,
         from_local,
         events,
@@ -532,7 +528,7 @@ mod tests {
         assert!(association_limit.try_admit());
 
         spawn_udp_association_with_idle_timeout(
-            open_agent_udp_association(bridge.clone(), udp_open_request(key)),
+            open_agent_udp_association(bridge.clone(), key.into_open_request()),
             key,
             from_local,
             events,
@@ -583,7 +579,7 @@ mod tests {
         assert!(association_limit.try_admit());
 
         spawn_udp_association_with_idle_timeout(
-            open_quic_native_udp_association(bridge.clone(), udp_open_request(key)),
+            open_quic_native_udp_association(bridge.clone(), key.into_open_request()),
             key,
             from_local,
             events,

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant as StdInstant};
 use anyhow::{bail, Context, Result};
 
 use crate::control_plane::{connect_tunnel_runtime, validate_agent_session_request_count};
-use crate::data_plane::{spawn_dns_query_on_data_plane, DataPlane};
+use crate::data_plane::{spawn_dns_query_on_data_plane, spawn_udp_association, DataPlane};
 use crate::defaults::DEFAULT_TUN_IP;
 use crate::packet_engine::{
     parse_dns_request_for_tunnel, parse_udp_request_for_agent_tunnel, smol_now, tun_ipv4_packet,
@@ -277,7 +277,7 @@ impl TunnelSupervisor {
                             let label = data_plane
                                 .udp_label()
                                 .expect("UDP-capable data plane must provide a UDP label");
-                            UdpAssociationTransportPlan::new(label, Arc::clone(&data_plane))
+                            UdpAssociationTransportPlan::new(label)
                         });
                         engine.plan_udp_datagram(
                             udp_transport,
@@ -286,7 +286,7 @@ impl TunnelSupervisor {
                             udp_association_idle_timeout,
                             &mut udp_actions,
                         );
-                        execute_udp_ingress_actions(engine, &mut udp_actions);
+                        execute_udp_ingress_actions(engine, &data_plane, &mut udp_actions);
                         continue;
                     }
 
@@ -393,17 +393,27 @@ fn execute_tcp_bridge_starts(
 
 fn execute_udp_ingress_actions(
     engine: &mut TunnelEngine,
-    actions: &mut Vec<UdpIngressAction<Arc<dyn DataPlane>>>,
+    data_plane: &Arc<dyn DataPlane>,
+    actions: &mut Vec<UdpIngressAction>,
 ) {
     for action in actions.drain(..) {
         if let Some(start) = engine.apply_udp_ingress_action(action) {
-            execute_udp_association_start(start);
+            execute_udp_association_start(data_plane, start);
         }
     }
 }
 
-fn execute_udp_association_start(start: UdpAssociationStart<Arc<dyn DataPlane>>) {
-    start.transport.spawn_udp_association(
+fn execute_udp_association_start(data_plane: &Arc<dyn DataPlane>, start: UdpAssociationStart) {
+    eprintln!(
+        "udp: opening association {}:{} -> {}:{} over {}",
+        start.key.src_ip,
+        start.key.src_port,
+        start.key.dst_ip,
+        start.key.dst_port,
+        start.transport_label,
+    );
+    spawn_udp_association(
+        data_plane.open_udp_ipv4(start.key.into_open_request()),
         start.key,
         start.from_local,
         start.events,
