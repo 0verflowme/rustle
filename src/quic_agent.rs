@@ -10,9 +10,9 @@ mod config;
 mod native_bridge;
 
 use auth::{
-    generate_quic_auth_token, open_quic_bi_stream_with_timeout, quic_auth_stage_context,
-    read_quic_auth_ok, verify_quic_auth_token, write_quic_auth_ok, write_quic_auth_token,
-    QUIC_AUTH_FAILED_CODE, QUIC_AUTH_TIMEOUT,
+    generate_quic_auth_token, open_quic_bi_stream_with_timeout, quic_auth_peer_stage_context,
+    quic_auth_stage_context, read_quic_auth_ok, verify_quic_auth_token, write_quic_auth_ok,
+    write_quic_auth_token, QUIC_AUTH_FAILED_CODE, QUIC_AUTH_TIMEOUT,
 };
 use bootstrap::sha256_hex;
 pub use bootstrap::QuicAgentBootstrap;
@@ -56,28 +56,63 @@ impl QuicAgentServer {
                     continue;
                 }
             };
+            let remote = connection.remote_address();
+            let stage_started = Instant::now();
             let (mut send, mut recv) =
                 match tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi()).await {
                     Ok(Ok(streams)) => streams,
                     Ok(Err(err)) => {
-                        eprintln!("quic-agent: failed to accept auth stream: {err:#}");
+                        eprintln!(
+                            "quic-agent: server auth failed: {} failed: {err:#}",
+                            quic_auth_peer_stage_context(
+                                "QUIC agent server auth",
+                                remote,
+                                "accept_stream",
+                                stage_started,
+                            )
+                        );
                         connection.close(QUIC_AUTH_FAILED_CODE.into(), b"auth stream failed");
                         continue;
                     }
                     Err(_) => {
-                        eprintln!("quic-agent: timed out waiting for auth stream");
+                        eprintln!(
+                            "quic-agent: server auth failed: {} timed_out",
+                            quic_auth_peer_stage_context(
+                                "QUIC agent server auth",
+                                remote,
+                                "accept_stream",
+                                stage_started,
+                            )
+                        );
                         connection.close(QUIC_AUTH_FAILED_CODE.into(), b"auth timeout");
                         continue;
                     }
                 };
-            if let Err(err) = verify_quic_auth_token(&mut recv, &self.bootstrap.auth_token).await {
+            let stage_started = Instant::now();
+            if let Err(err) = verify_quic_auth_token(&mut recv, &self.bootstrap.auth_token)
+                .await
+                .with_context(|| {
+                    quic_auth_peer_stage_context(
+                        "QUIC agent server auth",
+                        remote,
+                        "read_token",
+                        stage_started,
+                    )
+                })
+            {
                 eprintln!("quic-agent: rejected unauthenticated connection: {err:#}");
                 connection.close(QUIC_AUTH_FAILED_CODE.into(), b"invalid auth token");
                 continue;
             }
-            write_quic_auth_ok(&mut send)
-                .await
-                .context("failed to acknowledge QUIC agent auth")?;
+            let stage_started = Instant::now();
+            write_quic_auth_ok(&mut send).await.with_context(|| {
+                quic_auth_peer_stage_context(
+                    "QUIC agent server auth",
+                    remote,
+                    "write_ack",
+                    stage_started,
+                )
+            })?;
             return Ok((
                 recv,
                 send,

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,6 +25,18 @@ impl std::error::Error for QuicAuthError {}
 pub(super) fn quic_auth_stage_context(label: &str, stage: &str, started: Instant) -> String {
     format!(
         "{label} stage={stage} elapsed_ms={}",
+        started.elapsed().as_millis()
+    )
+}
+
+pub(super) fn quic_auth_peer_stage_context(
+    label: &str,
+    remote: SocketAddr,
+    stage: &str,
+    started: Instant,
+) -> String {
+    format!(
+        "{label} remote={remote} stage={stage} elapsed_ms={}",
         started.elapsed().as_millis()
     )
 }
@@ -161,12 +174,76 @@ pub(super) async fn authenticate_quic_bridge_connection_on_server(
     connection: &quinn::Connection,
     expected_token: &[u8],
 ) -> Result<()> {
+    let remote = connection.remote_address();
+    let stage_started = Instant::now();
     let (mut send, mut recv) = tokio::time::timeout(QUIC_AUTH_TIMEOUT, connection.accept_bi())
         .await
-        .context("timed out waiting for native QUIC bridge auth stream")?
-        .context("failed to accept native QUIC bridge auth stream")?;
-    verify_quic_auth_token(&mut recv, expected_token).await?;
-    write_quic_auth_ok(&mut send).await?;
+        .with_context(|| {
+            format!(
+                "{} timed_out",
+                quic_auth_peer_stage_context(
+                    "native QUIC bridge server auth",
+                    remote,
+                    "accept_stream",
+                    stage_started,
+                )
+            )
+        })?
+        .with_context(|| {
+            format!(
+                "{} failed",
+                quic_auth_peer_stage_context(
+                    "native QUIC bridge server auth",
+                    remote,
+                    "accept_stream",
+                    stage_started,
+                )
+            )
+        })?;
+    let stage_started = Instant::now();
+    verify_quic_auth_token(&mut recv, expected_token)
+        .await
+        .with_context(|| {
+            quic_auth_peer_stage_context(
+                "native QUIC bridge server auth",
+                remote,
+                "read_token",
+                stage_started,
+            )
+        })?;
+    let stage_started = Instant::now();
+    write_quic_auth_ok(&mut send).await.with_context(|| {
+        quic_auth_peer_stage_context(
+            "native QUIC bridge server auth",
+            remote,
+            "write_ack",
+            stage_started,
+        )
+    })?;
     let _ = send.shutdown().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Instant;
+
+    use super::quic_auth_peer_stage_context;
+
+    #[test]
+    fn quic_auth_peer_stage_context_reports_remote_stage_and_elapsed() {
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)), 4444);
+        let detail = quic_auth_peer_stage_context(
+            "QUIC agent server auth",
+            remote,
+            "read_token",
+            Instant::now(),
+        );
+
+        assert!(detail.contains("QUIC agent server auth"));
+        assert!(detail.contains("remote=203.0.113.9:4444"));
+        assert!(detail.contains("stage=read_token"));
+        assert!(detail.contains("elapsed_ms="));
+    }
 }
