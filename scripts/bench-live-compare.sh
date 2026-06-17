@@ -504,6 +504,9 @@ start_rustle() {
   local cmd_env=()
   local cmd=("$RUSTLE_BIN_RESOLVED" -r "$REMOTE")
 
+  if [[ -n "${RUSTLE_HOTPATH_TRACE:-}" ]]; then
+    cmd_env+=(RUSTLE_HOTPATH_TRACE="$RUSTLE_HOTPATH_TRACE")
+  fi
   if [[ -n "${RUSTLE_AGENT_DIR:-}" ]]; then
     cmd_env+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")
   fi

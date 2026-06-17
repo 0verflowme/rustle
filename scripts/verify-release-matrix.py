@@ -24,6 +24,7 @@ LIVE_BENCH = REPO / "scripts" / "bench-live-compare.sh"
 LIVE_BENCH_ROWS = REPO / "scripts" / "verify-live-benchmark-rows.py"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
+HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
 RELEASE_ARCHIVES = REPO / "scripts" / "verify-release-archives.py"
 BRIDGE_BENCH = REPO / "scripts" / "bench-bridge-lab.sh"
 AGENT_UDP_BENCH = REPO / "scripts" / "bench-agent-udp-lab.sh"
@@ -714,6 +715,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     'cmd_env+=(RUSTLE_AGENT_DIR="$RUSTLE_AGENT_DIR")',
     "RUSTLE_BENCH_READY_METHOD",
     "probe_args+=(--head)",
+    "RUSTLE_HOTPATH_TRACE",
 ]
 
 REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
@@ -919,6 +921,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         VERIFY_LOCAL,
+        "summarize-hotpath-trace.py",
+    ),
+    (
+        VERIFY_LOCAL,
         "verify-live-benchmark-rows.py",
     ),
     (
@@ -1096,6 +1102,15 @@ REQUIRED_LIVE_FIXTURE_ROW_SNIPPETS = [
     "invalid live fixture benchmark row",
     "produced no benchmark rows",
     "produced invalid benchmark rows",
+    "--self-test",
+    "assert_rejects",
+]
+
+REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
+    "rustle_hotpath_tcp",
+    "paths",
+    "first_remote_p95_ms",
+    "avg_flow_throughput_mib_s",
     "--self-test",
     "assert_rejects",
 ]
@@ -1538,6 +1553,7 @@ def main() -> None:
     live_bench_rows = LIVE_BENCH_ROWS.read_text(encoding="utf-8")
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
+    hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
     release_archives = RELEASE_ARCHIVES.read_text(encoding="utf-8")
     smoke_lib = SMOKE_LIB.read_text(encoding="utf-8")
     tun_dns_smoke = TUN_DNS_SMOKE.read_text(encoding="utf-8")
@@ -1679,6 +1695,17 @@ def main() -> None:
         fail(
             "scripts/verify-live-fixture-rows.py is missing required snippets: "
             f"{missing_live_fixture_rows!r}"
+        )
+
+    missing_hotpath_trace_summary = [
+        snippet
+        for snippet in REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS
+        if snippet not in hotpath_trace_summary
+    ]
+    if missing_hotpath_trace_summary:
+        fail(
+            "scripts/summarize-hotpath-trace.py is missing required snippets: "
+            f"{missing_hotpath_trace_summary!r}"
         )
 
     missing_release_archives = [

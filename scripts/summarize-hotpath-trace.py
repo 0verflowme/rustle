@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Summarize opt-in Rustle TCP hotpath trace lines."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import pathlib
+import sys
+import tempfile
+
+
+TRACE_PREFIX = "rustle_hotpath_tcp"
+TIMING_FIELDS = (
+    "stream_ready_us",
+    "opened_us",
+    "first_local_us",
+    "first_local_sent_us",
+    "first_remote_us",
+    "duration_us",
+)
+SUCCESS_OUTCOMES = {
+    "closed",
+    "local_eof",
+    "remote_eof",
+    "remote_close",
+    "remote_stream_closed",
+}
+
+
+def percentile(values: list[int], percentile_value: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = int((len(ordered) * percentile_value + 99) // 100)
+    index = min(max(rank, 1), len(ordered)) - 1
+    return ordered[index]
+
+
+def format_ms(value_us: int | None) -> str:
+    if value_us is None:
+        return "-"
+    return f"{value_us / 1000:.3f}"
+
+
+def parse_optional_us(value: str) -> int | None:
+    if value == "-":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise SystemExit(f"invalid trace duration value {value!r}") from exc
+    if parsed < 0:
+        raise SystemExit(f"invalid negative trace duration value {value!r}")
+    return parsed
+
+
+def parse_trace_line(line: str) -> dict[str, str] | None:
+    parts = line.rstrip("\n").split("\t")
+    if not parts or parts[0] != TRACE_PREFIX:
+        return None
+    fields: dict[str, str] = {}
+    for item in parts[1:]:
+        if "=" not in item:
+            raise SystemExit(f"invalid hotpath trace field {item!r}")
+        key, value = item.split("=", 1)
+        fields[key] = value
+    required = {"transport", "flow", "generation", "local_bytes", "remote_bytes", "outcome"}
+    missing = sorted(required.difference(fields))
+    if missing:
+        raise SystemExit(f"hotpath trace line missing required fields {missing!r}: {line!r}")
+    for field in TIMING_FIELDS:
+        if field not in fields:
+            raise SystemExit(f"hotpath trace line missing {field}: {line!r}")
+        parse_optional_us(fields[field])
+    for field in ("local_bytes", "remote_bytes"):
+        try:
+            value = int(fields[field])
+        except ValueError as exc:
+            raise SystemExit(f"invalid hotpath byte count {fields[field]!r}") from exc
+        if value < 0:
+            raise SystemExit(f"invalid negative hotpath byte count {fields[field]!r}")
+    return fields
+
+
+def read_path(path: str) -> str:
+    if path == "-":
+        return sys.stdin.read()
+    return pathlib.Path(path).read_text(encoding="utf-8")
+
+
+def read_paths(paths: list[str]) -> str:
+    if not paths:
+        return sys.stdin.read()
+    return "\n".join(read_path(path) for path in paths)
+
+
+def summarize(text: str) -> list[dict[str, object]]:
+    by_transport: dict[str, list[dict[str, str]]] = collections.defaultdict(list)
+    for line in text.splitlines():
+        fields = parse_trace_line(line)
+        if fields is not None:
+            by_transport[fields["transport"]].append(fields)
+    if not by_transport:
+        raise SystemExit("no rustle_hotpath_tcp trace lines found")
+
+    summaries: list[dict[str, object]] = []
+    for transport, rows in sorted(by_transport.items()):
+        outcomes = collections.Counter(row["outcome"] for row in rows)
+        timing_values = {
+            field: [
+                value
+                for row in rows
+                if (value := parse_optional_us(row[field])) is not None
+            ]
+            for field in TIMING_FIELDS
+        }
+        remote_bytes = sum(int(row["remote_bytes"]) for row in rows)
+        local_bytes = sum(int(row["local_bytes"]) for row in rows)
+        duration_values = timing_values["duration_us"]
+        total_duration_us = sum(duration_values)
+        avg_flow_throughput = (
+            (remote_bytes / (1024 * 1024)) / (total_duration_us / 1_000_000)
+            if total_duration_us > 0
+            else 0.0
+        )
+        summaries.append(
+            {
+                "transport": transport,
+                "flows": len(rows),
+                "ok_flows": sum(outcomes[outcome] for outcome in SUCCESS_OUTCOMES),
+                "failed_flows": len(rows)
+                - sum(outcomes[outcome] for outcome in SUCCESS_OUTCOMES),
+                "local_bytes": local_bytes,
+                "remote_bytes": remote_bytes,
+                "stream_ready_p50_ms": format_ms(percentile(timing_values["stream_ready_us"], 50)),
+                "opened_p50_ms": format_ms(percentile(timing_values["opened_us"], 50)),
+                "first_local_p50_ms": format_ms(percentile(timing_values["first_local_us"], 50)),
+                "first_local_sent_p50_ms": format_ms(
+                    percentile(timing_values["first_local_sent_us"], 50)
+                ),
+                "first_remote_p50_ms": format_ms(percentile(timing_values["first_remote_us"], 50)),
+                "first_remote_p95_ms": format_ms(percentile(timing_values["first_remote_us"], 95)),
+                "duration_p50_ms": format_ms(percentile(duration_values, 50)),
+                "duration_p95_ms": format_ms(percentile(duration_values, 95)),
+                "avg_flow_throughput_mib_s": f"{avg_flow_throughput:.2f}",
+                "outcomes": ",".join(
+                    f"{outcome}:{count}" for outcome, count in sorted(outcomes.items())
+                ),
+            }
+        )
+    return summaries
+
+
+def print_summary(summaries: list[dict[str, object]]) -> None:
+    columns = (
+        "transport",
+        "flows",
+        "ok_flows",
+        "failed_flows",
+        "local_bytes",
+        "remote_bytes",
+        "stream_ready_p50_ms",
+        "opened_p50_ms",
+        "first_local_p50_ms",
+        "first_local_sent_p50_ms",
+        "first_remote_p50_ms",
+        "first_remote_p95_ms",
+        "duration_p50_ms",
+        "duration_p95_ms",
+        "avg_flow_throughput_mib_s",
+        "outcomes",
+    )
+    print("\t".join(columns))
+    for summary in summaries:
+        print("\t".join(str(summary[column]) for column in columns))
+
+
+def assert_rejects(contents: str, expected_message: str) -> None:
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8") as handle:
+        handle.write(contents)
+        handle.flush()
+        try:
+            summarize(pathlib.Path(handle.name).read_text(encoding="utf-8"))
+        except SystemExit as exc:
+            if expected_message not in str(exc):
+                raise AssertionError(
+                    f"expected {expected_message!r} in rejection, got {exc!s}"
+                ) from exc
+        else:
+            raise AssertionError("expected hotpath summary to reject sample")
+
+
+def self_test() -> None:
+    sample = "\n".join(
+        [
+            "unrelated log line",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\toutcome=remote_eof",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\toutcome=closed",
+            "rustle_hotpath_tcp\ttransport=quic-native\tflow=10.0.0.3:49154->198.18.77.77:80\tgeneration=1\tstream_ready_us=500\topened_us=1500\tfirst_local_us=-\tfirst_local_sent_us=-\tfirst_remote_us=-\tduration_us=2500\tlocal_bytes=0\tremote_bytes=0\toutcome=open_timeout",
+        ]
+    )
+    summaries = summarize(sample)
+    assert len(summaries) == 2
+    agent = next(summary for summary in summaries if summary["transport"] == "agent")
+    assert agent["flows"] == 2
+    assert agent["ok_flows"] == 2
+    assert agent["failed_flows"] == 0
+    assert agent["remote_bytes"] == 3072
+    assert agent["first_remote_p50_ms"] == "10.000"
+    assert agent["first_remote_p95_ms"] == "30.000"
+    assert agent["outcomes"] == "closed:1,remote_eof:1"
+    native = next(summary for summary in summaries if summary["transport"] == "quic-native")
+    assert native["failed_flows"] == 1
+    assert native["first_remote_p50_ms"] == "-"
+    assert native["outcomes"] == "open_timeout:1"
+
+    assert_rejects("", "no rustle_hotpath_tcp")
+    assert_rejects(
+        "rustle_hotpath_tcp\ttransport=agent\tflow=f\tgeneration=1\t"
+        "stream_ready_us=bad\topened_us=-\tfirst_local_us=-\t"
+        "first_local_sent_us=-\tfirst_remote_us=-\tduration_us=1\t"
+        "local_bytes=0\tremote_bytes=0\toutcome=closed\n",
+        "invalid trace duration",
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="*", help="Rustle stderr/log paths, or - for stdin")
+    parser.add_argument("--self-test", action="store_true", help="run parser self-test")
+    args = parser.parse_args()
+
+    if args.self_test:
+        self_test()
+        return
+    print_summary(summarize(read_paths(args.paths)))
+
+
+if __name__ == "__main__":
+    main()

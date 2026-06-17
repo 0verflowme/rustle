@@ -96,6 +96,7 @@ verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-matrix.py"
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/code-health.py" --top 25
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-benchmark-rows.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" --self-test
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/summarize-hotpath-trace.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-archives.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-windows-tun-smoke.py"
 for script in "${SCRIPT_DIR}"/*.sh; do
