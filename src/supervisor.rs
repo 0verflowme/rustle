@@ -17,6 +17,7 @@ use crate::tun_io::TunWriter;
 use crate::tunnel_lifecycle::ShutdownSignal;
 use crate::{ssh_bridge, tcp_core};
 
+mod events;
 mod prepare;
 #[cfg(test)]
 mod prepare_tests;
@@ -220,7 +221,8 @@ impl TunnelSupervisor {
                     let Some(event) = event else {
                         bail!("SSH bridge event channel closed");
                     };
-                    engine.handle_bridge_event_batch(
+                    events::handle_bridge_event_batch(
+                        engine,
                         event,
                         &mut event_rx,
                         &bridge_event_accounting,
