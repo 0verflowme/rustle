@@ -1,31 +1,37 @@
 use anyhow::{Context, Result};
+#[cfg(test)]
 use std::net::SocketAddr;
 
 use crate::agent_runtime::{self, AgentRuntimeConfig};
+#[cfg(test)]
 use crate::agent_transport::AgentTransport;
-use crate::quic_agent::{self, QuicAgentBootstrap, QuicAgentServer, QuicAgentSession};
+#[cfg(test)]
+use crate::quic_agent::QuicAgentBootstrap;
+use crate::quic_agent::QuicAgentServer;
+#[cfg(test)]
+use crate::quic_agent::QuicAgentSession;
 
+#[cfg(test)]
 pub(crate) struct QuicAgentClient {
-    session: QuicAgentSession,
+    _session: QuicAgentSession,
     pub(crate) transport: AgentTransport,
 }
 
-impl QuicAgentClient {
-    pub(crate) fn into_transport_and_session(self) -> (AgentTransport, QuicAgentSession) {
-        (self.transport, self.session)
-    }
-}
-
+#[cfg(test)]
 pub(crate) async fn connect_quic_agent(
     remote: SocketAddr,
     bootstrap: &QuicAgentBootstrap,
     mtu: u16,
 ) -> Result<QuicAgentClient> {
-    let (recv, send, session) = quic_agent::connect_quic_agent_stream(remote, bootstrap).await?;
+    let (recv, send, session) =
+        crate::quic_agent::connect_quic_agent_stream(remote, bootstrap).await?;
     let transport = AgentTransport::connect(recv, send, mtu)
         .await
         .context("failed to negotiate Rustle agent protocol over QUIC")?;
-    Ok(QuicAgentClient { session, transport })
+    Ok(QuicAgentClient {
+        _session: session,
+        transport,
+    })
 }
 
 pub(crate) async fn run_one(server: QuicAgentServer, config: AgentRuntimeConfig) -> Result<()> {
