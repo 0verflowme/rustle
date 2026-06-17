@@ -490,10 +490,10 @@ Required before tagging a release:
   Unix, the tunnel and capture loops must treat Ctrl-C, SIGTERM, and SIGHUP as
   graceful shutdown signals so normal route, DNS, TUN, local DNS proxy, and
   uploaded-agent cleanup guards can run; `unix_shutdown_signals_include_hangup_and_terminate`
-  must pass. `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits`
+  must pass. `uploaded_helper_command_keeps_staged_binary_until_last_lane_exits_for_each_kind`
   must also pass so the generated upload wrapper is proven to keep one staged
-  helper alive across concurrent initial agent lanes and remove it after the last
-  lane exits.
+  helper alive across concurrent initial helper lanes and remove it after the
+  last lane exits.
 - Uploaded-agent temp staging checks are covered before release:
   `remote_agent_upload_commands_stage_in_private_temp_dirs` and
   `posix_remote_agent_upload_command_creates_private_executable_file` must pass

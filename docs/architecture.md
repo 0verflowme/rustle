@@ -417,9 +417,10 @@ failure, timeout, or route/device shutdown.
   directory instead of executing unverified bytes.
   POSIX remotes use a shell upload/execution wrapper, while Windows remotes use
   PowerShell for platform probing, binary upload, execution, and cleanup.
-  `uploaded_agent_command_keeps_staged_binary_until_last_lane_exits` executes
-  the generated wrapper twice against a fake agent and proves the staged helper
-  stays present until the last lane exits, then removes both the helper and refs.
+  `uploaded_helper_command_keeps_staged_binary_until_last_lane_exits_for_each_kind`
+  executes the generated wrapper twice against fake helpers and proves the staged
+  helper stays present until the last lane exits, then removes both the helper
+  and refs.
   `uploaded_agent_cleanup_removes_unverified_posix_staging_tree` executes the
   verification-failure cleanup command against a fake unverified helper with a
   non-empty refs directory and proves the private staging tree is removed.
