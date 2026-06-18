@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use russh::client::Handle;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::task::JoinHandle;
 
 use crate::agent_bridge::{
     AgentBridgeConnectFuture, AgentBridgeConnectManyFuture, AgentBridgeConnector,
@@ -133,14 +134,40 @@ async fn connect_quic_agent_bridge_transport_on_handle(
         QUIC_AGENT_BOOTSTRAP_ROLE.label,
         started.reader,
     ));
-    let (recv, send, session) = connect_quic_data_plane_any(
+    let (recv, send, session) = match connect_quic_data_plane_any(
         QUIC_AGENT_BOOTSTRAP_ROLE.label,
         &started.remote_addrs,
         |remote_addr| quic_agent::connect_quic_agent_stream(remote_addr, &started.bootstrap),
     )
-    .await?;
+    .await
+    {
+        Ok(connected) => connected,
+        Err(err) => {
+            cleanup_failed_quic_helper_startup(
+                QUIC_AGENT_BOOTSTRAP_ROLE.label,
+                &handle,
+                drain_task,
+                "quic agent data-plane connect failed",
+            )
+            .await;
+            return Err(err);
+        }
+    };
     let remote_addrs = format_socket_addrs(&started.remote_addrs);
-    let transport = negotiate_quic_agent_transport(recv, send, mtu, &remote_addrs).await?;
+    let transport = match negotiate_quic_agent_transport(recv, send, mtu, &remote_addrs).await {
+        Ok(transport) => transport,
+        Err(err) => {
+            session.close(0, b"quic agent protocol negotiation failed");
+            cleanup_failed_quic_helper_startup(
+                QUIC_AGENT_BOOTSTRAP_ROLE.label,
+                &handle,
+                drain_task,
+                "quic agent protocol negotiation failed",
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     Ok(AgentBridgeTransport::quic(
         handle,
@@ -267,16 +294,50 @@ async fn connect_quic_native_bridge_on_handle(
         QUIC_NATIVE_BOOTSTRAP_ROLE.label,
         started.reader,
     ));
-    let client = connect_quic_data_plane_any(
+    let client = match connect_quic_data_plane_any(
         QUIC_NATIVE_BOOTSTRAP_ROLE.label,
         &started.remote_addrs,
         |remote_addr| quic_agent::connect_quic_bridge(remote_addr, &started.bootstrap),
     )
-    .await?;
+    .await
+    {
+        Ok(client) => client,
+        Err(err) => {
+            cleanup_failed_quic_helper_startup(
+                QUIC_NATIVE_BOOTSTRAP_ROLE.label,
+                &handle,
+                drain_task,
+                "native quic data-plane connect failed",
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     Ok(QuicNativeBridge::with_ssh_carrier(
         client, handle, drain_task,
     ))
+}
+
+async fn cleanup_failed_quic_helper_startup(
+    label: &'static str,
+    handle: &Handle<Client>,
+    drain_task: JoinHandle<()>,
+    reason: &str,
+) {
+    drain_task.abort();
+    match drain_task.await {
+        Ok(()) => {}
+        Err(err) if err.is_cancelled() => {}
+        Err(err) => eprintln!("{label}: SSH helper output task failed during cleanup: {err:#}"),
+    }
+
+    if let Err(err) = handle
+        .disconnect(russh::Disconnect::ByApplication, reason, "en")
+        .await
+    {
+        eprintln!("{label}: failed to disconnect SSH helper after failed startup: {err:#}");
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use russh::client::Handle;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 use crate::quic_agent;
+use crate::remote_platform::RemotePlatform;
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 
 use super::command::HelperCommandPlan;
@@ -53,10 +54,11 @@ pub(super) struct BootstrappedHelper {
 }
 
 impl BootstrappedHelper {
-    pub(super) fn into_connect_parts(self) -> (Handle<Client>, String, String) {
+    pub(super) fn into_connect_parts(self) -> (Handle<Client>, String, String, RemotePlatform) {
         let command = self.helper.command;
         let remote_path = self.helper.remote_path;
-        (self.handle, command, remote_path)
+        let platform = self.helper.platform;
+        (self.handle, command, remote_path, platform)
     }
 }
 

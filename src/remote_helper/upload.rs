@@ -68,8 +68,17 @@ pub(crate) fn uploaded_helper_command(
 
 fn uploaded_posix_helper_command(remote_path: &str, helper_subcommand: &str) -> String {
     let quoted_path = shell_quote(remote_path);
+    let runner = if helper_subcommand == HelperKind::StdioAgent.subcommand() {
+        format!(
+            "( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup_refs ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" {helper_subcommand}; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
+        )
+    } else {
+        format!(
+            "child=; owner_watcher=; stdin_watcher=; cleanup() {{ exec 3<&- 2>/dev/null || true; if [ -n \"${{owner_watcher:-}}\" ]; then kill \"$owner_watcher\" 2>/dev/null || true; fi; if [ -n \"${{stdin_watcher:-}}\" ]; then kill \"$stdin_watcher\" 2>/dev/null || true; fi; if [ -n \"${{child:-}}\" ] && kill -0 \"$child\" 2>/dev/null; then kill \"$child\" 2>/dev/null || true; wait \"$child\" 2>/dev/null || true; fi; cleanup_refs; }}; trap cleanup EXIT HUP INT TERM; exec 3<&0; \"$tmp\" {helper_subcommand} & child=$!; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; kill \"$child\" 2>/dev/null || true; cleanup_refs ) </dev/null >/dev/null 2>&1 & owner_watcher=$!; ( trap '' HUP; while IFS= read -r _; do :; done; kill \"$child\" 2>/dev/null || true ) <&3 >/dev/null 2>&1 & stdin_watcher=$!; exec 3<&-; wait \"$child\"; status=$?; trap - EXIT HUP INT TERM; kill \"$owner_watcher\" 2>/dev/null || true; kill \"$stdin_watcher\" 2>/dev/null || true; wait \"$owner_watcher\" 2>/dev/null || true; wait \"$stdin_watcher\" 2>/dev/null || true; cleanup_refs; exit \"$status\""
+        )
+    };
     format!(
-        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup_parent() {{ parent=${{tmp%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac; }}; cleanup() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi; }}; ( trap '' HUP; while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup ) </dev/null >/dev/null 2>&1 & trap cleanup EXIT HUP INT TERM; \"$tmp\" {helper_subcommand}; status=$?; trap - EXIT HUP INT TERM; cleanup; exit \"$status\""
+        "tmp={quoted_path}; refdir=\"$tmp.refs\"; marker=\"$refdir/$$\"; owner=$$; mkdir -p \"$refdir\"; : > \"$marker\"; cleanup_parent() {{ parent=${{tmp%/*}}; base=${{parent##*/}}; case \"$base\" in rustle-agent.*) rmdir \"$parent\" 2>/dev/null || true;; esac; }}; cleanup_refs() {{ rm -f \"$marker\"; for stale in \"$refdir\"/*; do [ -e \"$stale\" ] || continue; pid=${{stale##*/}}; case \"$pid\" in *[!0-9]*) continue;; esac; kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\"; done; if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi; }}; cleanup() {{ cleanup_refs; }}; {runner}"
     )
 }
 
@@ -180,7 +189,7 @@ async fn verify_uploaded_agent_binary(
     Ok(())
 }
 
-async fn cleanup_uploaded_agent_binary(
+pub(super) async fn cleanup_uploaded_agent_binary(
     handle: &Handle<Client>,
     remote_path: &str,
     platform: RemotePlatform,
@@ -297,8 +306,11 @@ mod tests {
         assert!(command.contains("rm -f \"$marker\""));
         assert!(command.contains("for stale in \"$refdir\"/*"));
         assert!(command.contains("kill -0 \"$pid\" 2>/dev/null || rm -f \"$stale\""));
-        assert!(command.contains("while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup"));
+        assert!(command
+            .contains("while kill -0 \"$owner\" 2>/dev/null; do sleep 1; done; cleanup_refs"));
+        assert!(!command.contains("stdin_watcher"));
         assert!(command.contains("cleanup_parent()"));
+        assert!(command.contains("cleanup_refs()"));
         assert!(command.contains("case \"$base\" in rustle-agent.*)"));
         assert!(command
             .contains("if rmdir \"$refdir\" 2>/dev/null; then rm -f \"$tmp\"; cleanup_parent; fi"));
@@ -372,6 +384,13 @@ mod tests {
             let command = uploaded_helper_command("/tmp/rustle-agent", platform, kind);
 
             assert!(command.contains(&format!("\"$tmp\" {subcommand}")));
+            if kind == HelperKind::StdioAgent {
+                assert!(!command.contains("stdin_watcher"));
+            } else {
+                assert!(command.contains("stdin_watcher"));
+                assert!(command.contains(&format!("\"$tmp\" {subcommand} & child=$!")));
+                assert!(command.contains("while IFS= read -r _; do :; done; kill \"$child\""));
+            }
         }
     }
 
@@ -836,6 +855,7 @@ mod tests {
                         Command::new("sh")
                             .arg("-c")
                             .arg(&command)
+                            .stdin(std::process::Stdio::piped())
                             .env("RUSTLE_FAKE_HELPER_SUBCOMMAND", kind.subcommand())
                             .env("RUSTLE_FAKE_AGENT_READY_DIR", &ready_dir)
                             .env("RUSTLE_FAKE_AGENT_RELEASE_DIR", &release_dir)
@@ -879,5 +899,141 @@ mod tests {
         ] {
             assert_refcounted_cleanup_for_kind(kind);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uploaded_quic_helper_command_kills_child_when_stdin_closes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        struct ChildGuard {
+            child: Option<std::process::Child>,
+        }
+
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                if let Some(child) = &mut self.child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        fn wait_for_one_file(dir: &Path) -> PathBuf {
+            let deadline = StdInstant::now() + Duration::from_secs(3);
+            loop {
+                let files = std::fs::read_dir(dir)
+                    .expect("read wait directory")
+                    .map(|entry| entry.expect("read wait entry").path())
+                    .collect::<Vec<_>>();
+                if let Some(path) = files.into_iter().next() {
+                    return path;
+                }
+                assert!(
+                    StdInstant::now() < deadline,
+                    "timed out waiting for one file in {}",
+                    dir.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn wait_for_child_exit(child: &mut std::process::Child) {
+            let deadline = StdInstant::now() + Duration::from_secs(3);
+            loop {
+                if child.try_wait().expect("poll child").is_some() {
+                    return;
+                }
+                assert!(
+                    StdInstant::now() < deadline,
+                    "timed out waiting for uploaded QUIC helper wrapper to exit"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn wait_for_absent(path: &Path) {
+            let deadline = StdInstant::now() + Duration::from_secs(3);
+            loop {
+                if !path.exists() {
+                    return;
+                }
+                assert!(
+                    StdInstant::now() < deadline,
+                    "timed out waiting for {} to be removed",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        let root = env::temp_dir().join(format!(
+            "rustle-uploaded-quic-stdin-test-{}-{:?}",
+            std::process::id(),
+            StdInstant::now()
+        ));
+        let temp = TempTree { path: root };
+        std::fs::create_dir_all(&temp.path).expect("create temp tree");
+        let ready_dir = temp.path.join("ready");
+        std::fs::create_dir(&ready_dir).expect("create ready dir");
+
+        let agent_path = temp.path.join("rustle-agent");
+        std::fs::write(
+            &agent_path,
+            "#!/bin/sh\n\
+             set -eu\n\
+             if [ \"${1:-}\" != quic-bridge-agent ]; then exit 64; fi\n\
+             : > \"$RUSTLE_FAKE_AGENT_READY_DIR/$$\"\n\
+             trap 'exit 0' TERM HUP INT\n\
+             while :; do sleep 0.05; done\n",
+        )
+        .expect("write fake uploaded helper");
+        let mut perms = std::fs::metadata(&agent_path)
+            .expect("fake helper metadata")
+            .permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&agent_path, perms).expect("chmod fake helper");
+
+        let command = uploaded_helper_command(
+            agent_path.to_str().expect("utf-8 temp path"),
+            RemotePlatform {
+                os: "linux",
+                arch: "x86_64",
+            },
+            HelperKind::QuicBridgeNative,
+        );
+        let mut wrapper = ChildGuard {
+            child: Some(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .stdin(std::process::Stdio::piped())
+                    .env("RUSTLE_FAKE_AGENT_READY_DIR", &ready_dir)
+                    .spawn()
+                    .expect("spawn uploaded QUIC helper wrapper"),
+            ),
+        };
+
+        let refdir = PathBuf::from(format!("{}.refs", agent_path.display()));
+        let _ready = wait_for_one_file(&ready_dir);
+        assert!(agent_path.exists(), "staged helper disappeared early");
+        assert!(refdir.exists(), "refdir should exist while helper runs");
+
+        let child = wrapper.child.as_mut().expect("wrapper child");
+        drop(child.stdin.take());
+        wait_for_child_exit(child);
+        wait_for_absent(&agent_path);
+        wait_for_absent(&refdir);
+        wrapper.child.take();
     }
 }

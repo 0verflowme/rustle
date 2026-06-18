@@ -695,6 +695,16 @@ by the SSH/framed-agent open round trip and scheduling between the local
 controller and remote helper after the optimistic open and first local payload
 have been sent.
 
+On the same `bugserver` host, `quic-native` is currently blocked by UDP
+reachability rather than local QUIC setup. A 2026-06-18 forced `quic-native`
+fixture attempt completed SSH bootstrap and emitted successful `client_bind`,
+`client_config`, and `connect_start` diagnostics for
+`10.158.153.122:34345`, then timed out after 15000 ms in the QUIC data-plane
+attempt. Raw UDP probes to the SSH host also timed out. The same run verified
+failed uploaded-helper cleanup: after the forced startup failure, the remote
+host had zero `/tmp/rustle-agent.*` directories and no lingering
+`rustle-agent`, `quic-agent`, or `quic-bridge-agent` helper processes.
+
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:
 

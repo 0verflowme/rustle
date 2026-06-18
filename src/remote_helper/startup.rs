@@ -3,11 +3,13 @@ use std::future::Future;
 use anyhow::{bail, Context, Result};
 use russh::client::Handle;
 
+use crate::remote_platform::RemotePlatform;
 use crate::ssh_control::{connect_prepared_ssh, Client, PreparedSshConnection};
 
 use super::bootstrap::{bootstrap_helper, BootstrappedHelper};
 use super::command::HelperCommandPlan;
 use super::kind::HelperKind;
+use super::upload::cleanup_uploaded_agent_binary;
 
 async fn connect_helper_with_upload_fallback<T, PrimaryFut, UploadFn, UploadFut>(
     helper_plan: &HelperCommandPlan,
@@ -106,11 +108,14 @@ where
 {
     ensure_helper_plan_kind(helper_plan, expected)?;
     let started: BootstrappedHelper = bootstrap_helper(prepared, helper_plan).await?;
-    let (handle, command, remote_path) = started.into_connect_parts();
-    let connected = connect(handle, command.clone())
-        .await
-        .with_context(|| expected.uploaded_start_context(&remote_path))?;
-    Ok((connected, command))
+    let (handle, command, remote_path, platform) = started.into_connect_parts();
+    match connect(handle, command.clone()).await {
+        Ok(connected) => Ok((connected, command)),
+        Err(err) => {
+            cleanup_failed_uploaded_helper(prepared, expected, &remote_path, platform).await;
+            Err(err).with_context(|| expected.uploaded_start_context(&remote_path))
+        }
+    }
 }
 
 fn ensure_helper_plan_kind(plan: &HelperCommandPlan, expected: HelperKind) -> Result<()> {
@@ -122,6 +127,45 @@ fn ensure_helper_plan_kind(plan: &HelperCommandPlan, expected: HelperKind) -> Re
         );
     }
     Ok(())
+}
+
+async fn cleanup_failed_uploaded_helper(
+    prepared: &PreparedSshConnection,
+    kind: HelperKind,
+    remote_path: &str,
+    platform: RemotePlatform,
+) {
+    match connect_prepared_ssh(prepared).await {
+        Ok(handle) => {
+            if let Err(err) = cleanup_uploaded_agent_binary(&handle, remote_path, platform).await {
+                eprintln!(
+                    "{}: failed to remove uploaded helper after failed startup {}: {err:#}",
+                    kind.controller_log_prefix(),
+                    remote_path
+                );
+            }
+            if let Err(err) = handle
+                .disconnect(
+                    russh::Disconnect::ByApplication,
+                    "uploaded helper cleanup done",
+                    "en",
+                )
+                .await
+            {
+                eprintln!(
+                    "{}: failed to disconnect uploaded-helper cleanup SSH session: {err:#}",
+                    kind.controller_log_prefix()
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "{}: failed to open SSH session for uploaded helper cleanup {}: {err:#}",
+                kind.controller_log_prefix(),
+                remote_path
+            );
+        }
+    }
 }
 
 #[cfg(test)]
