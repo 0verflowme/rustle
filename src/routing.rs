@@ -741,6 +741,22 @@ pub(crate) fn prefix_to_mask(prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(bits)
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn prefix_to_mask_has_exact_contiguous_prefix_bits() {
+        let prefix: u8 = kani::any();
+        kani::assume(prefix <= 32);
+
+        let mask = u32::from(prefix_to_mask(prefix));
+        assert_eq!(mask.count_ones(), u32::from(prefix));
+        assert_eq!(mask.leading_ones(), u32::from(prefix));
+        assert_eq!(mask.trailing_zeros(), 32 - u32::from(prefix));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};

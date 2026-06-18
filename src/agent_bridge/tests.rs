@@ -11,6 +11,29 @@ use bytes::Bytes;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
+fn tcp_open_for_primary_agent_lane(
+    mut open: agent_proto::AgentOpenIpv4,
+    lane_count: usize,
+    primary: usize,
+) -> agent_proto::AgentOpenIpv4 {
+    for _ in 0..4096 {
+        if agent_lane_candidates(
+            AgentOpenRequest::TcpIpv4 {
+                open,
+                mode: AgentTcpOpenMode::Strict,
+            }
+            .lane_hash(),
+            lane_count,
+        )
+        .0 == primary
+        {
+            return open;
+        }
+        open.originator_port = open.originator_port.wrapping_add(1);
+    }
+    panic!("could not find TCP open request for primary agent lane {primary}");
+}
+
 #[test]
 fn agent_lane_index_spreads_many_flows_across_pool() {
     let mut seen = std::collections::BTreeSet::new();
@@ -91,6 +114,13 @@ async fn agent_lane_selection_prefers_less_loaded_secondary_but_repairs_failed_p
     bridge.set_lane_load_for_test(0, 5);
     assert_eq!(bridge.choose_lane_index_for_test(0, 1).await, 1);
 
+    bridge.set_lane_load_for_test(1, 5);
+    assert_eq!(
+        bridge.choose_lane_index_for_test(0, 1).await,
+        0,
+        "equal candidate load should keep primary lane affinity"
+    );
+
     bridge.set_lane_load_for_test(1, 8);
     assert_eq!(bridge.choose_lane_index_for_test(0, 1).await, 0);
 
@@ -120,6 +150,37 @@ async fn agent_lane_selection_prefers_less_loaded_secondary_but_repairs_failed_p
             .expect("agent join")
             .expect("agent run");
     }
+}
+
+#[tokio::test]
+async fn agent_lane_selection_keeps_single_candidate_even_when_unhealthy() {
+    let (failed_transport, failed_agent) = agent_transport_pair().await;
+    let (healthy_transport, healthy_agent) = agent_transport_pair().await;
+
+    failed_agent.abort();
+    let _ = failed_agent.await;
+    wait_for_transport_failure(&failed_transport).await;
+
+    let bridge = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![
+            detached_bridge_transport(failed_transport),
+            detached_bridge_transport(healthy_transport),
+        ],
+    );
+
+    assert_eq!(
+        bridge.choose_lane_index_for_test(0, 0).await,
+        0,
+        "primary==secondary is already a deterministic affinity decision"
+    );
+
+    drop(bridge);
+    tokio::time::timeout(std::time::Duration::from_secs(1), healthy_agent)
+        .await
+        .expect("healthy agent exits")
+        .expect("healthy agent join")
+        .expect("healthy agent run");
 }
 
 #[tokio::test]
@@ -242,6 +303,140 @@ async fn alternate_lane_selection_scans_by_load_without_snapshot_vector() {
 }
 
 #[tokio::test]
+async fn alternate_lane_selection_ties_keep_lowest_lane_index() {
+    let (skipped_transport, skipped_agent) = agent_transport_pair().await;
+    let (first_transport, first_agent) = agent_transport_pair().await;
+    let (second_transport, second_agent) = agent_transport_pair().await;
+    let bridge = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![
+            detached_bridge_transport(skipped_transport),
+            detached_bridge_transport(first_transport),
+            detached_bridge_transport(second_transport),
+        ],
+    );
+
+    bridge.set_lane_load_for_test(1, 3);
+    bridge.set_lane_load_for_test(2, 3);
+    assert_eq!(
+        bridge.next_alternate_lane_index_for_test(0, 0),
+        Some(1),
+        "equal-load alternates should choose the lowest lane index deterministically"
+    );
+
+    drop(bridge);
+    for agent in [skipped_agent, first_agent, second_agent] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+    }
+}
+
+#[tokio::test]
+async fn best_available_lane_selection_skips_both_candidate_lanes_and_preserves_ties() {
+    let (first_skipped_transport, first_skipped_agent) = agent_transport_pair().await;
+    let (second_skipped_transport, second_skipped_agent) = agent_transport_pair().await;
+    let (first_candidate_transport, first_candidate_agent) = agent_transport_pair().await;
+    let (second_candidate_transport, second_candidate_agent) = agent_transport_pair().await;
+    let bridge = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![
+            detached_bridge_transport(first_skipped_transport),
+            detached_bridge_transport(second_skipped_transport),
+            detached_bridge_transport(first_candidate_transport),
+            detached_bridge_transport(second_candidate_transport),
+        ],
+    );
+
+    bridge.set_lane_load_for_test(0, 0);
+    bridge.set_lane_load_for_test(1, 0);
+    bridge.set_lane_load_for_test(2, 4);
+    bridge.set_lane_load_for_test(3, 4);
+
+    assert_eq!(
+        bridge.best_available_lane_index_except_for_test(0, 1).await,
+        Some(2),
+        "fallback scan must skip both original candidates and keep lowest-index tie"
+    );
+
+    drop(bridge);
+    for agent in [
+        first_skipped_agent,
+        second_skipped_agent,
+        first_candidate_agent,
+        second_candidate_agent,
+    ] {
+        tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+            .await
+            .expect("agent exits")
+            .expect("agent join")
+            .expect("agent run");
+    }
+}
+
+#[tokio::test]
+async fn agent_lane_lease_releases_reserved_load_on_drop() {
+    let (transport, agent) = agent_transport_pair().await;
+    let bridge = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![detached_bridge_transport(transport)],
+    );
+    let load = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    {
+        let _lease = AgentLaneLease::new(bridge.clone(), 0, std::sync::Arc::clone(&load));
+        assert_eq!(load.load(std::sync::atomic::Ordering::Acquire), 1);
+    }
+    assert_eq!(
+        load.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "dropping an unopened lane lease must release reserved load"
+    );
+
+    drop(bridge);
+    tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+        .await
+        .expect("agent exits")
+        .expect("agent join")
+        .expect("agent run");
+}
+
+#[test]
+fn agent_open_request_lane_hash_preserves_transport_affinity_inputs() {
+    let tcp_open = agent_proto::AgentOpenIpv4 {
+        destination_ip: Ipv4Addr::new(192, 0, 2, 10),
+        destination_port: 443,
+        originator_ip: DEFAULT_TUN_IP,
+        originator_port: 49152,
+    };
+    let host_open = agent_proto::AgentOpenHost {
+        destination_host: "example.internal".to_owned(),
+        destination_port: 443,
+        originator_ip: DEFAULT_TUN_IP,
+        originator_port: 49152,
+    };
+
+    assert_eq!(
+        AgentOpenRequest::TcpIpv4 {
+            open: tcp_open,
+            mode: AgentTcpOpenMode::Strict,
+        }
+        .lane_hash(),
+        agent_ipv4_lane_hash(&tcp_open, TCP_PROTOCOL_NUMBER)
+    );
+    assert_eq!(
+        AgentOpenRequest::UdpIpv4(tcp_open).lane_hash(),
+        agent_ipv4_lane_hash(&tcp_open, UDP_PROTOCOL_NUMBER)
+    );
+    assert_eq!(
+        AgentOpenRequest::TcpHost(host_open.clone()).lane_hash(),
+        agent_host_lane_hash(&host_open, TCP_PROTOCOL_NUMBER)
+    );
+}
+
+#[tokio::test]
 async fn background_lane_repair_requests_are_coalesced() {
     let (transport, agent) = agent_transport_pair().await;
     let bridge = ReconnectingAgentBridge::new(
@@ -315,7 +510,91 @@ async fn agent_bridge_stream_load_is_released_on_close() {
 
     stream.close().await.expect("close tracked stream");
     assert_eq!(bridge.lane_load_for_test(0), 0);
+    tokio::time::timeout(std::time::Duration::from_secs(1), server)
+        .await
+        .expect("TCP server should observe agent stream close")
+        .expect("TCP server join");
 
+    drop(bridge);
+    tokio::time::timeout(std::time::Duration::from_secs(1), agent)
+        .await
+        .expect("agent exits")
+        .expect("agent join")
+        .expect("agent run");
+}
+
+#[tokio::test]
+async fn agent_bridge_stream_metrics_and_try_recv_forward_frames() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind TCP target");
+    let destination = listener.local_addr().expect("TCP target address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+        let mut request = Vec::new();
+        socket
+            .read_to_end(&mut request)
+            .await
+            .expect("read request");
+        assert_eq!(request, b"metrics");
+        socket.write_all(b"ok").await.expect("write response");
+        socket.shutdown().await.expect("shutdown TCP stream");
+    });
+
+    let (transport, agent) = agent_transport_pair().await;
+    let bridge = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![detached_bridge_transport(transport)],
+    );
+    let destination = match destination {
+        std::net::SocketAddr::V4(addr) => addr,
+        std::net::SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+    };
+
+    let mut stream = bridge
+        .open_tcp_ipv4(agent_proto::AgentOpenIpv4 {
+            destination_ip: *destination.ip(),
+            destination_port: destination.port(),
+            originator_ip: DEFAULT_TUN_IP,
+            originator_port: 49152,
+        })
+        .await
+        .expect("open tracked agent stream");
+    let metrics = stream
+        .send_data_with_metrics(Bytes::from_static(b"metrics"))
+        .await
+        .expect("send request with metrics");
+    assert_eq!(metrics.frames, 1);
+    stream.send_eof().await.expect("send EOF");
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let mut response = Vec::new();
+        loop {
+            if let Some(frame) = stream.try_recv().await {
+                match frame.kind {
+                    agent_proto::AgentFrameKind::Data => {
+                        response.extend_from_slice(&frame.payload);
+                    }
+                    agent_proto::AgentFrameKind::Eof | agent_proto::AgentFrameKind::Close => {
+                        break response;
+                    }
+                    agent_proto::AgentFrameKind::Reset => {
+                        panic!("stream reset: {}", String::from_utf8_lossy(&frame.payload));
+                    }
+                    _ => {}
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    })
+    .await
+    .expect("try_recv should observe response frames");
+    assert_eq!(response, b"ok");
+
+    drop(stream);
     drop(bridge);
     tokio::time::timeout(std::time::Duration::from_secs(1), agent)
         .await
@@ -894,6 +1173,134 @@ async fn reconnecting_agent_repairs_failed_alternate_lane_after_primary_reconnec
         .expect("replacement agent exits")
         .expect("replacement agent join")
         .expect("replacement agent run");
+    server.await.expect("TCP server join");
+}
+
+#[tokio::test]
+async fn reconnecting_agent_skips_failed_alternate_and_uses_next_lane() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind TCP target");
+    let destination = listener.local_addr().expect("TCP target address");
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept TCP stream");
+        let mut request = Vec::new();
+        socket
+            .read_to_end(&mut request)
+            .await
+            .expect("read request");
+        assert_eq!(request, b"skip-failed-alt");
+        socket
+            .write_all(b"next-alt:pong")
+            .await
+            .expect("write response");
+        socket.shutdown().await.expect("shutdown TCP stream");
+    });
+
+    let (dying_primary_transport, dying_primary_agent) =
+        agent_transport_closes_after_first_open().await;
+
+    let (failed_first_alternate_transport, failed_first_alternate_agent) =
+        agent_transport_pair().await;
+    failed_first_alternate_agent.abort();
+    let _ = failed_first_alternate_agent.await;
+    wait_for_transport_failure(&failed_first_alternate_transport).await;
+
+    let (healthy_second_alternate_transport, healthy_second_alternate_agent) =
+        agent_transport_pair().await;
+    let connector =
+        QueuedAgentConnector::new_with_primary_failures("rustle agent", Vec::new(), Vec::new(), 2);
+    let bridge = ReconnectingAgentBridge::new(
+        connector,
+        vec![
+            AgentBridgeTransport::detached_for_test(
+                dying_primary_transport,
+                "rustle agent".to_owned(),
+            ),
+            AgentBridgeTransport::detached_for_test(
+                failed_first_alternate_transport,
+                "rustle agent".to_owned(),
+            ),
+            AgentBridgeTransport::detached_for_test(
+                healthy_second_alternate_transport,
+                "rustle agent".to_owned(),
+            ),
+        ],
+    );
+    bridge.set_lane_load_for_test(1, 0);
+    bridge.set_lane_load_for_test(2, 4);
+
+    let destination = match destination {
+        std::net::SocketAddr::V4(addr) => addr,
+        std::net::SocketAddr::V6(_) => panic!("test listener should be IPv4"),
+    };
+    let open = agent_proto::AgentOpenIpv4 {
+        destination_ip: *destination.ip(),
+        destination_port: destination.port(),
+        originator_ip: DEFAULT_TUN_IP,
+        originator_port: 49152,
+    };
+    let open = tcp_open_for_primary_agent_lane(open, 3, 0);
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        bridge.open_tcp_ipv4(open),
+    )
+    .await
+    .expect("alternate scan should not stall on failed lower-load lane")
+    .expect("open stream on second alternate lane");
+    stream
+        .send_data(Bytes::from_static(b"skip-failed-alt"))
+        .await
+        .expect("send request");
+    stream.send_eof().await.expect("send EOF");
+
+    let mut response = Vec::new();
+    let mut saw_eof = false;
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await
+            .expect("receive agent frame")
+            .expect("agent stream frame");
+        match frame.kind {
+            agent_proto::AgentFrameKind::Data => response.extend_from_slice(&frame.payload),
+            agent_proto::AgentFrameKind::Eof => saw_eof = true,
+            agent_proto::AgentFrameKind::Close => break,
+            agent_proto::AgentFrameKind::Reset => {
+                panic!(
+                    "second alternate lane stream reset: {}",
+                    String::from_utf8_lossy(&frame.payload)
+                );
+            }
+            other => panic!("unexpected agent frame {other:?}"),
+        }
+    }
+    assert!(saw_eof);
+    assert_eq!(response, b"next-alt:pong");
+    assert_eq!(
+        bridge.reconnect_snapshot(),
+        AgentReconnectSnapshot {
+            attempts: 2,
+            successes: 0,
+            failures: 2,
+        }
+    );
+
+    drop(stream);
+    drop(bridge);
+    dying_primary_agent
+        .await
+        .expect("dying primary fake agent join");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        healthy_second_alternate_agent,
+    )
+    .await
+    .expect("healthy second alternate agent exits")
+    .expect("healthy second alternate agent join")
+    .expect("healthy second alternate agent run");
     server.await.expect("TCP server join");
 }
 

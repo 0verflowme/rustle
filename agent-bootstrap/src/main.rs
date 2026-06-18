@@ -2,10 +2,16 @@ use std::env;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+#[allow(dead_code)]
 #[path = "../../src/agent_proto.rs"]
 mod agent_proto;
+#[allow(dead_code)]
+#[path = "../../src/agent_io.rs"]
+mod agent_io;
 #[path = "../../src/agent_runtime.rs"]
 mod agent_runtime;
+#[path = "../../src/agent_window.rs"]
+mod agent_window;
 
 const DEFAULT_MTU: u16 = 1300;
 

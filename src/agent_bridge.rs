@@ -476,7 +476,10 @@ impl ReconnectingAgentBridge {
     ) -> Result<AgentBridgeStream> {
         let mut last_err = original_err;
         let mut tried_lanes = 0_u64;
-        while let Some(lane) = self.next_alternate_lane_by_load(skipped_index, tried_lanes) {
+        for _ in 0..self.lanes.len().saturating_sub(1) {
+            let Some(lane) = self.next_alternate_lane_by_load(skipped_index, tried_lanes) else {
+                break;
+            };
             tried_lanes |= agent_lane_bit(lane.index);
             let transport = match self.alternate_transport_or_repair(lane).await {
                 Ok(Some(transport)) => transport,
@@ -760,6 +763,16 @@ impl ReconnectingAgentBridge {
     ) -> Option<usize> {
         self.next_alternate_lane_by_load(skipped_index, tried_lanes)
             .map(|lane| lane.index)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn best_available_lane_index_except_for_test(
+        &self,
+        first_skipped: usize,
+        second_skipped: usize,
+    ) -> Option<usize> {
+        self.best_available_lane_index_except(first_skipped, second_skipped)
+            .await
     }
 
     #[cfg(test)]

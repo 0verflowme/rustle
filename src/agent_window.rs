@@ -79,6 +79,39 @@ impl Default for AgentCreditWindow {
     }
 }
 
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(8)]
+    fn record_consumed_keeps_window_within_configured_bounds() {
+        let first: u32 = kani::any();
+        let second: u32 = kani::any();
+        kani::assume(first <= (AGENT_STREAM_MAX_WINDOW_BYTES * 2) as u32);
+        kani::assume(second <= (AGENT_STREAM_MAX_WINDOW_BYTES * 2) as u32);
+
+        let mut window = AgentCreditWindow::new();
+        let _ = window.record_consumed(first as usize);
+        assert!(window.current_window >= AGENT_STREAM_INITIAL_WINDOW_BYTES);
+        assert!(window.current_window <= AGENT_STREAM_MAX_WINDOW_BYTES);
+
+        let _ = window.record_consumed(second as usize);
+        assert!(window.current_window >= AGENT_STREAM_INITIAL_WINDOW_BYTES);
+        assert!(window.current_window <= AGENT_STREAM_MAX_WINDOW_BYTES);
+        assert!(window.pending_credit <= (u32::MAX as usize));
+    }
+
+    #[kani::proof]
+    fn zero_consumption_does_not_change_credit_window() {
+        let mut window = AgentCreditWindow::new();
+        let before = window.clone();
+
+        assert!(window.record_consumed(0).is_none());
+        assert_eq!(window, before);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

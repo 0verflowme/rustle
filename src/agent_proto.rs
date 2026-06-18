@@ -39,21 +39,26 @@ impl TryFrom<u8> for AgentFrameKind {
     type Error = anyhow::Error;
 
     fn try_from(value: u8) -> Result<Self> {
-        match value {
-            1 => Ok(Self::Hello),
-            2 => Ok(Self::OpenTcp),
-            3 => Ok(Self::OpenUdp),
-            4 => Ok(Self::Data),
-            5 => Ok(Self::Window),
-            6 => Ok(Self::Eof),
-            7 => Ok(Self::Close),
-            8 => Ok(Self::Reset),
-            9 => Ok(Self::Opened),
-            10 => Ok(Self::Ping),
-            11 => Ok(Self::Pong),
-            12 => Ok(Self::OpenTcpHost),
-            _ => bail!("unknown agent frame kind {value}"),
-        }
+        agent_frame_kind_from_wire(value)
+            .ok_or_else(|| anyhow::anyhow!("unknown agent frame kind {value}"))
+    }
+}
+
+fn agent_frame_kind_from_wire(value: u8) -> Option<AgentFrameKind> {
+    match value {
+        1 => Some(AgentFrameKind::Hello),
+        2 => Some(AgentFrameKind::OpenTcp),
+        3 => Some(AgentFrameKind::OpenUdp),
+        4 => Some(AgentFrameKind::Data),
+        5 => Some(AgentFrameKind::Window),
+        6 => Some(AgentFrameKind::Eof),
+        7 => Some(AgentFrameKind::Close),
+        8 => Some(AgentFrameKind::Reset),
+        9 => Some(AgentFrameKind::Opened),
+        10 => Some(AgentFrameKind::Ping),
+        11 => Some(AgentFrameKind::Pong),
+        12 => Some(AgentFrameKind::OpenTcpHost),
+        _ => None,
     }
 }
 
@@ -425,6 +430,24 @@ fn validate_agent_host(host: &str) -> Result<()> {
         bail!("agent host open destination must not contain NUL bytes");
     }
     Ok(())
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn frame_kind_decode_accepts_only_defined_wire_values() {
+        let wire: u8 = kani::any();
+        let decoded = agent_frame_kind_from_wire(wire);
+
+        if (1..=12).contains(&wire) {
+            let kind = decoded.expect("defined wire value must decode");
+            assert_eq!(kind as u8, wire);
+        } else {
+            assert!(decoded.is_none());
+        }
+    }
 }
 
 #[cfg(test)]

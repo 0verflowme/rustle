@@ -1,0 +1,9 @@
+warning: async function has 127 code lines; split state transitions and I/O actions below 120
+  --> $DIR/main.rs:3:1
+   |
+LL | async fn oversized_async_state_machine() {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(oversized_async_state_machine)]` on by default
+
+warning: 1 warning emitted
