@@ -8,6 +8,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
+mod failure;
 mod heartbeat;
 mod reader_task;
 mod writer_metrics;
@@ -20,6 +21,9 @@ use crate::agent_proto::{
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
+use failure::{ensure_agent_ready, mark_agent_failed};
+#[cfg(test)]
+use failure::{truncate_reset_message, AGENT_STREAM_RESET_BYTES};
 use heartbeat::{run_agent_heartbeat, AgentHeartbeat};
 #[cfg(test)]
 use reader_task::dispatch_agent_frame;
@@ -30,7 +34,6 @@ use writer_task::{write_agent_frame, write_agent_frames};
 
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
-const AGENT_STREAM_RESET_BYTES: usize = 512;
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const _: () = assert!(
@@ -690,59 +693,6 @@ where
         .await?;
     *inbound = frame_reader.into_input();
     Ok(frame)
-}
-
-async fn reset_all_streams(streams: &StreamMap, message: String) {
-    let entries: Vec<(u64, StreamEntry)> = {
-        let mut streams = streams.lock().await;
-        streams.drain().collect()
-    };
-    let payload = Bytes::copy_from_slice(truncate_reset_message(&message).as_bytes());
-
-    for (stream_id, entry) in entries {
-        entry.send_credit.close();
-        let _ = entry.inbound.try_send(
-            AgentFrame::new(AgentFrameKind::Reset, stream_id, payload.clone())
-                .expect("reset frame payload is bounded"),
-        );
-    }
-}
-
-async fn mark_agent_failed(failure: &FailureState, streams: &StreamMap, message: String) {
-    let should_reset = {
-        let mut failure = failure.lock().await;
-        if failure.is_some() {
-            false
-        } else {
-            *failure = Some(message.clone());
-            true
-        }
-    };
-
-    if should_reset {
-        reset_all_streams(streams, message).await;
-    }
-}
-
-async fn ensure_agent_ready(failure: &FailureState) -> Result<()> {
-    if let Some(message) = failure.lock().await.clone() {
-        bail!("agent transport closed: {message}");
-    }
-    Ok(())
-}
-
-fn truncate_reset_message(message: &str) -> String {
-    if message.len() <= AGENT_STREAM_RESET_BYTES {
-        return message.to_owned();
-    }
-    let mut truncated = String::with_capacity(AGENT_STREAM_RESET_BYTES);
-    for ch in message.chars() {
-        if truncated.len() + ch.len_utf8() > AGENT_STREAM_RESET_BYTES {
-            break;
-        }
-        truncated.push(ch);
-    }
-    truncated
 }
 
 #[cfg(test)]
