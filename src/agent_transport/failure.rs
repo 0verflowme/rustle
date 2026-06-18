@@ -15,10 +15,9 @@ async fn reset_all_streams(streams: &StreamMap, message: String) {
 
     for (stream_id, entry) in entries {
         entry.send_credit.close();
-        let _ = entry.inbound.try_send(
-            AgentFrame::new(AgentFrameKind::Reset, stream_id, payload.clone())
-                .expect("reset frame payload is bounded"),
-        );
+        if let Ok(frame) = AgentFrame::new(AgentFrameKind::Reset, stream_id, payload.clone()) {
+            let _ = entry.inbound.try_send(frame);
+        }
     }
 }
 

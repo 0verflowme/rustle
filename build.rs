@@ -5,10 +5,10 @@ use std::path::PathBuf;
 const PE_MACHINE_AMD64: u16 = 0x8664;
 const PE_MACHINE_ARM64: u16 = 0xaa64;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-env-changed=RUSTLE_EMBED_WINTUN_DLL");
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR must be set")?);
     let generated = out_dir.join("embedded_wintun.rs");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -40,7 +40,8 @@ fn main() {
         None => "#[cfg_attr(not(windows), allow(dead_code))]\npub(crate) static EMBEDDED_WINTUN_DLL: Option<&'static [u8]> = None;\n".to_owned(),
     };
 
-    fs::write(generated, contents).expect("failed to write generated embedded_wintun.rs");
+    fs::write(generated, contents)?;
+    Ok(())
 }
 
 fn validate_embedded_wintun_arch(bytes: &[u8], target_arch: &str, source: &str) {

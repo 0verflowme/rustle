@@ -265,12 +265,10 @@ fn execute_udp_ingress_packet(
 }
 
 fn udp_transport(data_plane: &Arc<dyn DataPlane>) -> Option<UdpAssociationTransportPlan> {
-    data_plane.caps().udp_associations.then(|| {
-        let label = data_plane
-            .udp_label()
-            .expect("UDP-capable data plane must provide a UDP label");
-        UdpAssociationTransportPlan::new(label)
-    })
+    if !data_plane.caps().udp_associations {
+        return None;
+    }
+    data_plane.udp_label().map(UdpAssociationTransportPlan::new)
 }
 
 struct TcpBridgeRuntime<'a> {
@@ -366,4 +364,78 @@ async fn execute_tick(
         tcp::BridgeEventSink::new(event_tx, bridge_event_accounting),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_plane::{DataPlaneSnapshotFuture, OpenTcpFuture, OpenUdpFuture};
+    use crate::transport_model::{
+        BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneRuntimeSnapshot,
+        DataPlaneTcpOpen, DataPlaneTcpOpenMode,
+    };
+
+    struct FakeDataPlane {
+        udp_associations: bool,
+        udp_label: Option<&'static str>,
+    }
+
+    impl DataPlane for FakeDataPlane {
+        fn label(&self) -> &'static str {
+            "fake"
+        }
+
+        fn udp_label(&self) -> Option<&'static str> {
+            self.udp_label
+        }
+
+        fn caps(&self) -> DataPlaneCaps {
+            DataPlaneCaps {
+                udp_associations: self.udp_associations,
+            }
+        }
+
+        fn admission_limits(&self) -> BridgeAdmissionLimits {
+            BridgeAdmissionLimits::agent()
+        }
+
+        fn snapshot(&self) -> DataPlaneSnapshotFuture<'_> {
+            Box::pin(async { DataPlaneRuntimeSnapshot::default() })
+        }
+
+        fn open_tcp(
+            &self,
+            _open: DataPlaneTcpOpen,
+            _mode: DataPlaneTcpOpenMode,
+        ) -> OpenTcpFuture<'static> {
+            Box::pin(async { panic!("fake data plane open_tcp should not be called") })
+        }
+
+        fn open_udp_ipv4(&self, _open: DataPlaneIpv4Open) -> OpenUdpFuture<'static> {
+            Box::pin(async { panic!("fake data plane open_udp_ipv4 should not be called") })
+        }
+    }
+
+    #[test]
+    fn udp_transport_returns_expected_label_for_udp_capable_data_plane() {
+        let data_plane: Arc<dyn DataPlane> = Arc::new(FakeDataPlane {
+            udp_associations: true,
+            udp_label: Some("fake-udp"),
+        });
+
+        let transport =
+            udp_transport(&data_plane).expect("UDP-capable data plane should plan UDP transport");
+
+        assert_eq!("fake-udp", transport.label);
+    }
+
+    #[test]
+    fn udp_transport_returns_none_for_non_udp_data_plane() {
+        let data_plane: Arc<dyn DataPlane> = Arc::new(FakeDataPlane {
+            udp_associations: false,
+            udp_label: Some("ignored-udp"),
+        });
+
+        assert!(udp_transport(&data_plane).is_none());
+    }
 }

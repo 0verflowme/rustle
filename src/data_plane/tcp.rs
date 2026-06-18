@@ -537,7 +537,7 @@ async fn coalesce_remote_data(
 
 fn join_remote_data_chunks(mut chunks: Vec<Bytes>, total_bytes: usize) -> Bytes {
     if chunks.len() == 1 {
-        return chunks.pop().expect("remote data chunks must not be empty");
+        return chunks.pop().unwrap_or_default();
     }
     let mut output = BytesMut::with_capacity(total_bytes);
     for chunk in chunks {

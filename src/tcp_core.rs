@@ -246,11 +246,15 @@ impl FlowManager {
         config.random_seed = 0x5255_5354_4c45;
 
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
+        let mut ip_addr_inserted = true;
         iface.update_ip_addrs(|ip_addrs| {
-            ip_addrs
+            ip_addr_inserted = ip_addrs
                 .push(IpCidr::new(IpAddress::from(tun_ip), tun_prefix))
-                .expect("smoltcp default IP address storage must fit one IPv4 address");
+                .is_ok();
         });
+        if !ip_addr_inserted {
+            bail!("failed to add TUN IP address to smoltcp interface");
+        }
         let mut route_error = None;
         iface.routes_mut().update(|routes| {
             for route_cidr in route_cidrs {

@@ -127,45 +127,45 @@ impl DataPlane for DirectTcpipDataPlane {
         Box::pin(async move {
             let destination_label = open.destination_label();
             let channel = match open {
-                DataPlaneTcpOpen::Ipv4(open) if open.flow_generation.is_some() => {
-                    let flow = tcp_core::FlowKey::tcp(
-                        open.originator_ip,
-                        open.originator_port,
-                        open.destination_ip,
-                        open.destination_port,
-                    );
-                    let id = tcp_core::FlowId::new(
-                        flow,
-                        open.flow_generation.expect("checked flow generation"),
-                    );
-                    tokio::time::timeout(
-                        flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
-                        ssh.open_direct_tcpip_for_flow(id),
-                    )
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                            flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                DataPlaneTcpOpen::Ipv4(open) => {
+                    if let Some(flow_generation) = open.flow_generation {
+                        let flow = tcp_core::FlowKey::tcp(
+                            open.originator_ip,
+                            open.originator_port,
+                            open.destination_ip,
+                            open.destination_port,
+                        );
+                        let id = tcp_core::FlowId::new(flow, flow_generation);
+                        tokio::time::timeout(
+                            flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                            ssh.open_direct_tcpip_for_flow(id),
                         )
-                    })??
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                                flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                            )
+                        })??
+                    } else {
+                        tokio::time::timeout(
+                            flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                            ssh.open_background_direct_tcpip(
+                                open.destination_ip.to_string(),
+                                u32::from(open.destination_port),
+                                open.originator_ip.to_string(),
+                                u32::from(open.originator_port),
+                            ),
+                        )
+                        .await
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "timed out after {}ms opening direct-tcpip stream to {destination_label}",
+                                flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                            )
+                        })??
+                    }
                 }
-                DataPlaneTcpOpen::Ipv4(open) => tokio::time::timeout(
-                    flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
-                    ssh.open_background_direct_tcpip(
-                        open.destination_ip.to_string(),
-                        u32::from(open.destination_port),
-                        open.originator_ip.to_string(),
-                        u32::from(open.originator_port),
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                        flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
-                    )
-                })??,
                 DataPlaneTcpOpen::Host {
                     destination_host,
                     destination_port,

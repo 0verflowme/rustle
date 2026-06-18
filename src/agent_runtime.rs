@@ -934,17 +934,14 @@ async fn send_tcp_opened_frame(
     stream_id: u64,
     remote_connect_elapsed: Option<Duration>,
 ) -> Result<()> {
-    send_agent_frame(
-        out_tx,
-        AgentFrame::new(
-            AgentFrameKind::Opened,
-            stream_id,
-            opened_timing_payload(remote_connect_elapsed),
-        )
-        .expect("opened frame")
-        .with_credit(AgentCreditWindow::initial_credit() as u32),
+    let frame = AgentFrame::new(
+        AgentFrameKind::Opened,
+        stream_id,
+        opened_timing_payload(remote_connect_elapsed),
     )
-    .await
+    .context("failed to build TCP opened frame")?
+    .with_credit(AgentCreditWindow::initial_credit() as u32);
+    send_agent_frame(out_tx, frame).await
 }
 
 async fn run_tcp_output_loop(
@@ -963,12 +960,19 @@ async fn run_tcp_output_loop(
         match reader.read(&mut read_buf).await {
             Ok(0) => {
                 output_timing.record_remote_read_wait(read_started_at);
-                let _ = send_agent_frame(
-                    out_tx,
-                    AgentFrame::new(AgentFrameKind::Eof, stream_id, output_timing.encode())
-                        .expect("eof frame"),
-                )
-                .await;
+                match AgentFrame::new(AgentFrameKind::Eof, stream_id, output_timing.encode()) {
+                    Ok(frame) => {
+                        let _ = send_agent_frame(out_tx, frame).await;
+                    }
+                    Err(err) => {
+                        let _ = send_reset(
+                            out_tx,
+                            stream_id,
+                            &format!("failed to build TCP EOF frame: {err}"),
+                        )
+                        .await;
+                    }
+                }
                 break;
             }
             Ok(len) => {
@@ -981,11 +985,19 @@ async fn run_tcp_output_loop(
                 };
                 output_timing.record_output_credit_wait(credit_started_at);
                 let send_started_at = Instant::now();
-                let send_result = send_agent_frame(
-                    out_tx,
-                    AgentFrame::new(AgentFrameKind::Data, stream_id, bytes).expect("data frame"),
-                )
-                .await;
+                let frame = match AgentFrame::new(AgentFrameKind::Data, stream_id, bytes) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        let _ = send_reset(
+                            out_tx,
+                            stream_id,
+                            &format!("failed to build TCP data frame: {err}"),
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                let send_result = send_agent_frame(out_tx, frame).await;
                 output_timing.record_output_send_wait(send_started_at);
                 if send_result.is_err() {
                     break;
@@ -1014,11 +1026,9 @@ async fn close_tcp_connected_stream(
     writer_task: JoinHandle<()>,
 ) {
     writer_task.abort();
-    let _ = send_agent_frame(
-        out_tx,
-        AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()).expect("empty frame"),
-    )
-    .await;
+    if let Ok(frame) = AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()) {
+        let _ = send_agent_frame(out_tx, frame).await;
+    }
 }
 
 fn opened_timing_payload(remote_connect_elapsed: Option<Duration>) -> Bytes {
@@ -1082,15 +1092,19 @@ async fn run_udp_stream_inner(
         return;
     }
 
-    if send_agent_frame(
-        &out_tx,
-        AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
-            .expect("empty frame")
-            .with_credit(AgentCreditWindow::initial_credit() as u32),
-    )
-    .await
-    .is_err()
-    {
+    let opened = match AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new()) {
+        Ok(frame) => frame.with_credit(AgentCreditWindow::initial_credit() as u32),
+        Err(err) => {
+            let _ = send_reset(
+                &out_tx,
+                stream_id,
+                &format!("failed to build UDP opened frame: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if send_agent_frame(&out_tx, opened).await.is_err() {
         return;
     }
 
@@ -1133,13 +1147,19 @@ async fn run_udp_stream_inner(
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                if send_agent_frame(
-                    &out_tx,
-                    AgentFrame::new(AgentFrameKind::Data, stream_id, bytes).expect("data frame"),
-                )
-                .await
-                .is_err()
-                {
+                let frame = match AgentFrame::new(AgentFrameKind::Data, stream_id, bytes) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        let _ = send_reset(
+                            &out_tx,
+                            stream_id,
+                            &format!("failed to build UDP data frame: {err}"),
+                        )
+                        .await;
+                        break;
+                    }
+                };
+                if send_agent_frame(&out_tx, frame).await.is_err() {
                     break;
                 }
                 permit.forget();
@@ -1158,11 +1178,9 @@ async fn run_udp_stream_inner(
     }
 
     writer_task.abort();
-    let _ = send_agent_frame(
-        &out_tx,
-        AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()).expect("empty frame"),
-    )
-    .await;
+    if let Ok(frame) = AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()) {
+        let _ = send_agent_frame(&out_tx, frame).await;
+    }
 }
 
 async fn yield_after_output_data_frame(budget: &mut OutputProducerYieldBudget) {

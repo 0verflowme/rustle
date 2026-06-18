@@ -59,8 +59,16 @@ pub(crate) fn expand_target_routes(targets: &[Ipv4Net]) -> Result<Vec<Ipv4Net>> 
     let mut expanded = Vec::with_capacity(targets.len().saturating_add(1));
     for target in targets {
         if target.prefix_len() == 0 {
-            expanded.push("0.0.0.0/1".parse().expect("valid split default route"));
-            expanded.push("128.0.0.0/1".parse().expect("valid split default route"));
+            expanded.push(
+                "0.0.0.0/1"
+                    .parse()
+                    .context("failed to construct first split default route")?,
+            );
+            expanded.push(
+                "128.0.0.0/1"
+                    .parse()
+                    .context("failed to construct second split default route")?,
+            );
         } else if !expanded.contains(target) {
             expanded.push(*target);
         }
@@ -715,7 +723,7 @@ pub(crate) fn windows_control_route_command(
         .ok_or_else(|| anyhow!("Windows control route requires a next hop"))?;
     Ok(windows_route_command(
         action,
-        Ipv4Net::new(target, 32).expect("host route prefix is valid"),
+        Ipv4Net::new(target, 32).context("failed to construct Windows host route prefix")?,
         if_index,
         gateway,
     ))

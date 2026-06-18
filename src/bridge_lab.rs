@@ -151,9 +151,7 @@ pub(crate) fn bridge_lab_latency_percentiles(latencies_us: &mut [u128]) -> Bridg
     BridgeLabLatencySummary {
         p50_us: percentile_nearest_rank(latencies_us, 50),
         p95_us: percentile_nearest_rank(latencies_us, 95),
-        max_us: *latencies_us
-            .last()
-            .expect("non-empty bridge latency sample must have max"),
+        max_us: latencies_us.last().copied().unwrap_or_default(),
     }
 }
 
@@ -859,21 +857,29 @@ pub(crate) fn synthetic_lab_client(
     config.random_seed = 0x4252_4c41_4221;
 
     let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
+    let mut ip_addr_inserted = true;
     iface.update_ip_addrs(|ip_addrs| {
-        ip_addrs
+        ip_addr_inserted = ip_addrs
             .push(IpCidr::new(IpAddress::from(client_ip), DEFAULT_TUN_PREFIX))
-            .expect("smoltcp default IP address storage must fit lab client address");
+            .is_ok();
     });
+    if !ip_addr_inserted {
+        bail!("failed to add synthetic lab client IP address to smoltcp interface");
+    }
+    let mut route_inserted = true;
     iface.routes_mut().update(|routes| {
-        routes
+        route_inserted = routes
             .push(Route {
                 cidr: IpCidr::Ipv4(Ipv4Cidr::new(destination_ip, 32)),
                 via_router: IpAddress::from(gateway),
                 preferred_until: None,
                 expires_at: None,
             })
-            .expect("smoltcp default route storage must fit lab destination route");
+            .is_ok();
     });
+    if !route_inserted {
+        bail!("failed to add synthetic lab destination route to smoltcp interface");
+    }
 
     let mut sockets = SocketSet::new(vec![]);
     let mut client_socket = tcp::Socket::new(
