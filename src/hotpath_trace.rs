@@ -33,6 +33,15 @@ pub(crate) struct TcpFlowTrace {
     agent_send_outbound_wait_us: u128,
     agent_send_outbound_wait_max_us: u128,
     agent_send_frames: u64,
+    agent_remote_read_wait_us: u128,
+    agent_remote_read_wait_max_us: u128,
+    agent_remote_read_events: u64,
+    agent_remote_output_credit_wait_us: u128,
+    agent_remote_output_credit_wait_max_us: u128,
+    agent_remote_output_send_wait_us: u128,
+    agent_remote_output_send_wait_max_us: u128,
+    agent_remote_output_frames: u64,
+    agent_remote_output_bytes: u64,
     remote_event_wait_us: u128,
     remote_event_wait_max_us: u128,
     remote_event_waits: u64,
@@ -66,6 +75,15 @@ struct TcpFlowTraceSummary {
     agent_send_outbound_wait_us: u128,
     agent_send_outbound_wait_max_us: u128,
     agent_send_frames: u64,
+    agent_remote_read_wait_us: u128,
+    agent_remote_read_wait_max_us: u128,
+    agent_remote_read_events: u64,
+    agent_remote_output_credit_wait_us: u128,
+    agent_remote_output_credit_wait_max_us: u128,
+    agent_remote_output_send_wait_us: u128,
+    agent_remote_output_send_wait_max_us: u128,
+    agent_remote_output_frames: u64,
+    agent_remote_output_bytes: u64,
     remote_event_wait_us: u128,
     remote_event_wait_max_us: u128,
     remote_event_waits: u64,
@@ -103,6 +121,15 @@ impl TcpFlowTrace {
             agent_send_outbound_wait_us: 0,
             agent_send_outbound_wait_max_us: 0,
             agent_send_frames: 0,
+            agent_remote_read_wait_us: 0,
+            agent_remote_read_wait_max_us: 0,
+            agent_remote_read_events: 0,
+            agent_remote_output_credit_wait_us: 0,
+            agent_remote_output_credit_wait_max_us: 0,
+            agent_remote_output_send_wait_us: 0,
+            agent_remote_output_send_wait_max_us: 0,
+            agent_remote_output_frames: 0,
+            agent_remote_output_bytes: 0,
             remote_event_wait_us: 0,
             remote_event_wait_max_us: 0,
             remote_event_waits: 0,
@@ -193,6 +220,42 @@ impl TcpFlowTrace {
         self.agent_send_outbound_wait_max_us =
             self.agent_send_outbound_wait_max_us.max(outbound_wait_us);
         self.agent_send_frames = self.agent_send_frames.saturating_add(frames);
+    }
+
+    pub(crate) fn agent_remote_output_timing(
+        &mut self,
+        timing: crate::agent_proto::AgentEofTiming,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        self.agent_remote_read_wait_us = self
+            .agent_remote_read_wait_us
+            .saturating_add(u128::from(timing.remote_read_wait_us));
+        self.agent_remote_read_wait_max_us = self
+            .agent_remote_read_wait_max_us
+            .max(u128::from(timing.remote_read_wait_max_us));
+        self.agent_remote_read_events = self
+            .agent_remote_read_events
+            .saturating_add(timing.remote_read_events);
+        self.agent_remote_output_credit_wait_us = self
+            .agent_remote_output_credit_wait_us
+            .saturating_add(u128::from(timing.output_credit_wait_us));
+        self.agent_remote_output_credit_wait_max_us = self
+            .agent_remote_output_credit_wait_max_us
+            .max(u128::from(timing.output_credit_wait_max_us));
+        self.agent_remote_output_send_wait_us = self
+            .agent_remote_output_send_wait_us
+            .saturating_add(u128::from(timing.output_send_wait_us));
+        self.agent_remote_output_send_wait_max_us = self
+            .agent_remote_output_send_wait_max_us
+            .max(u128::from(timing.output_send_wait_max_us));
+        self.agent_remote_output_frames = self
+            .agent_remote_output_frames
+            .saturating_add(timing.output_frames);
+        self.agent_remote_output_bytes = self
+            .agent_remote_output_bytes
+            .saturating_add(timing.remote_bytes);
     }
 
     pub(crate) fn remote_bytes(&mut self, bytes: usize) {
@@ -286,6 +349,15 @@ impl TcpFlowTrace {
                 agent_send_outbound_wait_us: self.agent_send_outbound_wait_us,
                 agent_send_outbound_wait_max_us: self.agent_send_outbound_wait_max_us,
                 agent_send_frames: self.agent_send_frames,
+                agent_remote_read_wait_us: self.agent_remote_read_wait_us,
+                agent_remote_read_wait_max_us: self.agent_remote_read_wait_max_us,
+                agent_remote_read_events: self.agent_remote_read_events,
+                agent_remote_output_credit_wait_us: self.agent_remote_output_credit_wait_us,
+                agent_remote_output_credit_wait_max_us: self.agent_remote_output_credit_wait_max_us,
+                agent_remote_output_send_wait_us: self.agent_remote_output_send_wait_us,
+                agent_remote_output_send_wait_max_us: self.agent_remote_output_send_wait_max_us,
+                agent_remote_output_frames: self.agent_remote_output_frames,
+                agent_remote_output_bytes: self.agent_remote_output_bytes,
                 remote_event_wait_us: self.remote_event_wait_us,
                 remote_event_wait_max_us: self.remote_event_wait_max_us,
                 remote_event_waits: self.remote_event_waits,
@@ -324,7 +396,7 @@ fn hotpath_trace_enabled() -> bool {
 fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
     let key = summary.id.key;
     format!(
-        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tagent_remote_connect_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\ttcp_recv_queue_wait_us={}\ttcp_recv_queue_wait_max_us={}\ttcp_recv_queue_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
+        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tagent_remote_connect_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\ttcp_recv_queue_wait_us={}\ttcp_recv_queue_wait_max_us={}\ttcp_recv_queue_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tagent_remote_read_wait_us={}\tagent_remote_read_wait_max_us={}\tagent_remote_read_events={}\tagent_remote_output_credit_wait_us={}\tagent_remote_output_credit_wait_max_us={}\tagent_remote_output_send_wait_us={}\tagent_remote_output_send_wait_max_us={}\tagent_remote_output_frames={}\tagent_remote_output_bytes={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
         summary.transport,
         key.src_ip,
         key.src_port,
@@ -355,6 +427,15 @@ fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
         summary.agent_send_outbound_wait_us,
         summary.agent_send_outbound_wait_max_us,
         summary.agent_send_frames,
+        summary.agent_remote_read_wait_us,
+        summary.agent_remote_read_wait_max_us,
+        summary.agent_remote_read_events,
+        summary.agent_remote_output_credit_wait_us,
+        summary.agent_remote_output_credit_wait_max_us,
+        summary.agent_remote_output_send_wait_us,
+        summary.agent_remote_output_send_wait_max_us,
+        summary.agent_remote_output_frames,
+        summary.agent_remote_output_bytes,
         summary.remote_event_wait_us,
         summary.remote_event_wait_max_us,
         summary.remote_event_waits,
@@ -407,6 +488,15 @@ mod tests {
             agent_send_outbound_wait_us: 5,
             agent_send_outbound_wait_max_us: 4,
             agent_send_frames: 6,
+            agent_remote_read_wait_us: 21,
+            agent_remote_read_wait_max_us: 12,
+            agent_remote_read_events: 7,
+            agent_remote_output_credit_wait_us: 22,
+            agent_remote_output_credit_wait_max_us: 13,
+            agent_remote_output_send_wait_us: 23,
+            agent_remote_output_send_wait_max_us: 14,
+            agent_remote_output_frames: 8,
+            agent_remote_output_bytes: 456,
             remote_event_wait_us: 11,
             remote_event_wait_max_us: 10,
             remote_event_waits: 3,
@@ -418,7 +508,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tagent_remote_connect_us=5\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\ttcp_recv_queue_wait_us=14\ttcp_recv_queue_wait_max_us=10\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tagent_remote_connect_us=5\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\ttcp_recv_queue_wait_us=14\ttcp_recv_queue_wait_max_us=10\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tagent_remote_read_wait_us=21\tagent_remote_read_wait_max_us=12\tagent_remote_read_events=7\tagent_remote_output_credit_wait_us=22\tagent_remote_output_credit_wait_max_us=13\tagent_remote_output_send_wait_us=23\tagent_remote_output_send_wait_max_us=14\tagent_remote_output_frames=8\tagent_remote_output_bytes=456\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
         );
         assert!(!line.contains("payload"));
     }

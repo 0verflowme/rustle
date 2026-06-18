@@ -16,8 +16,8 @@ use crate::agent_io::{
     AgentFrameWriteReceiver, AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
 };
 use crate::agent_proto::{
-    AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AgentOpenedTiming,
-    AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
+    AgentEofTiming, AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4,
+    AgentOpenedTiming, AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -102,6 +102,60 @@ struct AgentTcpStreamOptions {
     connect_timeout: Duration,
     max_frame_payload: usize,
     done_tx: mpsc::Sender<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AgentTcpOutputTiming {
+    remote_read_wait_us: u128,
+    remote_read_wait_max_us: u128,
+    remote_read_events: u64,
+    output_credit_wait_us: u128,
+    output_credit_wait_max_us: u128,
+    output_send_wait_us: u128,
+    output_send_wait_max_us: u128,
+    output_frames: u64,
+    remote_bytes: u64,
+}
+
+impl AgentTcpOutputTiming {
+    fn record_remote_read_wait(&mut self, started_at: Instant) {
+        let elapsed = started_at.elapsed().as_micros();
+        self.remote_read_wait_us = self.remote_read_wait_us.saturating_add(elapsed);
+        self.remote_read_wait_max_us = self.remote_read_wait_max_us.max(elapsed);
+        self.remote_read_events = self.remote_read_events.saturating_add(1);
+    }
+
+    fn record_output_credit_wait(&mut self, started_at: Instant) {
+        let elapsed = started_at.elapsed().as_micros();
+        self.output_credit_wait_us = self.output_credit_wait_us.saturating_add(elapsed);
+        self.output_credit_wait_max_us = self.output_credit_wait_max_us.max(elapsed);
+    }
+
+    fn record_output_send_wait(&mut self, started_at: Instant) {
+        let elapsed = started_at.elapsed().as_micros();
+        self.output_send_wait_us = self.output_send_wait_us.saturating_add(elapsed);
+        self.output_send_wait_max_us = self.output_send_wait_max_us.max(elapsed);
+    }
+
+    fn record_output_frame(&mut self, bytes: usize) {
+        self.output_frames = self.output_frames.saturating_add(1);
+        self.remote_bytes = self.remote_bytes.saturating_add(bytes as u64);
+    }
+
+    fn encode(&self) -> Bytes {
+        AgentEofTiming {
+            remote_read_wait_us: micros_u128_to_u64(self.remote_read_wait_us),
+            remote_read_wait_max_us: micros_u128_to_u64(self.remote_read_wait_max_us),
+            remote_read_events: self.remote_read_events,
+            output_credit_wait_us: micros_u128_to_u64(self.output_credit_wait_us),
+            output_credit_wait_max_us: micros_u128_to_u64(self.output_credit_wait_max_us),
+            output_send_wait_us: micros_u128_to_u64(self.output_send_wait_us),
+            output_send_wait_max_us: micros_u128_to_u64(self.output_send_wait_max_us),
+            output_frames: self.output_frames,
+            remote_bytes: self.remote_bytes,
+        }
+        .encode()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -721,37 +775,46 @@ async fn run_tcp_connected_stream(
 
     let read_chunk = max_frame_payload.clamp(1, AGENT_TCP_READ_CHUNK);
     let mut read_buf = vec![0_u8; read_chunk];
+    let mut output_timing = AgentTcpOutputTiming::default();
     let mut output_yield_budget = OutputProducerYieldBudget::default();
     loop {
+        let read_started_at = Instant::now();
         match reader.read(&mut read_buf).await {
             Ok(0) => {
+                output_timing.record_remote_read_wait(read_started_at);
                 let _ = send_agent_frame(
                     &out_tx,
-                    AgentFrame::new(AgentFrameKind::Eof, stream_id, Bytes::new())
-                        .expect("empty frame"),
+                    AgentFrame::new(AgentFrameKind::Eof, stream_id, output_timing.encode())
+                        .expect("eof frame"),
                 )
                 .await;
                 break;
             }
             Ok(len) => {
+                output_timing.record_remote_read_wait(read_started_at);
                 let bytes = Bytes::copy_from_slice(&read_buf[..len]);
+                let credit_started_at = Instant::now();
                 let permit = match output_credit.clone().acquire_many_owned(len as u32).await {
                     Ok(permit) => permit,
                     Err(_) => break,
                 };
-                if send_agent_frame(
+                output_timing.record_output_credit_wait(credit_started_at);
+                let send_started_at = Instant::now();
+                let send_result = send_agent_frame(
                     &out_tx,
                     AgentFrame::new(AgentFrameKind::Data, stream_id, bytes).expect("data frame"),
                 )
-                .await
-                .is_err()
-                {
+                .await;
+                output_timing.record_output_send_wait(send_started_at);
+                if send_result.is_err() {
                     break;
                 }
+                output_timing.record_output_frame(len);
                 permit.forget();
                 yield_after_output_data_frame(&mut output_yield_budget).await;
             }
             Err(err) => {
+                output_timing.record_remote_read_wait(read_started_at);
                 let _ = send_reset(
                     &out_tx,
                     stream_id,
@@ -783,6 +846,10 @@ fn opened_timing_payload(remote_connect_elapsed: Option<Duration>) -> Bytes {
 
 fn duration_micros_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn micros_u128_to_u64(micros: u128) -> u64 {
+    u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
 async fn run_udp_stream(

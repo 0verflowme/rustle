@@ -162,6 +162,7 @@ where
                                 }
                             }
                             agent_proto::AgentFrameKind::Eof => {
+                                record_agent_eof_timing(&mut trace, &frame);
                                 trace.outcome("remote_eof");
                                 let _ = flow_bridge::send_bridge_event(
                                     &event_tx,
@@ -484,6 +485,12 @@ fn tcp_open_request(id: tcp_core::FlowId) -> DataPlaneIpv4Open {
 fn record_agent_opened_timing(trace: &mut TcpFlowTrace, frame: &agent_proto::AgentFrame) {
     if let Ok(Some(timing)) = agent_proto::AgentOpenedTiming::decode_optional(&frame.payload) {
         trace.agent_remote_connect(timing.remote_connect_us);
+    }
+}
+
+fn record_agent_eof_timing(trace: &mut TcpFlowTrace, frame: &agent_proto::AgentFrame) {
+    if let Ok(Some(timing)) = agent_proto::AgentEofTiming::decode_optional(&frame.payload) {
+        trace.agent_remote_output_timing(timing);
     }
 }
 

@@ -610,12 +610,18 @@ outcomes. It also derives `remote_open_wait`, `agent_remote_connect`,
 `first_byte_wait`, `post_open_first_byte_wait`, `body_drain`, cumulative
 `local_send_wait`, `tcp_recv_queue_wait`, `local_queue_wait`,
 `pre_bridge_queue_wait`, framed-agent `agent_send_credit_wait` and
-`agent_send_outbound_wait`, `remote_event_wait`, and a `likely_bottleneck`
-label. `tcp_recv_queue_wait` is the age of payload inside smoltcp before the
-packet engine drains it; `local_queue_wait` is the bridge mpsc wait;
-`agent_remote_connect` is measured inside the remote helper around its TCP
-connect call; `agent_open_transport_wait` is the remaining local
-`remote_open_wait` after subtracting that remote connect duration; and
+`agent_send_outbound_wait`, remote-helper `agent_remote_read_wait`,
+`agent_remote_output_credit_wait`, `agent_remote_output_send_wait`,
+`remote_event_wait`, and a `likely_bottleneck` label. `tcp_recv_queue_wait` is
+the age of payload inside smoltcp before the packet engine drains it;
+`local_queue_wait` is the bridge mpsc wait; `agent_remote_connect` is measured
+inside the remote helper around its TCP connect call;
+`agent_open_transport_wait` is the remaining local `remote_open_wait` after
+subtracting that remote connect duration; `agent_remote_read_wait` is the time
+the helper spends waiting for remote TCP response bytes;
+`agent_remote_output_credit_wait` is helper-side flow-control backpressure for
+remote-to-local bytes; `agent_remote_output_send_wait` is helper-side framed
+writer queue wait; and
 `pre_bridge_queue_wait` combines local pre-bridge waits as a coarse "before the
 data-plane task can act" diagnostic. Use those derived terms to decide which
 fix comes first:
@@ -805,11 +811,13 @@ until the hotpath artifact identifies the dominant term.
    behind large data bursts, and reducing any bridge admission or local queue
    delay before the first payload reaches the agent writer.
 3. For 100 MiB live throughput, use the trace counters to decide whether the cap
-   is `agent_send_credit_wait`, `agent_send_outbound_wait`, `remote_event_wait`,
-   packet-engine backlog, TUN write pressure, or writer flush/write time. The
-   framed-agent window already starts at 4 MiB and grows to 24 MiB, so a
-   3-6 MiB/s WAN result is more likely a scheduler/carrier/drain problem than a
-   raw initial-window constant.
+   is `agent_send_credit_wait`, `agent_send_outbound_wait`,
+   `agent_remote_read_wait`, `agent_remote_output_credit_wait`,
+   `agent_remote_output_send_wait`, `remote_event_wait`, packet-engine backlog,
+   TUN write pressure, or writer flush/write time. The framed-agent window
+   already starts at 4 MiB and grows to 24 MiB, so a 3-6 MiB/s WAN result is
+   more likely a scheduler/carrier/drain problem than a raw initial-window
+   constant.
 4. For concurrent 100 MiB transfers, prove fairness separately from raw
    throughput. The writer already round-robins non-priority frames inside each
    collected burst; remaining work is to test full writer turns under live RTT,

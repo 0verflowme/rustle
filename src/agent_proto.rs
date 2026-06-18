@@ -107,6 +107,19 @@ pub struct AgentOpenedTiming {
     pub remote_connect_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentEofTiming {
+    pub remote_read_wait_us: u64,
+    pub remote_read_wait_max_us: u64,
+    pub remote_read_events: u64,
+    pub output_credit_wait_us: u64,
+    pub output_credit_wait_max_us: u64,
+    pub output_send_wait_us: u64,
+    pub output_send_wait_max_us: u64,
+    pub output_frames: u64,
+    pub remote_bytes: u64,
+}
+
 impl AgentOpenedTiming {
     const WIRE_LEN: usize = 8;
 
@@ -129,6 +142,48 @@ impl AgentOpenedTiming {
         }
         Ok(Some(Self {
             remote_connect_us: payload.get_u64(),
+        }))
+    }
+}
+
+impl AgentEofTiming {
+    const WIRE_LEN: usize = 72;
+
+    pub fn encode(self) -> Bytes {
+        let mut payload = BytesMut::with_capacity(Self::WIRE_LEN);
+        payload.put_u64(self.remote_read_wait_us);
+        payload.put_u64(self.remote_read_wait_max_us);
+        payload.put_u64(self.remote_read_events);
+        payload.put_u64(self.output_credit_wait_us);
+        payload.put_u64(self.output_credit_wait_max_us);
+        payload.put_u64(self.output_send_wait_us);
+        payload.put_u64(self.output_send_wait_max_us);
+        payload.put_u64(self.output_frames);
+        payload.put_u64(self.remote_bytes);
+        payload.freeze()
+    }
+
+    pub fn decode_optional(mut payload: &[u8]) -> Result<Option<Self>> {
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if payload.len() != Self::WIRE_LEN {
+            bail!(
+                "agent EOF timing payload must be {} bytes, got {}",
+                Self::WIRE_LEN,
+                payload.len()
+            );
+        }
+        Ok(Some(Self {
+            remote_read_wait_us: payload.get_u64(),
+            remote_read_wait_max_us: payload.get_u64(),
+            remote_read_events: payload.get_u64(),
+            output_credit_wait_us: payload.get_u64(),
+            output_credit_wait_max_us: payload.get_u64(),
+            output_send_wait_us: payload.get_u64(),
+            output_send_wait_max_us: payload.get_u64(),
+            output_frames: payload.get_u64(),
+            remote_bytes: payload.get_u64(),
         }))
     }
 }
@@ -409,6 +464,36 @@ mod tests {
             .expect_err("truncated timing payload should fail");
         assert!(
             err.to_string().contains("opened timing payload"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn eof_timing_payload_is_optional_and_stable() {
+        assert_eq!(AgentEofTiming::decode_optional(&[]).unwrap(), None);
+
+        let timing = AgentEofTiming {
+            remote_read_wait_us: 1,
+            remote_read_wait_max_us: 2,
+            remote_read_events: 3,
+            output_credit_wait_us: 4,
+            output_credit_wait_max_us: 5,
+            output_send_wait_us: 6,
+            output_send_wait_max_us: 7,
+            output_frames: 8,
+            remote_bytes: 9,
+        };
+        assert_eq!(
+            AgentEofTiming::decode_optional(&timing.encode())
+                .unwrap()
+                .expect("timing payload"),
+            timing
+        );
+
+        let err = AgentEofTiming::decode_optional(&[0; 71])
+            .expect_err("truncated timing payload should fail");
+        assert!(
+            err.to_string().contains("EOF timing payload"),
             "unexpected error: {err:#}"
         );
     }
