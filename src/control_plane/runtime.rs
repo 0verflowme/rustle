@@ -55,152 +55,318 @@ pub(crate) async fn connect_tunnel_runtime(
 ) -> Result<TunnelRuntime> {
     match requested {
         BridgeTransportKind::DirectTcpip => {
-            let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-            Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)))
+            connect_direct_tcpip_runtime(ssh, options.ssh_sessions).await
         }
         BridgeTransportKind::Agent => {
-            let helper_plan = single_helper_plan(helper_plan, requested)?;
-            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
-            let connector: Arc<dyn AgentBridgeConnector> =
-                Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
-            let fast_start_agent_lanes = should_fast_start_agent_lanes(
-                options.fast_start_auto_agent_lanes,
-                options.agent_sessions,
-                desired_agent_sessions,
-            );
-            let data_plane = connect_framed_agent_data_plane(
-                connector,
-                desired_agent_sessions,
-                fast_start_agent_lanes,
-                dns_remote,
-            )
-            .await?;
-            Ok(TunnelRuntime::new(data_plane))
+            connect_agent_runtime(ssh, requested, helper_plan, mtu, dns_remote, options).await
         }
         BridgeTransportKind::QuicAgent => {
-            let helper_plan = single_helper_plan(helper_plan, requested)?;
-            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
-            let connector: Arc<dyn AgentBridgeConnector> = Arc::new(
-                SshQuicAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?,
-            );
-            let data_plane = connect_framed_agent_data_plane(
-                connector,
-                desired_agent_sessions,
-                false,
-                dns_remote,
-            )
-            .await?;
-            Ok(TunnelRuntime::new(data_plane))
+            connect_quic_agent_runtime(ssh, requested, helper_plan, mtu, dns_remote, options).await
         }
         BridgeTransportKind::QuicNative => {
-            let helper_plan = single_helper_plan(helper_plan, requested)?;
-            let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
-            Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
+            connect_quic_native_runtime(ssh, requested, helper_plan).await
         }
         BridgeTransportKind::Auto => {
-            let helper_plan = single_helper_plan(helper_plan, requested)?;
-            let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
-            let connector: Arc<dyn AgentBridgeConnector> =
-                Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
-            let fast_start_agent_lanes = should_fast_start_agent_lanes(
-                options.fast_start_auto_agent_lanes,
-                options.agent_sessions,
-                desired_agent_sessions,
-            );
-            let transports = match connect_initial_agent_transports(
-                connector.as_ref(),
-                desired_agent_sessions,
-                fast_start_agent_lanes,
-            )
-            .await
-            {
-                Ok(transports) => transports,
-                Err(err) => {
-                    eprintln!(
-                        "transport: auto could not start agent ({err:#}); falling back to direct-tcpip"
-                    );
-                    let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                    return Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)));
-                }
-            };
-            if let Err(err) = ensure_agent_dns_remote_supported(&transports, dns_remote) {
-                eprintln!(
-                    "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
-                );
-                let ssh = connect_ssh_pool(ssh, options.ssh_sessions).await?;
-                return Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)));
-            }
-            eprintln!("transport: auto selected agent");
-            Ok(TunnelRuntime::new(framed_agent_data_plane_from_transports(
-                connector,
-                transports,
-                desired_agent_sessions,
-                fast_start_agent_lanes,
-            )))
+            connect_auto_runtime(ssh, requested, helper_plan, mtu, dns_remote, options).await
         }
         BridgeTransportKind::AutoQuic => {
-            let BridgeHelperCommandPlan::AutoQuic { agent, quic_native } = helper_plan else {
-                bail!("auto-quic runtime requires distinct QUIC-native and agent helper plans");
-            };
-            let probe_started_at = Instant::now();
-            log_auto_quic_decision(
-                "probe",
-                "start",
-                probe_started_at,
-                AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
-            );
-            eprintln!(
-                "transport: auto-quic probing quic-native with data-plane timeout {}ms",
-                AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT.as_millis()
-            );
-            match connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout(
-                ssh,
-                &quic_native,
-                Some(AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT),
-            )
-            .await
-            {
-                Ok(bridge) => {
-                    log_auto_quic_decision(
-                        "select",
-                        "quic-native",
-                        probe_started_at,
-                        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
-                    );
-                    eprintln!("transport: auto-quic selected quic-native");
-                    Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
-                }
-                Err(err) => {
-                    log_auto_quic_decision(
-                        "select",
-                        "agent-fallback",
-                        probe_started_at,
-                        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
-                    );
-                    eprintln!(
-                        "transport: auto-quic could not start quic-native ({err:#}); falling back to agent"
-                    );
-                    let desired_agent_sessions =
-                        resolve_agent_session_count(options.agent_sessions);
-                    let connector: Arc<dyn AgentBridgeConnector> =
-                        Arc::new(SshAgentBridgeConnector::new(ssh.clone(), agent, mtu)?);
-                    let fast_start_agent_lanes = should_fast_start_agent_lanes(
-                        options.fast_start_auto_agent_lanes,
-                        options.agent_sessions,
-                        desired_agent_sessions,
-                    );
-                    let data_plane = connect_framed_agent_data_plane(
-                        connector,
-                        desired_agent_sessions,
-                        fast_start_agent_lanes,
-                        dns_remote,
-                    )
-                    .await?;
-                    Ok(TunnelRuntime::new(data_plane))
-                }
-            }
+            connect_auto_quic_runtime(ssh, helper_plan, mtu, dns_remote, options).await
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoAgentRuntimeDecision {
+    Agent,
+    DirectTcpipFallback(AutoAgentFallbackReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoAgentFallbackReason {
+    AgentStartupFailed,
+    DnsUnsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutoQuicProbeSelection {
+    QuicNative,
+    AgentFallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentDnsCapabilityRequirement {
+    UdpAssociateForIpv4,
+    TcpConnectHostForHostname,
+}
+
+struct AutoQuicHelperPlans {
+    agent: HelperCommandPlan,
+    quic_native: HelperCommandPlan,
+}
+
+impl AutoQuicProbeSelection {
+    fn result_label(self) -> &'static str {
+        match self {
+            Self::QuicNative => "quic-native",
+            Self::AgentFallback => "agent-fallback",
+        }
+    }
+}
+
+async fn connect_direct_tcpip_runtime(ssh: &SshArgs, ssh_sessions: usize) -> Result<TunnelRuntime> {
+    let ssh = connect_ssh_pool(ssh, ssh_sessions).await?;
+    Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)))
+}
+
+async fn connect_agent_runtime(
+    ssh: &SshArgs,
+    requested: BridgeTransportKind,
+    helper_plan: BridgeHelperCommandPlan,
+    mtu: u16,
+    dns_remote: Option<&Destination>,
+    options: TunnelRuntimeOptions,
+) -> Result<TunnelRuntime> {
+    let helper_plan = single_helper_plan(helper_plan, requested)?;
+    let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
+    let connector = ssh_agent_connector(ssh, helper_plan, mtu)?;
+    let fast_start_agent_lanes = auto_agent_fast_start_enabled(options, desired_agent_sessions);
+    let data_plane = connect_framed_agent_data_plane(
+        connector,
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+        dns_remote,
+    )
+    .await?;
+    Ok(TunnelRuntime::new(data_plane))
+}
+
+async fn connect_quic_agent_runtime(
+    ssh: &SshArgs,
+    requested: BridgeTransportKind,
+    helper_plan: BridgeHelperCommandPlan,
+    mtu: u16,
+    dns_remote: Option<&Destination>,
+    options: TunnelRuntimeOptions,
+) -> Result<TunnelRuntime> {
+    let helper_plan = single_helper_plan(helper_plan, requested)?;
+    let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
+    let connector = ssh_quic_agent_connector(ssh, helper_plan, mtu)?;
+    let data_plane =
+        connect_framed_agent_data_plane(connector, desired_agent_sessions, false, dns_remote)
+            .await?;
+    Ok(TunnelRuntime::new(data_plane))
+}
+
+async fn connect_quic_native_runtime(
+    ssh: &SshArgs,
+    requested: BridgeTransportKind,
+    helper_plan: BridgeHelperCommandPlan,
+) -> Result<TunnelRuntime> {
+    let helper_plan = single_helper_plan(helper_plan, requested)?;
+    let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
+    Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
+}
+
+async fn connect_auto_runtime(
+    ssh: &SshArgs,
+    requested: BridgeTransportKind,
+    helper_plan: BridgeHelperCommandPlan,
+    mtu: u16,
+    dns_remote: Option<&Destination>,
+    options: TunnelRuntimeOptions,
+) -> Result<TunnelRuntime> {
+    let helper_plan = single_helper_plan(helper_plan, requested)?;
+    let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
+    let connector = ssh_agent_connector(ssh, helper_plan, mtu)?;
+    let fast_start_agent_lanes = auto_agent_fast_start_enabled(options, desired_agent_sessions);
+    let transports = match connect_initial_agent_transports(
+        connector.as_ref(),
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+    )
+    .await
+    {
+        Ok(transports) => transports,
+        Err(err) => {
+            let decision = decide_auto_agent_runtime(false, true);
+            return connect_auto_agent_fallback_runtime(ssh, options.ssh_sessions, decision, err)
+                .await;
+        }
+    };
+    if let Err(err) = ensure_agent_dns_remote_supported(&transports, dns_remote) {
+        let decision = decide_auto_agent_runtime(true, false);
+        return connect_auto_agent_fallback_runtime(ssh, options.ssh_sessions, decision, err).await;
+    }
+    eprintln!("transport: auto selected agent");
+    Ok(TunnelRuntime::new(framed_agent_data_plane_from_transports(
+        connector,
+        transports,
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+    )))
+}
+
+async fn connect_auto_quic_runtime(
+    ssh: &SshArgs,
+    helper_plan: BridgeHelperCommandPlan,
+    mtu: u16,
+    dns_remote: Option<&Destination>,
+    options: TunnelRuntimeOptions,
+) -> Result<TunnelRuntime> {
+    let AutoQuicHelperPlans { agent, quic_native } = auto_quic_helper_plans(helper_plan)?;
+    let probe_started_at = start_auto_quic_probe();
+    match connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout(
+        ssh,
+        &quic_native,
+        Some(AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT),
+    )
+    .await
+    {
+        Ok(bridge) => {
+            log_auto_quic_selection(decide_auto_quic_probe(true), probe_started_at);
+            eprintln!("transport: auto-quic selected quic-native");
+            Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
+        }
+        Err(err) => {
+            log_auto_quic_selection(decide_auto_quic_probe(false), probe_started_at);
+            connect_auto_quic_agent_fallback_runtime(ssh, agent, mtu, dns_remote, options, err)
+                .await
+        }
+    }
+}
+
+async fn connect_auto_agent_fallback_runtime(
+    ssh: &SshArgs,
+    ssh_sessions: usize,
+    decision: AutoAgentRuntimeDecision,
+    err: anyhow::Error,
+) -> Result<TunnelRuntime> {
+    let AutoAgentRuntimeDecision::DirectTcpipFallback(reason) = decision else {
+        unreachable!("auto fallback runtime requires a direct-tcpip fallback decision");
+    };
+    log_auto_agent_fallback(reason, &err);
+    connect_direct_tcpip_runtime(ssh, ssh_sessions).await
+}
+
+async fn connect_auto_quic_agent_fallback_runtime(
+    ssh: &SshArgs,
+    helper_plan: HelperCommandPlan,
+    mtu: u16,
+    dns_remote: Option<&Destination>,
+    options: TunnelRuntimeOptions,
+    err: anyhow::Error,
+) -> Result<TunnelRuntime> {
+    eprintln!("transport: auto-quic could not start quic-native ({err:#}); falling back to agent");
+    let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
+    let connector = ssh_agent_connector(ssh, helper_plan, mtu)?;
+    let fast_start_agent_lanes = auto_agent_fast_start_enabled(options, desired_agent_sessions);
+    let data_plane = connect_framed_agent_data_plane(
+        connector,
+        desired_agent_sessions,
+        fast_start_agent_lanes,
+        dns_remote,
+    )
+    .await?;
+    Ok(TunnelRuntime::new(data_plane))
+}
+
+fn ssh_agent_connector(
+    ssh: &SshArgs,
+    helper_plan: HelperCommandPlan,
+    mtu: u16,
+) -> Result<Arc<dyn AgentBridgeConnector>> {
+    Ok(Arc::new(SshAgentBridgeConnector::new(
+        ssh.clone(),
+        helper_plan,
+        mtu,
+    )?))
+}
+
+fn ssh_quic_agent_connector(
+    ssh: &SshArgs,
+    helper_plan: HelperCommandPlan,
+    mtu: u16,
+) -> Result<Arc<dyn AgentBridgeConnector>> {
+    Ok(Arc::new(SshQuicAgentBridgeConnector::new(
+        ssh.clone(),
+        helper_plan,
+        mtu,
+    )?))
+}
+
+fn auto_agent_fast_start_enabled(
+    options: TunnelRuntimeOptions,
+    desired_agent_sessions: usize,
+) -> bool {
+    should_fast_start_agent_lanes(
+        options.fast_start_auto_agent_lanes,
+        options.agent_sessions,
+        desired_agent_sessions,
+    )
+}
+
+fn decide_auto_agent_runtime(agent_started: bool, dns_supported: bool) -> AutoAgentRuntimeDecision {
+    if !agent_started {
+        AutoAgentRuntimeDecision::DirectTcpipFallback(AutoAgentFallbackReason::AgentStartupFailed)
+    } else if !dns_supported {
+        AutoAgentRuntimeDecision::DirectTcpipFallback(AutoAgentFallbackReason::DnsUnsupported)
+    } else {
+        AutoAgentRuntimeDecision::Agent
+    }
+}
+
+fn log_auto_agent_fallback(reason: AutoAgentFallbackReason, err: &anyhow::Error) {
+    match reason {
+        AutoAgentFallbackReason::AgentStartupFailed => {
+            eprintln!(
+                "transport: auto could not start agent ({err:#}); falling back to direct-tcpip"
+            );
+        }
+        AutoAgentFallbackReason::DnsUnsupported => {
+            eprintln!(
+                "transport: auto selected direct-tcpip because the agent cannot support the configured DNS resolver ({err:#})"
+            );
+        }
+    }
+}
+
+fn auto_quic_helper_plans(plan: BridgeHelperCommandPlan) -> Result<AutoQuicHelperPlans> {
+    let BridgeHelperCommandPlan::AutoQuic { agent, quic_native } = plan else {
+        bail!("auto-quic runtime requires distinct QUIC-native and agent helper plans");
+    };
+    Ok(AutoQuicHelperPlans { agent, quic_native })
+}
+
+fn start_auto_quic_probe() -> Instant {
+    let started_at = Instant::now();
+    log_auto_quic_decision(
+        "probe",
+        "start",
+        started_at,
+        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
+    );
+    eprintln!(
+        "transport: auto-quic probing quic-native with data-plane timeout {}ms",
+        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT.as_millis()
+    );
+    started_at
+}
+
+fn decide_auto_quic_probe(probe_succeeded: bool) -> AutoQuicProbeSelection {
+    if probe_succeeded {
+        AutoQuicProbeSelection::QuicNative
+    } else {
+        AutoQuicProbeSelection::AgentFallback
+    }
+}
+
+fn log_auto_quic_selection(selection: AutoQuicProbeSelection, started_at: Instant) {
+    log_auto_quic_decision(
+        "select",
+        selection.result_label(),
+        started_at,
+        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
+    );
 }
 
 fn log_auto_quic_decision(
@@ -302,30 +468,47 @@ fn ensure_agent_dns_capabilities_supported(
     capabilities: &[u64],
     remote: &Destination,
 ) -> Result<()> {
-    if remote.host.parse::<Ipv4Addr>().is_ok() {
-        if !capabilities.is_empty()
-            && capabilities
-                .iter()
-                .all(|capabilities| capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0)
-        {
-            return Ok(());
-        }
-        bail!(
-            "agent DNS transport to IPv4 resolver {} requires UDP associate support",
-            remote.host
-        );
-    }
+    let requirement = agent_dns_capability_requirement(remote);
     if !capabilities.is_empty()
         && capabilities
             .iter()
-            .all(|capabilities| capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0)
+            .all(|capabilities| requirement.is_satisfied_by(*capabilities))
     {
         return Ok(());
     }
-    bail!(
-        "agent DNS transport to hostname {} requires hostname TCP connect support",
-        remote.host
-    )
+    match requirement {
+        AgentDnsCapabilityRequirement::UdpAssociateForIpv4 => {
+            bail!(
+                "agent DNS transport to IPv4 resolver {} requires UDP associate support",
+                remote.host
+            );
+        }
+        AgentDnsCapabilityRequirement::TcpConnectHostForHostname => {
+            bail!(
+                "agent DNS transport to hostname {} requires hostname TCP connect support",
+                remote.host
+            );
+        }
+    }
+}
+
+fn agent_dns_capability_requirement(remote: &Destination) -> AgentDnsCapabilityRequirement {
+    if remote.host.parse::<Ipv4Addr>().is_ok() {
+        AgentDnsCapabilityRequirement::UdpAssociateForIpv4
+    } else {
+        AgentDnsCapabilityRequirement::TcpConnectHostForHostname
+    }
+}
+
+impl AgentDnsCapabilityRequirement {
+    fn is_satisfied_by(self, capabilities: u64) -> bool {
+        match self {
+            Self::UdpAssociateForIpv4 => capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0,
+            Self::TcpConnectHostForHostname => {
+                capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -337,6 +520,66 @@ mod tests {
             host: host.to_owned(),
             port: 53,
         }
+    }
+
+    #[test]
+    fn auto_agent_runtime_decision_falls_back_to_direct_tcpip_for_startup_or_dns() {
+        assert_eq!(
+            decide_auto_agent_runtime(false, true),
+            AutoAgentRuntimeDecision::DirectTcpipFallback(
+                AutoAgentFallbackReason::AgentStartupFailed
+            )
+        );
+        assert_eq!(
+            decide_auto_agent_runtime(false, false),
+            AutoAgentRuntimeDecision::DirectTcpipFallback(
+                AutoAgentFallbackReason::AgentStartupFailed
+            )
+        );
+        assert_eq!(
+            decide_auto_agent_runtime(true, false),
+            AutoAgentRuntimeDecision::DirectTcpipFallback(AutoAgentFallbackReason::DnsUnsupported)
+        );
+        assert_eq!(
+            decide_auto_agent_runtime(true, true),
+            AutoAgentRuntimeDecision::Agent
+        );
+    }
+
+    #[test]
+    fn auto_quic_probe_decision_selects_native_or_agent_fallback() {
+        assert_eq!(
+            decide_auto_quic_probe(true),
+            AutoQuicProbeSelection::QuicNative
+        );
+        assert_eq!(
+            decide_auto_quic_probe(false),
+            AutoQuicProbeSelection::AgentFallback
+        );
+        assert_eq!(
+            AutoQuicProbeSelection::QuicNative.result_label(),
+            "quic-native"
+        );
+        assert_eq!(
+            AutoQuicProbeSelection::AgentFallback.result_label(),
+            "agent-fallback"
+        );
+    }
+
+    #[test]
+    fn dns_capability_requirement_tracks_remote_host_kind() {
+        assert_eq!(
+            agent_dns_capability_requirement(&remote("1.1.1.1")),
+            AgentDnsCapabilityRequirement::UdpAssociateForIpv4
+        );
+        assert_eq!(
+            agent_dns_capability_requirement(&remote("dns.example.test")),
+            AgentDnsCapabilityRequirement::TcpConnectHostForHostname
+        );
+        assert!(AgentDnsCapabilityRequirement::UdpAssociateForIpv4
+            .is_satisfied_by(agent_proto::CAP_UDP_ASSOCIATE));
+        assert!(AgentDnsCapabilityRequirement::TcpConnectHostForHostname
+            .is_satisfied_by(agent_proto::CAP_TCP_CONNECT_HOST));
     }
 
     #[test]

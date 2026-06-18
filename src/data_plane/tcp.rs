@@ -23,6 +23,11 @@ enum BridgeInput {
     Local(Option<flow_bridge::ReceivedLocalData>),
 }
 
+enum PreOpenRetry {
+    Retried(AgentIoStream),
+    NotRetried(AgentIoStream),
+}
+
 #[cfg(test)]
 pub(crate) fn spawn_agent_tcp_bridge(
     id: tcp_core::FlowId,
@@ -178,41 +183,40 @@ where
                             }
                             agent_proto::AgentFrameKind::Close => {
                                 if !open_reported {
-                                    if retry_agent.is_some()
-                                        && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
+                                    match maybe_retry_agent_pre_open_stream(
+                                        retry_agent.as_ref(),
+                                        open.into_agent_open(),
+                                        stream,
+                                        &pre_open_local,
+                                        &mut pre_open_retries,
+                                    )
+                                    .await
                                     {
-                                        pre_open_retries += 1;
-                                        match retry_agent_pre_open_stream(
-                                            retry_agent.as_ref(),
-                                            open.into_agent_open(),
-                                            stream,
-                                            &pre_open_local,
-                                        )
-                                        .await
-                                        {
-                                            Ok(replacement) => {
-                                                stream = replacement;
-                                                open_timeout.as_mut().reset(
-                                                    tokio::time::Instant::now()
-                                                        + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
-                                                );
-                                                continue;
-                                            }
-                                            Err(err) => {
-                                                trace.finish("pre_open_reopen_error");
-                                                let _ = flow_bridge::send_bridge_event(
-                                                    &event_tx,
-                                                    flow_bridge::BridgeEvent::Failed {
-                                                        id,
-                                                        phase: flow_bridge::BridgeFailurePhase::Open,
-                                                        message: format!(
-                                                            "failed to reopen agent stream after pre-open close: {err:#}"
-                                                        ),
-                                                    },
-                                                )
-                                                .await;
-                                                return;
-                                            }
+                                        Ok(PreOpenRetry::Retried(replacement)) => {
+                                            stream = replacement;
+                                            open_timeout.as_mut().reset(
+                                                tokio::time::Instant::now()
+                                                    + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                            );
+                                            continue;
+                                        }
+                                        Ok(PreOpenRetry::NotRetried(current)) => {
+                                            stream = current;
+                                        }
+                                        Err(err) => {
+                                            trace.finish("pre_open_reopen_error");
+                                            let _ = flow_bridge::send_bridge_event(
+                                                &event_tx,
+                                                flow_bridge::BridgeEvent::Failed {
+                                                    id,
+                                                    phase: flow_bridge::BridgeFailurePhase::Open,
+                                                    message: format!(
+                                                        "failed to reopen agent stream after pre-open close: {err:#}"
+                                                    ),
+                                                },
+                                            )
+                                            .await;
+                                            return;
                                         }
                                     }
                                     trace.finish("remote_close_before_open");
@@ -231,26 +235,26 @@ where
                             }
                             agent_proto::AgentFrameKind::Reset => {
                                 let message = String::from_utf8_lossy(&frame.payload).to_string();
-                                if !open_reported
-                                    && retry_agent.is_some()
-                                    && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
-                                {
-                                    pre_open_retries += 1;
-                                    match retry_agent_pre_open_stream(
+                                if !open_reported {
+                                    match maybe_retry_agent_pre_open_stream(
                                         retry_agent.as_ref(),
                                         open.into_agent_open(),
                                         stream,
                                         &pre_open_local,
+                                        &mut pre_open_retries,
                                     )
                                     .await
                                     {
-                                        Ok(replacement) => {
+                                        Ok(PreOpenRetry::Retried(replacement)) => {
                                             stream = replacement;
                                             open_timeout.as_mut().reset(
                                                 tokio::time::Instant::now()
                                                     + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                             );
                                             continue;
+                                        }
+                                        Ok(PreOpenRetry::NotRetried(current)) => {
+                                            stream = current;
                                         }
                                         Err(err) => {
                                             trace.finish("pre_open_reopen_error");
@@ -291,26 +295,26 @@ where
                             _ => {}
                         },
                         Ok(None) => {
-                            if !open_reported
-                                && retry_agent.is_some()
-                                && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
-                            {
-                                pre_open_retries += 1;
-                                match retry_agent_pre_open_stream(
+                            if !open_reported {
+                                match maybe_retry_agent_pre_open_stream(
                                     retry_agent.as_ref(),
                                     open.into_agent_open(),
                                     stream,
                                     &pre_open_local,
+                                    &mut pre_open_retries,
                                 )
                                 .await
                                 {
-                                    Ok(replacement) => {
+                                    Ok(PreOpenRetry::Retried(replacement)) => {
                                         stream = replacement;
                                         open_timeout.as_mut().reset(
                                             tokio::time::Instant::now()
                                                 + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                         );
                                         continue;
+                                    }
+                                    Ok(PreOpenRetry::NotRetried(current)) => {
+                                        stream = current;
                                     }
                                     Err(err) => {
                                         trace.finish("pre_open_reopen_error");
@@ -382,26 +386,26 @@ where
                                     trace.local_sent();
                                 }
                                 Ok(Err(err)) => {
-                                    if !open_reported
-                                        && retry_agent.is_some()
-                                        && pre_open_retries < AGENT_PRE_OPEN_RETRY_LIMIT
-                                    {
-                                        pre_open_retries += 1;
-                                        match retry_agent_pre_open_stream(
+                                    if !open_reported {
+                                        match maybe_retry_agent_pre_open_stream(
                                             retry_agent.as_ref(),
                                             open.into_agent_open(),
                                             stream,
                                             &pre_open_local,
+                                            &mut pre_open_retries,
                                         )
                                         .await
                                         {
-                                            Ok(replacement) => {
+                                            Ok(PreOpenRetry::Retried(replacement)) => {
                                                 stream = replacement;
                                                 open_timeout.as_mut().reset(
                                                     tokio::time::Instant::now()
                                                         + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                                 );
                                                 continue;
+                                            }
+                                            Ok(PreOpenRetry::NotRetried(current)) => {
+                                                stream = current;
                                             }
                                             Err(retry_err) => {
                                                 trace.finish("pre_open_reopen_error");
@@ -576,6 +580,23 @@ async fn retry_agent_pre_open_stream(
             .context("failed to replay pre-open agent bytes")?;
     }
     Ok(stream)
+}
+
+async fn maybe_retry_agent_pre_open_stream(
+    agent: Option<&ReconnectingAgentBridge>,
+    open: agent_proto::AgentOpenIpv4,
+    stream: AgentIoStream,
+    replay: &VecDeque<Bytes>,
+    retries: &mut usize,
+) -> Result<PreOpenRetry> {
+    if agent.is_some() && *retries < AGENT_PRE_OPEN_RETRY_LIMIT {
+        *retries += 1;
+        retry_agent_pre_open_stream(agent, open, stream, replay)
+            .await
+            .map(PreOpenRetry::Retried)
+    } else {
+        Ok(PreOpenRetry::NotRetried(stream))
+    }
 }
 
 async fn report_agent_stream_opened(
