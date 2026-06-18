@@ -7,14 +7,16 @@ use tokio::io::{self, AsyncWriteExt};
 use crate::agent_bridge::AgentBridgeConnector;
 use crate::agent_proto;
 use crate::cli::{AgentDnsLabArgs, AgentLabArgs, AgentUdpLabArgs};
-use crate::control_plane::{connect_tunnel_runtime, SshAgentBridgeConnector};
+use crate::control_plane::{
+    bridge_runtime_command_plan, connect_tunnel_runtime, SshAgentBridgeConnector,
+};
 use crate::data_plane::query_dns_on_data_plane;
 use crate::defaults::{DEFAULT_SSH_SESSIONS, DEFAULT_TUN_IP};
 use crate::lab_support::{
     build_dns_a_query, default_http_request, parse_ipv4_destination, percentile_nearest_rank,
     validate_dns_response,
 };
-use crate::remote_helper::{agent_command_plan, bridge_runtime_command_plan};
+use crate::remote_helper::agent_command_plan;
 use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
 
 const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;

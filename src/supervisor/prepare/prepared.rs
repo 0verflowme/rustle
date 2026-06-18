@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::control_plane::connect_tunnel_runtime;
-use crate::remote_helper::bridge_runtime_command_plan;
+use crate::control_plane::{bridge_runtime_command_plan, connect_tunnel_runtime};
 use crate::routing::{expand_target_routes, ssh_control_ip_to_protect};
 use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
 use crate::{tcp_core, TunnelArgs};

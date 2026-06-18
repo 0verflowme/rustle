@@ -504,8 +504,9 @@ mod tests {
     use ipnet::Ipv4Net;
 
     use super::{Cli, CommandKind};
+    use crate::control_plane::effective_bridge_agent_command;
     use crate::defaults::{DEFAULT_AGENT_SESSIONS, DEFAULT_SSH_SESSIONS};
-    use crate::remote_helper::{effective_agent_command, effective_bridge_agent_command};
+    use crate::remote_helper::effective_agent_command;
     use crate::transport_model::BridgeTransportKind;
 
     #[test]

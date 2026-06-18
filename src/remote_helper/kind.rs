@@ -1,5 +1,3 @@
-use crate::transport_model::BridgeTransportKind;
-
 pub(crate) const DEFAULT_AGENT_COMMAND: &str = "rustle agent";
 pub(crate) const DEFAULT_QUIC_AGENT_COMMAND: &str = "rustle quic-agent";
 pub(crate) const DEFAULT_QUIC_BRIDGE_AGENT_COMMAND: &str = "rustle quic-bridge-agent";
@@ -58,17 +56,6 @@ impl HelperKind {
             Self::QuicBridgeNative => {
                 format!("uploaded native QUIC bridge helper failed to start from {remote_path}")
             }
-        }
-    }
-
-    pub(crate) fn for_bridge_transport(transport: BridgeTransportKind) -> Self {
-        match transport {
-            BridgeTransportKind::QuicAgent => Self::QuicAgent,
-            BridgeTransportKind::QuicNative => Self::QuicBridgeNative,
-            BridgeTransportKind::Auto
-            | BridgeTransportKind::AutoQuic
-            | BridgeTransportKind::DirectTcpip
-            | BridgeTransportKind::Agent => Self::StdioAgent,
         }
     }
 }
@@ -143,33 +130,5 @@ mod tests {
                 start_context
             );
         }
-    }
-
-    #[test]
-    fn helper_kind_maps_bridge_transports_to_helper_commands() {
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::QuicAgent),
-            HelperKind::QuicAgent
-        );
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::QuicNative),
-            HelperKind::QuicBridgeNative
-        );
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::Agent),
-            HelperKind::StdioAgent
-        );
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::DirectTcpip),
-            HelperKind::StdioAgent
-        );
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::Auto),
-            HelperKind::StdioAgent
-        );
-        assert_eq!(
-            HelperKind::for_bridge_transport(BridgeTransportKind::AutoQuic),
-            HelperKind::StdioAgent
-        );
     }
 }

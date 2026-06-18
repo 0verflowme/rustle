@@ -8,13 +8,14 @@ use crate::agent_bridge::{AgentBridgeConnector, AgentBridgeTransport, Reconnecti
 use crate::data_plane::{
     DataPlane, DirectTcpipDataPlane, FramedAgentDataPlane, QuicNativeDataPlane,
 };
-use crate::remote_helper::{BridgeHelperCommandPlan, HelperCommandPlan};
+use crate::remote_helper::HelperCommandPlan;
 use crate::ssh_control::connect_ssh_pool;
 use crate::transport_model::{BridgeTransportKind, Destination, TunnelRuntimeOptions};
 use crate::{agent_proto, SshArgs};
 
 use super::agent_policy::{resolve_agent_session_count, should_fast_start_agent_lanes};
 use super::agent_startup::connect_auto_agent_bridge_transports_from_connector;
+use super::helper_plan::BridgeHelperCommandPlan;
 use super::quic_startup::{
     connect_quic_native_bridge_fresh_ssh_command,
     connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout,
