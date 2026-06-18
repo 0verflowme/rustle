@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, Semaphore};
 
 use super::{ensure_agent_ready, mark_agent_failed, FailureState, StreamMap, WriterMetrics};
@@ -141,34 +142,50 @@ impl AgentStream {
 
     pub async fn recv(&mut self) -> Option<AgentFrame> {
         let frame = self.inbound.recv().await?;
+        if self
+            .apply_received_frame_side_effects(&frame)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Some(frame)
+    }
+
+    pub async fn try_recv(&mut self) -> Option<AgentFrame> {
+        let frame = match self.inbound.try_recv() {
+            Ok(frame) => frame,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return None,
+        };
+        if self
+            .apply_received_frame_side_effects(&frame)
+            .await
+            .is_err()
+        {
+            return None;
+        }
+        Some(frame)
+    }
+
+    async fn apply_received_frame_side_effects(&mut self, frame: &AgentFrame) -> Result<()> {
         match frame.kind {
             AgentFrameKind::Opened => {
                 if !self.initial_receive_credit_granted {
-                    if self
-                        .grant_receive_credit(AgentCreditWindow::initial_credit())
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
+                    self.grant_receive_credit(AgentCreditWindow::initial_credit())
+                        .await?;
                     self.initial_receive_credit_granted = true;
                 }
             }
             AgentFrameKind::Data if !frame.payload.is_empty() => {
-                if self
-                    .record_received_data_credit(frame.payload.len())
-                    .await
-                    .is_err()
-                {
-                    return None;
-                }
+                self.record_received_data_credit(frame.payload.len())
+                    .await?;
             }
             AgentFrameKind::Close | AgentFrameKind::Reset => {
                 self.close_credit_and_unregister().await;
             }
             _ => {}
         }
-        Some(frame)
+        Ok(())
     }
 
     pub async fn close(self) -> Result<()> {

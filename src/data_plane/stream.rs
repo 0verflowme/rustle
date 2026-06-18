@@ -223,6 +223,17 @@ impl AgentIoStream {
         }
     }
 
+    pub(crate) async fn try_recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
+        match self {
+            Self::Bridge { stream, .. } => Ok(stream.try_recv().await),
+            #[cfg(test)]
+            Self::Raw(stream) => Ok(stream.try_recv().await),
+            Self::DirectTcpip { .. } | Self::QuicNativeTcp { .. } | Self::QuicNativeUdp(_) => {
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) async fn close(self) -> Result<()> {
         match self {
             Self::Bridge { stream, .. } => stream.close().await,

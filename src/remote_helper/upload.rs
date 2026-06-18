@@ -1,9 +1,5 @@
 use std::env;
 use std::path::{Path, PathBuf};
-#[cfg(all(test, unix))]
-use std::process::Command;
-#[cfg(all(test, unix))]
-use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};
 use russh::client::Handle;

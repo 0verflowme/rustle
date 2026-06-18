@@ -144,6 +144,17 @@ impl AgentBridgeStream {
         frame
     }
 
+    pub(crate) async fn try_recv(&mut self) -> Option<agent_proto::AgentFrame> {
+        let frame = self.inner.as_mut()?.try_recv().await;
+        if matches!(
+            frame.as_ref().map(|frame| frame.kind),
+            Some(agent_proto::AgentFrameKind::Reset)
+        ) {
+            self.schedule_repair_if_transport_failed().await;
+        }
+        frame
+    }
+
     pub(crate) async fn close(mut self) -> Result<()> {
         match self.inner.take() {
             Some(stream) => {

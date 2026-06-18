@@ -1130,6 +1130,45 @@ async fn stream_recv_batches_receive_credit_until_threshold() {
 }
 
 #[tokio::test]
+async fn stream_try_recv_updates_receive_credit() {
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
+    let (inbound_tx, inbound) = mpsc::channel(8);
+    let mut stream = test_agent_stream(8, outbound, inbound);
+    let chunk = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / 4;
+
+    for _ in 0..4 {
+        inbound_tx
+            .send(
+                AgentFrame::new(AgentFrameKind::Data, 8, Bytes::from(vec![0x5a; chunk]))
+                    .expect("data frame"),
+            )
+            .await
+            .expect("queue data frame");
+    }
+
+    for _ in 0..4 {
+        let frame = stream.try_recv().await.expect("receive queued data frame");
+        assert_eq!(frame.kind, AgentFrameKind::Data);
+    }
+
+    let window = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(window.kind, AgentFrameKind::Window);
+    assert_eq!(window.stream_id, 8);
+    assert_eq!(
+        window.credit as usize,
+        AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
+    );
+    assert!(
+        writer_queue_is_empty(&mut outbound_rx),
+        "try_recv should emit exactly one batched receive-credit window"
+    );
+    assert!(
+        stream.try_recv().await.is_none(),
+        "empty stream should not block or synthesize a frame"
+    );
+}
+
+#[tokio::test]
 async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
     let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
     let (inbound_tx, inbound) = mpsc::channel(8);

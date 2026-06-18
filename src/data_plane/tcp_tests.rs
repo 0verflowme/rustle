@@ -146,6 +146,116 @@ async fn agent_tcp_bridge_sends_local_data_before_agent_opened() {
 }
 
 #[tokio::test]
+async fn agent_tcp_bridge_coalesces_queued_remote_data() {
+    let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let fake_agent = tokio::spawn(async move {
+        let (mut reader, mut writer) = tokio::io::split(agent_io);
+        let mut inbound = BytesMut::new();
+
+        let hello = read_test_agent_frame(&mut reader, &mut inbound).await;
+        assert_eq!(hello.kind, agent_proto::AgentFrameKind::Hello);
+        write_test_agent_frame(
+            &mut writer,
+            agent_proto::AgentFrame::new(
+                agent_proto::AgentFrameKind::Hello,
+                0,
+                agent_proto::AgentHello::current(DEFAULT_MTU).encode(),
+            )
+            .expect("test hello frame"),
+        )
+        .await;
+
+        let open = read_test_agent_frame(&mut reader, &mut inbound).await;
+        assert_eq!(open.kind, agent_proto::AgentFrameKind::OpenTcp);
+
+        let window = read_test_agent_frame(&mut reader, &mut inbound).await;
+        assert_eq!(window.kind, agent_proto::AgentFrameKind::Window);
+        assert_eq!(window.stream_id, open.stream_id);
+
+        write_test_agent_frame(
+            &mut writer,
+            agent_proto::AgentFrame::new(
+                agent_proto::AgentFrameKind::Opened,
+                open.stream_id,
+                Bytes::new(),
+            )
+            .expect("opened frame")
+            .with_credit((1024 * 1024) as u32),
+        )
+        .await;
+        write_test_agent_frame(
+            &mut writer,
+            agent_proto::AgentFrame::new(
+                agent_proto::AgentFrameKind::Data,
+                open.stream_id,
+                Bytes::from_static(b"remote-"),
+            )
+            .expect("first remote data frame"),
+        )
+        .await;
+        write_test_agent_frame(
+            &mut writer,
+            agent_proto::AgentFrame::new(
+                agent_proto::AgentFrameKind::Data,
+                open.stream_id,
+                Bytes::from_static(b"burst"),
+            )
+            .expect("second remote data frame"),
+        )
+        .await;
+
+        let _ = finish_rx.await;
+    });
+
+    let (client_reader, client_writer) = tokio::io::split(client_io);
+    let transport =
+        agent_transport::AgentTransport::connect(client_reader, client_writer, DEFAULT_MTU)
+            .await
+            .expect("connect fake agent transport");
+    let agent = ReconnectingAgentBridge::new(
+        QueuedAgentConnector::new("rustle agent", Vec::new(), Vec::new()),
+        vec![detached_bridge_transport(transport)],
+    );
+    let id = test_flow_id();
+    let (event_tx, mut event_rx) = mpsc::channel(4);
+    let bridge = spawn_agent_tcp_bridge(id, event_tx, agent);
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("opened event")
+        .expect("bridge event");
+    assert!(
+        matches!(event, flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
+    );
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("remote data event")
+        .expect("bridge event");
+    match event {
+        flow_bridge::BridgeEvent::RemoteData {
+            id: event_id,
+            bytes,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(&bytes[..], b"remote-burst");
+        }
+        other => panic!("expected coalesced remote data, got {other:?}"),
+    }
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv())
+            .await
+            .is_err(),
+        "queued remote data should be emitted as one event"
+    );
+
+    drop(bridge);
+    let _ = finish_tx.send(());
+    fake_agent.await.expect("fake agent join");
+}
+
+#[tokio::test]
 async fn agent_tcp_bridge_retries_pre_open_close_and_replays_local_data() {
     let (first_client_io, first_agent_io) = tokio::io::duplex(256 * 1024);
     let (replacement_client_io, replacement_agent_io) = tokio::io::duplex(256 * 1024);

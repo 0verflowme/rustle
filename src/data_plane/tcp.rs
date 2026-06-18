@@ -3,7 +3,7 @@ use std::future::Future;
 use std::time::Instant as StdInstant;
 
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
 
 use crate::agent_bridge::ReconnectingAgentBridge;
@@ -14,6 +14,8 @@ use crate::{agent_proto, flow_bridge, tcp_core};
 use super::stream::AgentIoStream;
 
 const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
+const REMOTE_DATA_COALESCE_MAX_FRAMES: usize = 8;
+const REMOTE_DATA_COALESCE_MAX_BYTES: usize = 512 * 1024;
 
 enum BridgeInput {
     OpenTimeout,
@@ -75,11 +77,14 @@ where
         let mut pre_open_local = VecDeque::<Bytes>::new();
         let mut pre_open_retries = 0_usize;
         let mut prefer_local_after_remote = false;
+        let mut pending_remote: Option<Result<Option<agent_proto::AgentFrame>>> = None;
         let open_timeout = tokio::time::sleep(flow_bridge::AGENT_STREAM_OPEN_TIMEOUT);
         tokio::pin!(open_timeout);
 
         loop {
-            let input = if prefer_local_after_remote {
+            let input = if let Some(remote) = pending_remote.take() {
+                BridgeInput::Remote(remote)
+            } else if prefer_local_after_remote {
                 tokio::select! {
                     biased;
                     _ = &mut open_timeout, if !open_reported => BridgeInput::OpenTimeout,
@@ -144,15 +149,15 @@ where
                                     open_reported = true;
                                     pre_open_local.clear();
                                 }
-                                trace.remote_bytes(frame.payload.len());
+                                let (payload, pending) =
+                                    coalesce_remote_data(&mut stream, frame.payload, &mut trace)
+                                        .await;
+                                pending_remote = pending;
                                 let event_started_at = StdInstant::now();
                                 let event_sent = flow_bridge::send_bridge_event_accounted(
                                     &event_tx,
                                     &event_accounting,
-                                    flow_bridge::BridgeEvent::RemoteData {
-                                        id,
-                                        bytes: frame.payload,
-                                    },
+                                    flow_bridge::BridgeEvent::RemoteData { id, bytes: payload },
                                 )
                                 .await;
                                 trace.remote_event_wait(event_started_at);
@@ -492,6 +497,49 @@ fn record_agent_eof_timing(trace: &mut TcpFlowTrace, frame: &agent_proto::AgentF
     if let Ok(Some(timing)) = agent_proto::AgentEofTiming::decode_optional(&frame.payload) {
         trace.agent_remote_output_timing(timing);
     }
+}
+
+async fn coalesce_remote_data(
+    stream: &mut AgentIoStream,
+    first_payload: Bytes,
+    trace: &mut TcpFlowTrace,
+) -> (Bytes, Option<Result<Option<agent_proto::AgentFrame>>>) {
+    trace.remote_bytes(first_payload.len());
+    let mut frames = 1_usize;
+    let mut total_bytes = first_payload.len();
+    let mut chunks = vec![first_payload];
+
+    while frames < REMOTE_DATA_COALESCE_MAX_FRAMES && total_bytes < REMOTE_DATA_COALESCE_MAX_BYTES {
+        match stream.try_recv().await {
+            Ok(Some(frame)) if frame.kind == agent_proto::AgentFrameKind::Data => {
+                trace.remote_bytes(frame.payload.len());
+                total_bytes = total_bytes.saturating_add(frame.payload.len());
+                chunks.push(frame.payload);
+                frames += 1;
+            }
+            Ok(Some(frame)) => {
+                return (
+                    join_remote_data_chunks(chunks, total_bytes),
+                    Some(Ok(Some(frame))),
+                )
+            }
+            Ok(None) => break,
+            Err(err) => return (join_remote_data_chunks(chunks, total_bytes), Some(Err(err))),
+        }
+    }
+
+    (join_remote_data_chunks(chunks, total_bytes), None)
+}
+
+fn join_remote_data_chunks(mut chunks: Vec<Bytes>, total_bytes: usize) -> Bytes {
+    if chunks.len() == 1 {
+        return chunks.pop().expect("remote data chunks must not be empty");
+    }
+    let mut output = BytesMut::with_capacity(total_bytes);
+    for chunk in chunks {
+        output.extend_from_slice(&chunk);
+    }
+    output.freeze()
 }
 
 #[cfg(test)]
