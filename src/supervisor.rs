@@ -5,8 +5,9 @@ use anyhow::{bail, Result};
 
 use crate::data_plane::DataPlane;
 use crate::packet_engine::{
-    parse_udp_request_for_agent_tunnel, tun_ipv4_packet, TunnelEngine, UdpAssociationTransportPlan,
-    MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES, PACKET_BUF_SIZE,
+    parse_udp_request_for_agent_tunnel, tun_ipv4_packet, TcpBridgeHandles, TunnelEngine,
+    UdpAssociationTransportPlan, MAX_ACTIVE_UDP_ASSOCIATIONS, MAX_IN_FLIGHT_DNS_QUERIES,
+    PACKET_BUF_SIZE,
 };
 use crate::transport_model::{Destination, UdpAssociationEvents};
 use crate::tun_io::TunWriter;
@@ -36,6 +37,7 @@ const STATS_LOG_INTERVAL: Duration = Duration::from_secs(5);
 pub(crate) struct TunnelSupervisor {
     dev: tun_rs::AsyncDevice,
     engine: TunnelEngine,
+    tcp_bridges: TcpBridgeHandles,
     data_plane: Arc<dyn DataPlane>,
     dns_remote: Destination,
     udp_association_idle_timeout: Duration,
@@ -54,6 +56,7 @@ impl TunnelSupervisor {
         Self {
             dev,
             engine: TunnelEngine::new(flow_manager),
+            tcp_bridges: TcpBridgeHandles::default(),
             data_plane,
             dns_remote,
             udp_association_idle_timeout,
@@ -67,6 +70,7 @@ impl TunnelSupervisor {
         let Self {
             dev,
             engine,
+            tcp_bridges,
             data_plane,
             dns_remote,
             udp_association_idle_timeout,
@@ -104,6 +108,7 @@ impl TunnelSupervisor {
                     eprintln!(
                         "stats: final {}",
                         engine.status_line(
+                            tcp_bridges.len(),
                             data_plane.snapshot().await,
                             bridge_event_accounting.snapshot(),
                         )
@@ -150,10 +155,10 @@ impl TunnelSupervisor {
                         engine,
                         &tun,
                         packet,
+                        tcp_bridges,
                         &mut tcp_bridge_starts,
                         &data_plane,
-                        &event_tx,
-                        &bridge_event_accounting,
+                        tcp::BridgeEventSink::new(&event_tx, &bridge_event_accounting),
                     )
                     .await?;
                 }
@@ -180,14 +185,16 @@ impl TunnelSupervisor {
                         engine,
                         event,
                         &mut event_rx,
+                        tcp_bridges,
                         &bridge_event_accounting,
                     )?;
-                    tcp::execute_bridge_event_cycle(engine, &tun).await?;
+                    tcp::execute_bridge_event_cycle(engine, tcp_bridges, &tun).await?;
                 }
                 _ = stats_tick.tick() => {
                     eprintln!(
                         "stats: {}",
                         engine.status_line(
+                            tcp_bridges.len(),
                             data_plane.snapshot().await,
                             bridge_event_accounting.snapshot(),
                         )
@@ -197,10 +204,10 @@ impl TunnelSupervisor {
                     tcp::execute_tick_cycle(
                         engine,
                         &tun,
+                        tcp_bridges,
                         &mut tcp_bridge_starts,
                         &data_plane,
-                        &event_tx,
-                        &bridge_event_accounting,
+                        tcp::BridgeEventSink::new(&event_tx, &bridge_event_accounting),
                     ).await?;
                 }
             }

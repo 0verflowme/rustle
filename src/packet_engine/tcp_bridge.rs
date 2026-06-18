@@ -13,6 +13,8 @@ use super::backlog::{RemoteBacklogPush, RemoteBacklogs};
 pub(crate) const LOCAL_DRAIN_CHUNK_BYTES: usize = tcp_core::TCP_RECV_BUFFER_BYTES;
 const _: () = assert!(LOCAL_DRAIN_CHUNK_BYTES <= flow_bridge::FLOW_CHANNEL_BYTES);
 
+pub(crate) type TcpBridgeHandles = HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>;
+
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct BridgeAdmissionStats {
     pub(crate) deferred_active_limit: u64,
@@ -51,7 +53,7 @@ pub(crate) struct BridgeEventStats {
 
 pub(crate) fn plan_bridge_starts(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &TcpBridgeHandles,
     limits: BridgeAdmissionLimits,
     ready_flow_ids: &mut Vec<tcp_core::FlowId>,
     opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
@@ -91,7 +93,7 @@ pub(crate) fn plan_bridge_starts(
 
 fn active_bridge_reservations(
     flow_manager: &tcp_core::FlowManager,
-    bridges: &HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &TcpBridgeHandles,
     opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
 ) -> usize {
     flow_manager.opening_flow_keys_into(opening_flow_keys);
@@ -104,7 +106,7 @@ fn active_bridge_reservations(
 
 pub(crate) fn register_tcp_bridge(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &mut TcpBridgeHandles,
     start: TcpBridgeStart,
     bridge: flow_bridge::FlowBridge,
 ) -> Result<()> {
@@ -131,7 +133,7 @@ pub(crate) fn register_tcp_bridge(
 
 pub(crate) fn drain_local_bytes_to_bridges(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &mut TcpBridgeHandles,
     flow_keys: &mut Vec<tcp_core::FlowKey>,
     now: SmolInstant,
 ) -> Result<LocalDrainStats> {
@@ -360,7 +362,7 @@ pub(crate) fn bridge_event_name(event: &flow_bridge::BridgeEvent) -> &'static st
 
 pub(crate) fn expire_stale_flows(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &mut TcpBridgeHandles,
     remote_backlogs: &mut RemoteBacklogs,
     now: SmolInstant,
     expired: &mut Vec<tcp_core::FlowKey>,
@@ -377,7 +379,7 @@ pub(crate) fn expire_stale_flows(
 
 pub(crate) fn prune_closed_flows(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
+    bridges: &mut TcpBridgeHandles,
     remote_backlogs: &mut RemoteBacklogs,
     removable: &mut Vec<tcp_core::FlowKey>,
 ) -> Result<usize> {

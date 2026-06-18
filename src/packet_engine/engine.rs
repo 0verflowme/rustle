@@ -18,7 +18,7 @@ use super::status::{TcpRuntimeSnapshot, TunnelStats, TunnelStatusSnapshot};
 use super::tcp_bridge::{
     drain_local_bytes_to_bridges, expire_stale_flows, handle_bridge_event_into, plan_bridge_starts,
     prune_closed_flows, register_tcp_bridge, BridgeAdmissionStats, BridgeEventStats,
-    LocalDrainStats, TcpBridgeStart,
+    LocalDrainStats, TcpBridgeHandles, TcpBridgeStart,
 };
 use super::tun::TunWriteStats;
 use super::udp::{
@@ -28,7 +28,6 @@ use super::udp::{
 
 pub(crate) struct TunnelEngine {
     flow_manager: tcp_core::FlowManager,
-    bridges: HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     udp_associations: HashMap<UdpFlowKey, UdpAssociation>,
     remote_backlogs: RemoteBacklogs,
     dns_admission: AdmissionCounter,
@@ -50,7 +49,6 @@ impl TunnelEngine {
     pub(crate) fn new(flow_manager: tcp_core::FlowManager) -> Self {
         Self {
             flow_manager,
-            bridges: HashMap::new(),
             udp_associations: HashMap::new(),
             remote_backlogs: RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW),
             dns_admission: AdmissionCounter::new(MAX_IN_FLIGHT_DNS_QUERIES),
@@ -125,13 +123,14 @@ impl TunnelEngine {
 
     pub(crate) fn status_line(
         &self,
+        active_tcp_bridges: usize,
         agent: DataPlaneRuntimeSnapshot,
         bridge_events: flow_bridge::BridgeEventQueueSnapshot,
     ) -> String {
         self.stats.status_line(TunnelStatusSnapshot {
             tcp: TcpRuntimeSnapshot {
                 active_flows: self.flow_manager.active_flow_count(),
-                ssh_channels: self.bridges.len(),
+                ssh_channels: active_tcp_bridges,
                 backlog_flows: self.remote_backlogs.active_flow_count(),
                 backlog_bytes: self.remote_backlogs.total_bytes(),
                 backlog_bytes_max: self.remote_backlogs.total_bytes_max(),
@@ -157,13 +156,14 @@ impl TunnelEngine {
 
     pub(crate) fn plan_bridge_starts(
         &mut self,
+        bridges: &TcpBridgeHandles,
         limits: BridgeAdmissionLimits,
         starts: &mut Vec<TcpBridgeStart>,
     ) -> Result<BridgeAdmissionStats> {
         let now = self.now();
         let admission_stats = plan_bridge_starts(
             &mut self.flow_manager,
-            &self.bridges,
+            bridges,
             limits,
             &mut self.ready_flow_ids,
             &mut self.opening_flow_keys,
@@ -176,17 +176,21 @@ impl TunnelEngine {
 
     pub(crate) fn register_tcp_bridge(
         &mut self,
+        bridges: &mut TcpBridgeHandles,
         start: TcpBridgeStart,
         bridge: flow_bridge::FlowBridge,
     ) -> Result<()> {
-        register_tcp_bridge(&mut self.flow_manager, &mut self.bridges, start, bridge)
+        register_tcp_bridge(&mut self.flow_manager, bridges, start, bridge)
     }
 
-    pub(crate) fn drain_local_bytes_to_bridges(&mut self) -> Result<LocalDrainStats> {
+    pub(crate) fn drain_local_bytes_to_bridges(
+        &mut self,
+        bridges: &mut TcpBridgeHandles,
+    ) -> Result<LocalDrainStats> {
         let now = self.now();
         let drain_stats = drain_local_bytes_to_bridges(
             &mut self.flow_manager,
-            &mut self.bridges,
+            bridges,
             &mut self.flow_keys,
             now,
         )?;
@@ -194,7 +198,7 @@ impl TunnelEngine {
         Ok(drain_stats)
     }
 
-    pub(crate) fn flush_remote_backlogs(&mut self) -> Result<()> {
+    pub(crate) fn flush_remote_backlogs(&mut self, bridges: &mut TcpBridgeHandles) -> Result<()> {
         let now = self.now();
         self.remote_backlogs.flush_all_into(
             &mut self.flow_manager,
@@ -203,24 +207,24 @@ impl TunnelEngine {
             &mut self.backlog_closed_flows,
         )?;
         for closed_flow in self.backlog_closed_flows.drain(..) {
-            self.bridges.remove(&closed_flow);
+            bridges.remove(&closed_flow);
         }
         self.flow_manager.poll_into(now, &mut self.outbound_packets);
         Ok(())
     }
 
-    pub(crate) fn expire_and_prune(&mut self) -> Result<()> {
+    pub(crate) fn expire_and_prune(&mut self, bridges: &mut TcpBridgeHandles) -> Result<()> {
         let now = self.now();
         self.stats.expired_flows = self.stats.expired_flows.saturating_add(expire_stale_flows(
             &mut self.flow_manager,
-            &mut self.bridges,
+            bridges,
             &mut self.remote_backlogs,
             now,
             &mut self.expired_flows,
         ) as u64);
         self.stats.pruned_flows = self.stats.pruned_flows.saturating_add(prune_closed_flows(
             &mut self.flow_manager,
-            &mut self.bridges,
+            bridges,
             &mut self.remote_backlogs,
             &mut self.removable_flows,
         )? as u64);
@@ -229,6 +233,7 @@ impl TunnelEngine {
 
     pub(crate) fn handle_bridge_event(
         &mut self,
+        bridges: &mut TcpBridgeHandles,
         event: flow_bridge::BridgeEvent,
     ) -> Result<BridgeEventStats> {
         self.stats.record_bridge_event(&event);
@@ -249,7 +254,7 @@ impl TunnelEngine {
             .stale_bridge_events
             .saturating_add(outcome.stale_bridge_events);
         for flow in self.bridge_event_closed_flows.drain(..) {
-            self.bridges.remove(&flow);
+            bridges.remove(&flow);
         }
         Ok(outcome)
     }
@@ -302,5 +307,89 @@ impl TunnelEngine {
     #[cfg(test)]
     pub(crate) fn stats_for_test(&self) -> &TunnelStats {
         &self.stats
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use smoltcp::time::Instant as SmolInstant;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn bridge_event_removes_supervisor_owned_bridge_handle() {
+        let packet = ipv4_tcp_packet(0x02, 0);
+        let flow = tcp_core::parse_ipv4_tcp_segment(&packet)
+            .expect("valid packet")
+            .expect("TCP segment")
+            .flow;
+        let mut flow_manager = tcp_core::FlowManager::new(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[tcp_core::Ipv4NetParts::new(
+                Ipv4Addr::new(172, 16, 0, 0),
+                16,
+            )],
+            1300,
+        )
+        .expect("flow manager");
+        flow_manager
+            .ingest_packet(SmolInstant::from_millis(0), &packet)
+            .expect("SYN");
+        flow_manager
+            .mark_flow_state(flow, tcp_core::FlowState::BridgeOpening)
+            .expect("mark bridge opening");
+        let id = flow_manager.flow_id(flow).expect("flow id");
+        let mut engine = TunnelEngine::new(flow_manager);
+        let mut tcp_bridges = TcpBridgeHandles::default();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let bridge =
+            flow_bridge::spawn_bridge_task(id, event_tx, |_id, _local_rx, _event_tx| async {});
+
+        engine
+            .register_tcp_bridge(
+                &mut tcp_bridges,
+                TcpBridgeStart {
+                    id,
+                    ready_wait_ms: 0,
+                },
+                bridge,
+            )
+            .expect("register bridge");
+        assert!(tcp_bridges.contains_key(&flow));
+
+        engine
+            .handle_bridge_event(&mut tcp_bridges, flow_bridge::BridgeEvent::Closed { id })
+            .expect("handle close");
+
+        assert!(!tcp_bridges.contains_key(&flow));
+        assert_eq!(engine.stats_for_test().ssh_closed, 1);
+    }
+
+    fn ipv4_tcp_packet(tcp_flags: u8, payload_len: usize) -> Vec<u8> {
+        let total_len = 20 + 20 + payload_len;
+        let mut packet = vec![0_u8; total_len];
+
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&[10, 255, 255, 1]);
+        packet[16..20].copy_from_slice(&[172, 16, 0, 9]);
+
+        let tcp = &mut packet[20..];
+        tcp[0..2].copy_from_slice(&49152_u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&443_u16.to_be_bytes());
+        tcp[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = tcp_flags;
+        tcp[14..16].copy_from_slice(&4096_u16.to_be_bytes());
+        for byte in &mut tcp[20..] {
+            *byte = b'x';
+        }
+
+        packet
     }
 }

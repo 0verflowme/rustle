@@ -3,7 +3,7 @@ use std::time::Instant as StdInstant;
 use anyhow::Result;
 
 use crate::flow_bridge::{self, BridgeEvent};
-use crate::packet_engine::TunnelEngine;
+use crate::packet_engine::{TcpBridgeHandles, TunnelEngine};
 
 const BRIDGE_EVENT_BATCH_LIMIT: usize = 32;
 
@@ -11,6 +11,7 @@ pub(super) fn handle_bridge_event_batch(
     engine: &mut TunnelEngine,
     first: BridgeEvent,
     event_rx: &mut tokio::sync::mpsc::Receiver<BridgeEvent>,
+    tcp_bridges: &mut TcpBridgeHandles,
     bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<usize> {
     let started_at = StdInstant::now();
@@ -28,7 +29,7 @@ pub(super) fn handle_bridge_event_batch(
             }
         };
         bridge_event_accounting.record_dequeued(&event);
-        engine.handle_bridge_event(event)?;
+        engine.handle_bridge_event(tcp_bridges, event)?;
         handled += 1;
         if engine.should_pause_bridge_events() {
             paused_by_backlog = true;
@@ -77,6 +78,7 @@ mod tests {
     #[test]
     fn bridge_event_batch_is_bounded() {
         let mut engine = test_engine();
+        let mut tcp_bridges = TcpBridgeHandles::default();
         let id = test_flow_id();
         let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(BRIDGE_EVENT_BATCH_LIMIT + 1);
@@ -89,6 +91,7 @@ mod tests {
             &mut engine,
             BridgeEvent::Closed { id },
             &mut rx,
+            &mut tcp_bridges,
             &bridge_event_accounting,
         )
         .expect("handle bridge event batch");
@@ -107,6 +110,7 @@ mod tests {
     #[test]
     fn bridge_event_batch_records_stats() {
         let mut engine = test_engine();
+        let mut tcp_bridges = TcpBridgeHandles::default();
         let id = test_flow_id();
         let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -117,6 +121,7 @@ mod tests {
             &mut engine,
             BridgeEvent::Closed { id },
             &mut rx,
+            &mut tcp_bridges,
             &bridge_event_accounting,
         )
         .expect("handle bridge event batch");
@@ -133,6 +138,7 @@ mod tests {
     #[test]
     fn bridge_event_batch_handles_receiver_disconnect_after_first_event() {
         let mut engine = test_engine();
+        let mut tcp_bridges = TcpBridgeHandles::default();
         let id = test_flow_id();
         let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
@@ -142,6 +148,7 @@ mod tests {
             &mut engine,
             BridgeEvent::Closed { id },
             &mut rx,
+            &mut tcp_bridges,
             &bridge_event_accounting,
         )
         .expect("handle bridge event batch");
@@ -156,6 +163,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_event_batch_releases_accounted_remote_data_on_dequeue() {
         let mut engine = test_engine();
+        let mut tcp_bridges = TcpBridgeHandles::default();
         let id = test_flow_id();
         let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
@@ -181,9 +189,14 @@ mod tests {
             .await
             .expect("first bridge event should be queued");
 
-        let handled =
-            handle_bridge_event_batch(&mut engine, first, &mut rx, &bridge_event_accounting)
-                .expect("handle bridge event batch");
+        let handled = handle_bridge_event_batch(
+            &mut engine,
+            first,
+            &mut rx,
+            &mut tcp_bridges,
+            &bridge_event_accounting,
+        )
+        .expect("handle bridge event batch");
 
         assert_eq!(handled, 2);
         assert_eq!(bridge_event_accounting.snapshot().remote_bytes, 0);

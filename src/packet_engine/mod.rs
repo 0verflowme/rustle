@@ -16,7 +16,7 @@ pub(crate) use engine::TunnelEngine;
 pub(crate) use status::TunnelStats;
 pub(crate) use tcp_bridge::{
     drain_local_bytes_to_bridges, expire_stale_flows, handle_bridge_event_into, plan_bridge_starts,
-    prune_closed_flows, register_tcp_bridge, TcpBridgeStart,
+    prune_closed_flows, register_tcp_bridge, TcpBridgeHandles, TcpBridgeStart,
 };
 pub(crate) use tun::{tun_ipv4_packet, TunWriteStats, PACKET_BUF_SIZE};
 pub(crate) use udp::{
