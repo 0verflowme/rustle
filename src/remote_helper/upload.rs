@@ -1,8 +1,8 @@
 use std::env;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::process::Command;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::time::{Duration, Instant as StdInstant};
 
 use anyhow::{bail, Context, Result};

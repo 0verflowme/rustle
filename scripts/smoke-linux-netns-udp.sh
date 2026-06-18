@@ -39,6 +39,10 @@ if [[ -z "$SSHD_PATH" ]]; then
   fi
 fi
 [[ -x "$SSHD_PATH" ]] || smoke_die "sshd is not executable: $SSHD_PATH"
+if [[ ! -d /run/sshd ]]; then
+  "${SUDO_CMD[@]}" mkdir -p /run/sshd
+  "${SUDO_CMD[@]}" chmod 755 /run/sshd
+fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-netns-udp-smoke.XXXXXX")"
 NS_NAME="rustle-udp-$$"
@@ -208,8 +212,16 @@ printf '[%s]:%s %s\n' "$SSH_IP" "$SSH_PORT" "$host_pub" >"$KNOWN_HOSTS"
   printf 'LogLevel ERROR\n'
 } >"$SSHD_CONFIG"
 
-"${SUDO_CMD[@]}" ip netns exec "$NS_NAME" "$SSHD_PATH" -f "$SSHD_CONFIG" -D -e \
-  >"$SSHD_LOG" 2>&1 &
+start_netns_sshd() {
+  if [[ "$(id -u)" -eq 0 || "$SMOKE_SSH_USER" == "root" ]]; then
+    "${SUDO_CMD[@]}" ip netns exec "$NS_NAME" "$SSHD_PATH" -f "$SSHD_CONFIG" -D -e
+  else
+    "${SUDO_CMD[@]}" ip netns exec "$NS_NAME" sudo -n -u "$SMOKE_SSH_USER" \
+      "$SSHD_PATH" -f "$SSHD_CONFIG" -D -e
+  fi
+}
+
+start_netns_sshd >"$SSHD_LOG" 2>&1 &
 SSHD_PID=$!
 
 if ! smoke_wait_for_port "$SSH_IP" "$SSH_PORT" 10; then

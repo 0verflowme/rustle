@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use ipnet::Ipv4Net;
 use tokio::net::UdpSocket;
@@ -403,7 +403,7 @@ async fn wait_for_shutdown_signal(
         let mut sigint = match signal(interrupt.kind()) {
             Ok(signal) => signal,
             Err(err) => {
-                let err = Error::new(err)
+                let err = anyhow::Error::new(err)
                     .context(format!("failed to listen for {}", interrupt.os_name()));
                 let _ = ready.send(Err(format!("{err:#}")));
                 return Err(err);
@@ -412,7 +412,7 @@ async fn wait_for_shutdown_signal(
         let mut sigterm = match signal(terminate.kind()) {
             Ok(signal) => signal,
             Err(err) => {
-                let err = Error::new(err)
+                let err = anyhow::Error::new(err)
                     .context(format!("failed to listen for {}", terminate.os_name()));
                 let _ = ready.send(Err(format!("{err:#}")));
                 return Err(err);
@@ -421,8 +421,8 @@ async fn wait_for_shutdown_signal(
         let mut sighup = match signal(hangup.kind()) {
             Ok(signal) => signal,
             Err(err) => {
-                let err =
-                    Error::new(err).context(format!("failed to listen for {}", hangup.os_name()));
+                let err = anyhow::Error::new(err)
+                    .context(format!("failed to listen for {}", hangup.os_name()));
                 let _ = ready.send(Err(format!("{err:#}")));
                 return Err(err);
             }
