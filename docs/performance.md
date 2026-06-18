@@ -735,6 +735,94 @@ Summarize them with
 `scripts/summarize-quic-diagnostics.py` to distinguish UDP reachability,
 certificate/bootstrap, auth-stream, and framed-agent protocol failures without
 exposing raw tokens.
+
+### Current Contabo RC Blockers
+
+The latest 2026-06-18 Contabo release-candidate run moved the blocker from
+setup into product behavior. SSH alias resolution, privileged local TUN/DNS
+route tests, macOS DNS takeover/restore, live agent smoke, live direct-tcpip
+smoke, live agent UDP smoke, and local/rootless QUIC-native 100 MiB throughput
+all passed. Local correctness gates also passed.
+
+The failed release-candidate gate is tiny-response latency against sshuttle on
+the same live target:
+
+| Tool | avg p50 |
+| --- | ---: |
+| `rustle-agent` | 200.6 ms |
+| `sshuttle` | 183.2 ms |
+
+The ratio was 1.09, while the release-candidate gate requires
+`rustle-agent <= sshuttle` on average p50.
+
+The same controlled fixture showed that Rustle is much faster than sshuttle on
+bulk transfer, but not fast enough to call the agent path production-grade for
+large live responses yet:
+
+| Fixture | Result |
+| --- | --- |
+| 1 MiB | `rustle-agent` 4.29 MiB/s, `direct-tcpip` 3.10 MiB/s, `sshuttle` 0.24 MiB/s |
+| 10 MiB | `rustle-agent` 5.96 MiB/s, `direct-tcpip` timed out with partial response |
+| 100 MiB single-flow | `rustle-agent` completed in 26.5 s, about 3.78 MiB/s |
+| 100 MiB concurrent | default 45 s curl timeout hit; one response reached about 72.9 MiB before timeout |
+
+QUIC-native is not production-ready on this host yet. Rebuilding the Linux
+sidecar removed stale `RUSTLE_QUIC_BRIDGE_V1` bootstrap output and produced
+`RUSTLE_QUIC_BRIDGE_V2`, so helper selection and upload are no longer the
+blocker. Raw UDP echo to Contabo rules out a blanket provider UDP block, but it
+does not prove that the helper's random advertised `bootstrap_port` is reachable
+or that post-TLS token auth and bridge stream readiness are healthy. The current
+live failure is therefore in the QUIC helper reachability/auth/readiness slice,
+not in sidecar selection.
+
+### Live Performance Research Plan
+
+Treat Rustle as a transport scheduler with three independent live bottlenecks:
+open latency, byte throughput, and concurrent-flow fairness. Do not guess-tune
+until the hotpath artifact identifies the dominant term.
+
+1. Capture a fresh Contabo artifact with `RUSTLE_HOTPATH_TRACE=1` and preserve
+   `hotpath-summary.tsv`, `startup-summary.tsv`, `live-results.tsv`,
+   `live-diagnosis.tsv`, and QUIC diagnostics. The required first split is
+   `remote_open_wait` versus `post_open_first_byte_wait`; if almost all p50 is
+   in `remote_open_wait`, optimize stream open scheduling, not TCP payload
+   forwarding. Also add the missing writer-side counters before tuning:
+   enqueue-to-write lag, burst write duration, flush duration, queued
+   frames/bytes, high-water marks, and burst frame/byte counts per agent lane.
+2. For tiny responses, optimize the framed-agent open path only after the trace
+   proves the wait. Current code already opens TCP optimistically, grants
+   optimistic initial send credit, and records first-local/first-sent timings.
+   The next likely wins are coalescing `OpenTcp` with the first local payload
+   into one writer turn, ensuring priority control frames are never delayed
+   behind large data bursts, and reducing any bridge admission or local queue
+   delay before the first payload reaches the agent writer.
+3. For 100 MiB live throughput, use the trace counters to decide whether the cap
+   is `agent_send_credit_wait`, `agent_send_outbound_wait`, `remote_event_wait`,
+   packet-engine backlog, TUN write pressure, or writer flush/write time. The
+   framed-agent window already starts at 4 MiB and grows to 24 MiB, so a
+   3-6 MiB/s WAN result is more likely a scheduler/carrier/drain problem than a
+   raw initial-window constant.
+4. For concurrent 100 MiB transfers, prove fairness separately from raw
+   throughput. The writer already round-robins non-priority frames inside each
+   collected burst; remaining work is to test full writer turns under live RTT,
+   make lane load byte-aware instead of only stream-count-aware if needed, and
+   add a fixture gate that fails when any concurrent response starves while
+   another drains.
+5. For QUIC-native, add an explicit post-auth bridge liveness proof before
+   treating connect success as ready. A good proof is a tiny authenticated
+   health stream or a loopback-safe open/status exchange that verifies the
+   remote `quic-bridge-agent` command loop is accepting streams after TLS and
+   token auth complete.
+6. Before QUIC-native can be default or performance-first `auto-quic`, add route
+   protection for the actual resolved QUIC UDP carrier addresses under
+   full-tunnel `0.0.0.0/0`, a diagnostic way to pin the helper UDP bind/port
+   during live tests, clear auth-stage diagnostics for live timeouts, reconnect
+   or explicit failure semantics after the QUIC connection dies, and repeated
+   live TCP/DNS/UDP/100 MiB gates on both macOS and Linux.
+
+The product order remains: fix the SSH-agent p50 release-candidate blocker
+first, fix live 100 MiB drain/fairness second, then graduate QUIC-native from
+experimental only after live auth/readiness and route-protection gates pass.
 When `RUSTLE_LIVE_REMOTE` or `RUSTLE_LIVE_UDP_REMOTE` is an OpenSSH `Host`
 alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_SSH_CONFIG=$HOME/.ssh/config` or the UDP-specific
