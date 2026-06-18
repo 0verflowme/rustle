@@ -5,7 +5,8 @@ use anyhow::Result;
 use crate::flow_bridge::{self, BridgeEvent};
 use crate::packet_engine::{TcpBridgeHandles, TunnelEngine};
 
-const BRIDGE_EVENT_BATCH_LIMIT: usize = 32;
+const BRIDGE_EVENT_BATCH_LIMIT: usize = 128;
+const BRIDGE_EVENT_BATCH_REMOTE_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn handle_bridge_event_batch(
     engine: &mut TunnelEngine,
@@ -14,11 +15,32 @@ pub(super) fn handle_bridge_event_batch(
     tcp_bridges: &mut TcpBridgeHandles,
     bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<usize> {
+    handle_bridge_event_batch_with_limits(
+        engine,
+        first,
+        event_rx,
+        tcp_bridges,
+        bridge_event_accounting,
+        BRIDGE_EVENT_BATCH_LIMIT,
+        BRIDGE_EVENT_BATCH_REMOTE_BYTES,
+    )
+}
+
+fn handle_bridge_event_batch_with_limits(
+    engine: &mut TunnelEngine,
+    first: BridgeEvent,
+    event_rx: &mut tokio::sync::mpsc::Receiver<BridgeEvent>,
+    tcp_bridges: &mut TcpBridgeHandles,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
+    max_events: usize,
+    max_remote_bytes: usize,
+) -> Result<usize> {
     let started_at = StdInstant::now();
     let mut handled = 0_usize;
+    let mut handled_remote_bytes = 0_usize;
     let mut paused_by_backlog = false;
     let mut next = Some(first);
-    while handled < BRIDGE_EVENT_BATCH_LIMIT {
+    while handled < max_events {
         let event = if let Some(event) = next.take() {
             event
         } else {
@@ -28,11 +50,16 @@ pub(super) fn handle_bridge_event_batch(
                 Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         };
+        let remote_bytes = remote_event_bytes(&event);
         bridge_event_accounting.record_dequeued(&event);
         engine.handle_bridge_event(tcp_bridges, event)?;
         handled += 1;
+        handled_remote_bytes = handled_remote_bytes.saturating_add(remote_bytes);
         if engine.should_pause_bridge_events() {
             paused_by_backlog = true;
+            break;
+        }
+        if max_remote_bytes > 0 && handled_remote_bytes >= max_remote_bytes {
             break;
         }
     }
@@ -40,9 +67,18 @@ pub(super) fn handle_bridge_event_batch(
     Ok(handled)
 }
 
+fn remote_event_bytes(event: &BridgeEvent) -> usize {
+    match event {
+        BridgeEvent::RemoteData { bytes, .. } => bytes.len(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
+
+    use bytes::Bytes;
 
     use super::*;
     use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
@@ -100,6 +136,53 @@ mod tests {
         assert_eq!(
             rx.try_recv().expect("one queued event should remain"),
             BridgeEvent::Closed { id }
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn bridge_event_batch_is_bounded_by_remote_bytes() {
+        let mut engine = test_engine();
+        let mut tcp_bridges = TcpBridgeHandles::default();
+        let id = test_flow_id();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+        let first = BridgeEvent::RemoteData {
+            id,
+            bytes: Bytes::from_static(b"first"),
+        };
+        tx.try_send(BridgeEvent::RemoteData {
+            id,
+            bytes: Bytes::from_static(b"second"),
+        })
+        .expect("queue second remote data event");
+        tx.try_send(BridgeEvent::RemoteData {
+            id,
+            bytes: Bytes::from_static(b"third"),
+        })
+        .expect("queue third remote data event");
+
+        let handled = handle_bridge_event_batch_with_limits(
+            &mut engine,
+            first,
+            &mut rx,
+            &mut tcp_bridges,
+            &bridge_event_accounting,
+            8,
+            6,
+        )
+        .expect("handle bridge event batch");
+
+        assert_eq!(handled, 2);
+        assert_eq!(
+            rx.try_recv().expect("third event should remain queued"),
+            BridgeEvent::RemoteData {
+                id,
+                bytes: Bytes::from_static(b"third")
+            }
         );
         assert!(matches!(
             rx.try_recv(),

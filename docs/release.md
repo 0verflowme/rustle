@@ -414,6 +414,9 @@ Required before tagging a release:
   `bridge_event_batch_releases_accounted_remote_data_on_dequeue` pass, proving
   remote `RemoteData` bytes are visible in bridge-event queue accounting before
   packet-engine backlog ingestion and are released on dequeue or send timeout.
+- `bridge_event_batch_is_bounded_by_remote_bytes` passes, proving bulk
+  remote-data drain work is bounded by a byte budget as well as an event-count
+  budget, so a single busy bridge queue cannot monopolize the supervisor loop.
 - `stale_remote_data_storm_after_flow_removal_is_bounded` passes, proving
   high-rate stale `RemoteData` after a flow has been removed does not recreate
   remote backlog state or emit closed-flow cleanup work.

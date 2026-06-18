@@ -647,7 +647,10 @@ inside the packet engine, and `bridge_event_queue=remote_bytes:<n> max:<n>
 remote_bytes_raw:<n> max_raw:<n>` reports remote `RemoteData` bytes already
 queued by bridge tasks but not yet dequeued by the packet engine.
 `bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
-supervisor bridge-event batch pressure and backlog pauses.
+supervisor bridge-event batch pressure and backlog pauses. The supervisor drains
+bridge events in batches bounded by both event count and remote-data bytes, so
+bulk transfers can reduce queue residency without letting one bridge wake
+monopolize the loop.
 `agent_writer=...` reports framed-agent writer pressure: current/max queued
 frames and bytes, burst counts and byte totals, enqueue-to-write delay, and
 writer/flush timings. Live artifacts summarize those fields into
