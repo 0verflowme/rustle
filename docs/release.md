@@ -1,5 +1,29 @@
 # Rustle Release Notes
 
+## Current Release Posture
+
+Rustle is not production-released yet. The default `agent` transport is the v1
+product path, and current local/live evidence shows it can run real TCP, DNS,
+UDP, and full-tunnel traffic. A release is blocked until the release-candidate
+matrix proves the same behavior across supported platforms and leaves no
+Rustle-owned network or helper state behind.
+
+Required before calling a build production-ready:
+
+- remote uploaded-helper cleanup must be deterministic after normal shutdown,
+  failed startup, Ctrl-C, and helper crash paths;
+- live TCP, live UDP, full-tunnel, DNS takeover, and route/DNS restoration gates
+  must pass on privileged macOS/Linux hosts;
+- native Windows TUN smoke must pass with packaged Wintun artifacts;
+- the default `agent` live p50 gate must match or beat sshuttle on the same
+  target;
+- `quic-native` must remain opt-in until live throughput and p50 ratio gates
+  consistently beat the default agent path.
+
+The release process should treat stale remote `/tmp/rustle-agent.*` directories,
+stale routes, stale DNS settings, leaked helper processes, or incomplete live
+evidence as release failures.
+
 ## Binary Targets
 
 The release workflow builds native archives for:

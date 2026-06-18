@@ -127,6 +127,20 @@ chunked-response cases for local regression checks. When `RUSTLE_HOTPATH_TRACE`
 is enabled, `scripts/bench-bridge-lab.sh` summarizes traced flow timings from
 the per-run stderr logs before cleanup.
 
+## Current Performance Posture
+
+Rustle's performance status is mixed and should be described precisely:
+
+- The default `agent` path is competitive with sshuttle on tiny live responses
+  in the latest Contabo run, but the margin is small.
+- Native QUIC is functional and faster than `agent` on the latest 100 MiB
+  Contabo fixture, but it is not yet the large step-function speedup the v2 data
+  plane is intended to deliver.
+- Live bulk runs currently point at supervisor event-queue pressure, so the next
+  performance work is data-path queue reduction before marketing claims.
+- QUIC remains opt-in until live throughput, tiny p50, UDP reachability,
+  fallback, reconnect, and cleanup gates are consistently green.
+
 The framed-agent stream window starts at 4 MiB and can grow to 24 MiB. The
 initial window is deliberately larger than a minimal LAN default because live
 SSH-agent traffic is RTT-sensitive: at 200 ms RTT, a 1 MiB first-flight window
@@ -654,62 +668,33 @@ shape and target.
 
 ### Current Live Fixture Evidence
 
-The following rows were collected on 2026-06-16 from a macOS client against the
-`contabo` SSH config alias, routing only the remote-side fixture address
-`172.17.0.1/32`. They are lab evidence for this client, network, and host, not a
-portable release claim.
+The following rows were collected on 2026-06-18 from a macOS client against the
+`contabo` SSH config alias, using a controlled remote loopback fixture at
+`198.18.77.77/32`. They are lab evidence for this client, network, and host, not
+a portable release claim.
 
 | Fixture | Tool | Runs | Result |
 | --- | --- | ---: | --- |
-| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 218.1 ms |
-| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 174.1 ms |
-| 10 MiB, 1 request | `rustle-agent` | 2 | avg throughput 3.90 MiB/s |
-| 10 MiB, 1 request | `rustle-quic-native` | 2 | avg throughput 2.71 MiB/s, with one slow outlier |
-| 10 MiB, 1 request | `sshuttle` | 2 | avg throughput 0.19 MiB/s |
-| 100 MiB, 1 request | `rustle-agent` | 1 | 5.65 MiB/s |
-| 100 MiB, 1 request | `rustle-quic-native` | 1 | 14.84 MiB/s |
-| 100 MiB, 1 request | `sshuttle` | 1 | timed out after 75 s with 14.36 MiB received |
+| 1 KiB, 12 requests, concurrency 1 | `rustle-agent` | 3 | 36/36 succeeded, median p50 `163.50 ms` |
+| 1 KiB, 12 requests, concurrency 1 | `sshuttle` | 3 | 36/36 succeeded, median p50 `177.73 ms` |
+| 100 MiB, 1 request | `rustle-agent` | 2 | avg throughput about `10.60 MiB/s` |
+| 100 MiB, 1 request | `rustle-quic-native` | 2 | avg throughput about `14.59 MiB/s` |
+| 1 KiB, 4 requests, concurrency 1 | `rustle-auto-quic` | 1 | selected native QUIC and succeeded, but decision trace reached about `10 s` |
+| UDP fixture | `rustle-agent` | 1 | passed, with idle association cleanup |
+| UDP fixture | `rustle-quic-native` | 1 | passed, proving UDP/QUIC reachability on this host |
+| 1 KiB full tunnel `0.0.0.0/0` | `rustle-agent` | 1 | passed, including split default route cleanup |
 
-This proves the current bulk-transfer path is already much faster than sshuttle
-on that lab route, and that `quic-native` can provide the intended high-throughput
-optional data plane. It also shows the default SSH-agent path does not yet beat
-sshuttle on tiny-response latency on this host, so tiny p50 remains an open
-performance gate rather than a completed claim.
+The good news: the default agent path matched or beat sshuttle p50 on this live
+tiny-response run, and native QUIC was faster than agent for the 100 MiB body.
+The bad news: the 100 MiB run diagnosed `supervisor_event_queue_pressure`, and
+the native QUIC improvement was about 1.4x, not yet the intended high-speed
+data-plane jump. Treat QUIC as functional opt-in evidence, not a default-ready
+performance claim.
 
-The following traced run was collected on 2026-06-18 from a Linux client against
-the `bugserver` SSH config alias, routing only the remote container fixture
-address `172.17.0.2/32`. The client also has a local Docker `172.17.0.0/16`
-route, so this proof depends on Rustle installing a more-specific `/32` route.
-`bugserver` is Ubuntu 16.04; the run required
-`RUSTLE_AGENT_DIR=target/rustle-agent-dir` so the uploaded helper used the
-portable Linux sidecar instead of the local glibc release binary.
-
-| Fixture | Tool | Runs | Result |
-| --- | --- | ---: | --- |
-| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 238.3 ms |
-| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 251.4 ms |
-
-The trace summaries reported `rustle_agent_startup` success for all three agent
-starts with primary startup p50 9.7 s. The controller hotpath showed
-`first_byte_wait` p50 242.1 ms, but almost all of that overlapped remote open:
-`remote_open_wait` p50 was 242.0 ms and the post-open first-byte delay was
-0.034 ms. The remote agent's measured TCP connect component was only 0.217 ms
-p50, leaving 241.8 ms p50 as agent open transport wait. That means this run no
-longer points at helper startup, remote TCP connect, or remote HTTP response
-delay once the portable sidecar is selected; the tiny-response path is dominated
-by the SSH/framed-agent open round trip and scheduling between the local
-controller and remote helper after the optimistic open and first local payload
-have been sent.
-
-On the same `bugserver` host, `quic-native` is currently blocked by UDP
-reachability rather than local QUIC setup. A 2026-06-18 forced `quic-native`
-fixture attempt completed SSH bootstrap and emitted successful `client_bind`,
-`client_config`, and `connect_start` diagnostics for
-`10.158.153.122:34345`, then timed out after 15000 ms in the QUIC data-plane
-attempt. Raw UDP probes to the SSH host also timed out. The same run verified
-failed uploaded-helper cleanup: after the forced startup failure, the remote
-host had zero `/tmp/rustle-agent.*` directories and no lingering
-`rustle-agent`, `quic-agent`, or `quic-bridge-agent` helper processes.
+Operational note: these same live runs proved sidecar upload and SHA-256
+verification work, but successful runs left stale remote `/tmp/rustle-agent.*`
+directories. That cleanup issue is a release blocker until the helper lifecycle
+and live verifier both prove no remote Rustle-owned helper artifacts remain.
 
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:

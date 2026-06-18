@@ -127,6 +127,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "docs/code-health.md",
             "docs/performance.md",
             "docs/release.md",
+            "docs/status.md",
             "docs/troubleshooting.md",
         ],
     },

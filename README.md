@@ -1,29 +1,59 @@
 # Rustle
 
-Rustle is an experimental, cross-platform SSH network pivoting tool written in
-Rust. It routes selected IPv4 traffic through a local TUN interface and carries
-the traffic over SSH to a remote host.
+Rustle is a pre-release, cross-platform SSH tunneling tool written in Rust. It
+routes selected IPv4 traffic through a local TUN interface, handles TCP, DNS,
+and UDP in user space, and carries traffic to the remote side through an
+authenticated Rustle helper.
 
-Rustle is designed as a next-generation alternative to sshuttle, with a
-user-space networking core and a framed Rustle agent protocol as the primary
-transport.
+The v1 product path is the default SSH-agent data plane:
+
+```sh
+sudo rustle -r user@host 10.0.0.0/8
+sudo rustle -r user@host 0.0.0.0/0
+```
+
+Rustle is designed to replace sshuttle for daily IPv4 use first, then expose an
+optional QUIC data plane for higher-throughput workloads once the QUIC gates are
+consistently better than the SSH-agent path on live targets.
 
 ## Features
 
 - Cross-platform TUN-based capture for macOS, Linux, and Windows.
 - Compact sshuttle-style CLI.
-- IPv4 TCP tunneling over SSH.
+- IPv4 TCP tunneling through the default framed SSH-agent transport.
+- Full-tunnel split-route support for `0.0.0.0/0`.
 - DNS interception with `--dns`.
-- Generic IPv4 UDP forwarding through the Rustle agent transport.
-- Bounded queues and explicit flow-control paths for load-bearing behavior.
+- Generic IPv4 UDP forwarding through the agent transport.
+- Automatic remote helper startup with sidecar upload when the remote binary is
+  not installed.
+- Bounded queues, explicit credit, reconnect, and cleanup-oriented telemetry.
+- Opt-in QUIC data planes for performance experiments.
 - `direct-tcpip` compatibility mode for labs and comparisons.
 
 ## Status
 
-Rustle is still under active development. The agent transport is the preferred
-architecture, and the high-fanout TCP lifecycle path is covered by a rootless
-256-flow stress gate. Live remote, DNS takeover, and cross-platform TUN proof
-are still required before treating Rustle as production-ready pivoting software.
+Short answer: Rustle is still pre-release, but not all paths are equally
+experimental.
+
+| Area | Current posture |
+| --- | --- |
+| Default `agent` transport | Product path for v1. Local verifier, stress, live TCP, live UDP, and full-tunnel Contabo checks pass. |
+| Remote helper upload | Functional and SHA-256 verified, but remote temp cleanup must be hardened before release. |
+| DNS takeover | Implemented, but must pass the release-candidate resolver leak/restore gates on the target platform. |
+| `quic-native` | Opt-in v2 path. It works and was faster than `agent` in the latest Contabo 100 MiB fixture, but is not default-ready. |
+| `auto-quic` | Hidden experiment. It can select QUIC or fall back, but startup decision latency still needs work. |
+| `direct-tcpip` | Lab and fallback comparison path only. |
+
+Latest live evidence from a macOS client to the `contabo` SSH alias:
+
+- 1 KiB fixture: `rustle-agent` p50 `163.50 ms`, sshuttle p50 `177.73 ms`.
+- 100 MiB fixture: `rustle-agent` about `10.6 MiB/s`, `quic-native` about
+  `14.6 MiB/s`.
+- Agent and native-QUIC live UDP smokes passed.
+- Full tunnel `0.0.0.0/0` over agent passed against the controlled fixture.
+
+Remaining release blockers are tracked in [`docs/status.md`](docs/status.md)
+and the hard release gates in [`docs/release.md`](docs/release.md).
 
 IPv6 is not part of the current MVP.
 
@@ -238,6 +268,7 @@ scripts/bench-live-fixture.sh
 
 ## Documentation
 
+- [`docs/status.md`](docs/status.md): current maturity, blockers, and next work
 - [`docs/architecture.md`](docs/architecture.md): architecture and protocol notes
 - [`docs/performance.md`](docs/performance.md): benchmarking methodology
 - [`docs/release.md`](docs/release.md): release and platform packaging

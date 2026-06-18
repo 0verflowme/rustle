@@ -1,14 +1,89 @@
 # Rustle Architecture
 
-Rustle is a user-space network pivot. The end-state pipeline is:
+Rustle is a user-space network pivot and SSH-authenticated tunneling tool. The
+product pipeline is:
 
 ```text
-local app -> OS route -> TUN -> userspace TCP/UDP handling -> SSH transport -> remote socket
+local app
+  -> OS route
+  -> TUN
+  -> packet engine
+  -> data plane
+  -> remote socket
 ```
 
 The project intentionally avoids firewall redirect hooks. Route injection is
 allowed because traffic must reach the TUN device, but Rustle must not depend on
 `iptables`, `nftables`, `pf`, or Windows Filtering Platform.
+
+## Current Architecture Decision
+
+Rustle is still pre-release, but the architecture has a stable product spine:
+
+```text
+CLI
+  -> Supervisor
+  -> Packet Engine
+  -> DataPlane trait
+  -> agent | quic-native | direct-tcpip
+```
+
+The default path is the SSH-authenticated framed agent data plane. Native QUIC
+is a second data plane, not a patch inside agent logic. SSH remains the
+bootstrap and authentication mechanism for the remote helper; QUIC becomes only
+the data carrier after helper bootstrap succeeds.
+
+The current product rule is:
+
+- `agent` is the v1 default and the only daily-use path.
+- `quic-native` is the v2 opt-in high-performance path.
+- `auto-quic` is hidden until probe latency, fallback behavior, reconnect, and
+  live performance gates are stable.
+- `direct-tcpip` is a compatibility/lab path, not the architecture to optimize.
+
+## Runtime Ownership
+
+Rustle's modules are split by ownership rather than by protocol names:
+
+- CLI parses sshuttle-style commands, hidden lab switches, SSH auth options, and
+  target CIDRs. It does not own runtime lifecycle.
+- Supervisor owns lifecycle. It prepares TUN, route, DNS, SSH/control state, the
+  selected data plane, signal handling, shutdown ordering, and final stats.
+- Packet engine owns packet semantics. It reads and writes TUN packets, drives
+  smoltcp TCP state, handles DNS/UDP ingress, tracks flow admission, and exposes
+  transport-neutral bridge starts and bridge events.
+- Control plane owns remote access. It resolves SSH config aliases, enforces
+  host-key policy, authenticates over SSH, probes the remote platform, prepares
+  helper command plans, uploads/verifies sidecars, and starts helpers.
+- Data planes implement transport behavior. They expose TCP open, hostname TCP
+  open, UDP association, close/reset, and telemetry semantics without leaking
+  SSH or QUIC implementation details into the packet engine.
+- Remote helpers own remote socket I/O. They run as explicit subcommands:
+  `agent`, `quic-agent`, or `quic-bridge-agent`.
+
+This split is the first-principles boundary: packet handling must not know
+whether bytes travel over SSH stdio, QUIC streams, or lab direct-tcpip; control
+plane bootstrap must not know smoltcp flow state; cleanup must be centralized in
+the supervisor.
+
+## Product Phases
+
+```text
+Rustle v1:
+  TUN + smoltcp + SSH-authenticated framed agent
+  Goal: sshuttle replacement for IPv4 TCP, DNS, and generic UDP
+
+Rustle v2:
+  SSH bootstrap/control plane + native QUIC data plane
+  Goal: lower latency and higher throughput when UDP reachability allows it
+
+Rustle v3 optional:
+  rootful/kernel-assisted fast path
+  Goal: maximum speed where both endpoints allow deeper network setup
+```
+
+v1 must be boring and deterministic. v2 must earn promotion through live gates,
+not through local benchmark optimism.
 
 ## MVP Boundary
 
@@ -47,7 +122,8 @@ does not support it.
 
 ## Transport Architecture
 
-Rustle keeps three transport choices, but only one is the normal path:
+Rustle keeps several transport choices behind one packet-engine contract. Only
+one is the normal path:
 
 - Agent mode: the default compact `rustle -r user@host CIDR...` path. A framed
   Rustle protocol is carried over one or more SSH `exec` sessions to a
@@ -158,6 +234,30 @@ Rustle keeps three transport choices, but only one is the normal path:
   is the candidate shape for future performance-first selection, but the default
   remains `agent` until live QUIC reachability, fallback, reconnect, and stress
   gates are stable.
+
+## Current Architecture Gaps
+
+These are the gaps that still prevent a production-ready release:
+
+- Remote helper cleanup must be proven on real remotes. Unit tests prove wrapper
+  cleanup shape, and live failure cleanup has passed in some cases, but the
+  latest successful Contabo runs left stale `/tmp/rustle-agent.*` directories
+  after shutdown. The product invariant is stricter: normal shutdown, failed
+  startup, Ctrl-C, and helper crashes must leave no Rustle-owned helper
+  binaries or refs behind.
+- Bulk data still crosses a central bridge-event queue before packet-engine
+  ingestion. This keeps ownership simple and telemetry explicit, but latest live
+  100 MiB evidence identified supervisor event-queue pressure. The next data
+  path iteration should preserve single-owner packet-engine state while reducing
+  remote-data queueing cost.
+- `auto-quic` has the right product shape but not the right startup behavior.
+  The control plane must account probe time precisely and fall back quickly
+  enough that failed UDP reachability does not make the default command feel
+  worse than agent mode.
+- DNS takeover is intentionally platform-owned, but it is also environment
+  sensitive. Managed macOS/VPN resolver profiles can override service-scoped
+  settings; release evidence must prove actual resolver delivery, not just that
+  configuration commands succeeded.
 
 The agent protocol is binary and length-prefixed. Every frame has a fixed
 24-byte header:
@@ -324,34 +424,34 @@ explicit SSH `direct-tcpip` compatibility channel.
 NewSyn
   -> TcpHandshaking
   -> TcpEstablished
-  -> SshOpening
+  -> BridgeOpening
   -> Relaying
   -> HalfClosedLocal
   -> HalfClosedRemote
   -> Closed
 
-Any non-terminal state may move to Reset on local TCP reset, SSH channel
+Any non-terminal state may move to Reset on local TCP reset, data-plane stream
 failure, timeout, or route/device shutdown.
 ```
 
 ## Hard Invariants
 
-- One local TCP flow maps to at most one SSH channel.
-- A flow must not open an SSH channel until the local TCP handshake has been
-  accepted by the userspace TCP engine.
+- One local TCP flow maps to at most one active data-plane stream.
+- A flow must not open a data-plane stream until the local TCP handshake has
+  been accepted by the userspace TCP engine.
 - A flow must not acknowledge remote payload bytes to the local application
   until Rustle has accepted those bytes into bounded buffers.
 - Backpressure must propagate in both directions.
 - Local application bytes must not be drained from smoltcp while the per-flow
-  SSH bridge queue is full by item count or byte count; the TUN loop must keep
-  serving other flows instead of awaiting one saturated SSH sender.
-- SSH channel creation is admission controlled. Rustle caps total active bridge
-  tasks and separately caps flows in the `SshOpening` state so a SYN burst
-  cannot spawn an unbounded number of tasks waiting on `sshd` channel
+  bridge queue is full by item count or byte count; the TUN loop must keep
+  serving other flows instead of awaiting one saturated data-plane sender.
+- Data-plane stream creation is admission controlled. Rustle caps total active
+  bridge tasks and separately caps flows in the `BridgeOpening` state so a SYN
+  burst cannot spawn an unbounded number of tasks waiting on remote stream-open
   confirmations.
-- Remote SSH bytes that cannot immediately fit in the local smoltcp socket stay
-  in a bounded per-flow backlog. Partial smoltcp writes must never drop the
-  unsent suffix.
+- Remote data-plane bytes that cannot immediately fit in the local smoltcp
+  socket stay in a bounded per-flow backlog. Partial smoltcp writes must never
+  drop the unsent suffix.
 - The SSH control connection must never be captured by Rustle's own target
   routes. If a target CIDR captures the resolved IPv4 address of the SSH
   server, `tunnel` installs a temporary host route for that control connection
