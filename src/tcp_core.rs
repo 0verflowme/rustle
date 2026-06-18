@@ -68,7 +68,7 @@ pub enum FlowState {
     NewSyn,
     TcpHandshaking,
     TcpEstablished,
-    SshOpening,
+    BridgeOpening,
     Relaying,
     HalfClosedLocal,
     HalfClosedRemote,
@@ -481,7 +481,7 @@ impl FlowManager {
     pub fn opening_flow_count(&self) -> usize {
         self.flows
             .values()
-            .filter(|entry| entry.state == FlowState::SshOpening)
+            .filter(|entry| entry.state == FlowState::BridgeOpening)
             .count()
     }
 
@@ -489,9 +489,9 @@ impl FlowManager {
         out.clear();
         out.reserve(self.flows.len());
         out.extend(
-            self.flows
-                .iter()
-                .filter_map(|(&key, entry)| (entry.state == FlowState::SshOpening).then_some(key)),
+            self.flows.iter().filter_map(|(&key, entry)| {
+                (entry.state == FlowState::BridgeOpening).then_some(key)
+            }),
         );
     }
 
@@ -662,7 +662,9 @@ impl FlowManager {
                 FlowState::NewSyn | FlowState::TcpHandshaking => {
                     now - entry.state_since >= self.policy.opening_timeout
                 }
-                FlowState::SshOpening => now - entry.state_since >= self.policy.bridge_open_timeout,
+                FlowState::BridgeOpening => {
+                    now - entry.state_since >= self.policy.bridge_open_timeout
+                }
                 _ => false,
             };
             let idle_expired = matches!(
@@ -1304,13 +1306,13 @@ mod tests {
 
         assert_eq!(manager.opening_flow_count(), 0);
         manager
-            .mark_flow_state(flow, FlowState::SshOpening)
+            .mark_flow_state(flow, FlowState::BridgeOpening)
             .expect("mark opening");
         assert_eq!(manager.opening_flow_count(), 1);
     }
 
     #[test]
-    fn ssh_opening_timeout_starts_when_flow_enters_ssh_opening() {
+    fn bridge_opening_timeout_starts_when_flow_enters_bridge_opening() {
         let mut manager = FlowManager::with_policy(
             Ipv4Addr::new(10, 255, 255, 1),
             24,
@@ -1346,7 +1348,7 @@ mod tests {
         );
 
         manager
-            .mark_flow_state_at(flow, FlowState::SshOpening, Instant::from_millis(100))
+            .mark_flow_state_at(flow, FlowState::BridgeOpening, Instant::from_millis(100))
             .expect("mark opening");
         assert!(manager
             .expire_stale_flows(Instant::from_millis(104))

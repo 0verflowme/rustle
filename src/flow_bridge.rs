@@ -394,8 +394,8 @@ mod tests {
                 }
 
                 manager
-                    .mark_flow_state(ready_flow, FlowState::SshOpening)
-                    .expect("mark SSH opening");
+                    .mark_flow_state(ready_flow, FlowState::BridgeOpening)
+                    .expect("mark bridge opening");
                 let bridge = spawn_fake_remote(ready_id, event_tx.clone());
                 bridges.insert(ready_flow, bridge);
             }

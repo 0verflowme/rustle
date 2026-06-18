@@ -81,7 +81,7 @@ pub(crate) fn plan_bridge_starts(
         }
 
         let ready_wait_ms = flow_manager.flow_state_elapsed_ms(flow, now)?;
-        flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::SshOpening, now)?;
+        flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::BridgeOpening, now)?;
         starts.push(TcpBridgeStart { id, ready_wait_ms });
         active_channels += 1;
         opening_channels += 1;
@@ -145,7 +145,7 @@ pub(crate) fn drain_local_bytes_to_bridges(
         let Some(bridge) = bridges.get(&flow) else {
             if matches!(
                 flow_manager.flow_state(flow)?,
-                tcp_core::FlowState::TcpEstablished | tcp_core::FlowState::SshOpening
+                tcp_core::FlowState::TcpEstablished | tcp_core::FlowState::BridgeOpening
             ) {
                 stats.bridge_backpressure_events =
                     stats.bridge_backpressure_events.saturating_add(1);
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[test]
-    fn planned_bridge_start_marks_flow_ssh_opening() {
+    fn planned_bridge_start_marks_flow_bridge_opening() {
         let client_ip = Ipv4Addr::new(10, 255, 255, 2);
         let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
         let destination_port = 443;
@@ -506,7 +506,7 @@ mod tests {
         assert!(starts[0].ready_wait_ms <= 10);
         assert_eq!(
             manager.flow_state(flow).expect("flow state"),
-            tcp_core::FlowState::SshOpening
+            tcp_core::FlowState::BridgeOpening
         );
         assert!(bridges.is_empty());
     }
@@ -717,11 +717,11 @@ mod tests {
         assert_eq!(manager.opening_flow_count(), 1);
         assert!(matches!(
             manager.flow_state(first_flow).expect("first flow state"),
-            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+            tcp_core::FlowState::BridgeOpening | tcp_core::FlowState::TcpEstablished
         ));
         assert!(matches!(
             manager.flow_state(second_flow).expect("second flow state"),
-            tcp_core::FlowState::SshOpening | tcp_core::FlowState::TcpEstablished
+            tcp_core::FlowState::BridgeOpening | tcp_core::FlowState::TcpEstablished
         ));
 
         starts.clear();
