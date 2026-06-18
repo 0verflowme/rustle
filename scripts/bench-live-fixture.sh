@@ -23,6 +23,7 @@ TARGET_CIDR="${RUSTLE_FIXTURE_TARGET_CIDR:-${RUSTLE_BENCH_TARGET_CIDR:-}}"
 ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
 ALLOW_CONTROL_HOST="${RUSTLE_FIXTURE_ALLOW_CONTROL_HOST:-0}"
 ALLOW_LOCAL_HOST="${RUSTLE_FIXTURE_ALLOW_LOCAL_HOST:-0}"
+SKIP_REMOTE_CLEANUP_CHECK="${RUSTLE_FIXTURE_SKIP_REMOTE_CLEANUP_CHECK:-0}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_FIXTURE_REMOTE or RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$FIXTURE_HOST" ]] || smoke_die "set RUSTLE_FIXTURE_HOST to the remote IP reachable through Rustle, for example 192.168.190.45"
@@ -51,6 +52,10 @@ esac
 case "$ALLOW_LOCAL_HOST" in
   0 | 1) ;;
   *) smoke_die "RUSTLE_FIXTURE_ALLOW_LOCAL_HOST must be 0 or 1" ;;
+esac
+case "$SKIP_REMOTE_CLEANUP_CHECK" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_FIXTURE_SKIP_REMOTE_CLEANUP_CHECK must be 0 or 1" ;;
 esac
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-fixture.XXXXXX")"
@@ -130,6 +135,31 @@ if [[ -n "$SSH_PASSWORD_VALUE" ]]; then
   )
 fi
 SSH_CMD+=("$SSH_REMOTE")
+
+remote_uploaded_agent_artifacts() {
+  "${SSH_CMD[@]}" 'root=${TMPDIR:-/tmp}; find "$root" -maxdepth 1 \( -name "rustle-agent.*" -o -name "rustle-agent-[0-9]*" -o -name "rustle-agent-[0-9]*.refs" \) -print 2>/dev/null | sort'
+}
+
+wait_for_remote_uploaded_agent_cleanup() {
+  [[ "$SKIP_REMOTE_CLEANUP_CHECK" == "0" ]] || return 0
+
+  local seconds="${1:-10}"
+  local attempts=$((seconds * 2))
+  local artifacts=""
+
+  for ((i = 0; i <= attempts; i++)); do
+    artifacts="$(remote_uploaded_agent_artifacts)" \
+      || smoke_die "failed to check remote uploaded agent cleanup on ${SSH_REMOTE}"
+    if [[ -z "$artifacts" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+
+  smoke_info "remote uploaded agent artifacts remain on ${SSH_REMOTE}:"
+  printf '%s\n' "$artifacts" | sed 's/^/  /' >&2 || true
+  smoke_die "remote uploaded agent cleanup left artifact(s)"
+}
 
 ssh_remote_lookup_host() {
   local remote="$1"
@@ -458,5 +488,6 @@ for body_bytes in $FIXTURE_BODY_BYTES; do
     smoke_info "wrote live fixture artifact ${bench_artifact_dir}/fixture-results.tsv"
   fi
   verify_fixture_benchmark_rows "$fixture_results" "$body_bytes"
+  wait_for_remote_uploaded_agent_cleanup 10
   stop_fixture
 done

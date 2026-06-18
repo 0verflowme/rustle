@@ -560,9 +560,11 @@ Required before tagging a release:
   `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process and fixture
   SSH command resolve the same alias. Controlled live fixture benchmarks can use
   `RUSTLE_FIXTURE_SSH_CONFIG` to apply the same OpenSSH config to the fixture
-  command and nested Rustle/sshuttle comparison. Use
-  `RUSTLE_LIVE_UDP_AGENT_PATH` only when this UDP proof needs a different
-  preinstalled remote Rustle binary from the main live smoke.
+  command and nested Rustle/sshuttle comparison. After each successful
+  controlled fixture body-size run, the fixture wrapper checks the remote temp
+  root for stale `rustle-agent.*` upload artifacts and fails the run if any
+  remain. Use `RUSTLE_LIVE_UDP_AGENT_PATH` only when this UDP proof needs a
+  different preinstalled remote Rustle binary from the main live smoke.
 - `scripts/smoke-windows-tun.ps1` passes from an elevated native Windows shell
   with an architecture-matching Wintun DLL available. The release workflow runs
   this smoke against the packaged Windows binary with embedded Wintun before

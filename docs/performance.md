@@ -575,6 +575,12 @@ Set `RUSTLE_FIXTURE_ALLOW_FAILED_TOOLS=sshuttle` when a large fixture should
 preserve Rustle rows and record a partial failed sshuttle comparator row instead
 of aborting the whole fixture run. The fixture row verifier still requires every
 non-allowed tool row to have zero failures and exact transferred bytes.
+After each successful body-size benchmark, `scripts/bench-live-fixture.sh`
+checks the remote temp root over the same SSH configuration and fails if any
+Rustle-owned uploaded helper artifacts remain, such as `/tmp/rustle-agent.*` or
+matching `.refs` directories. Set `RUSTLE_FIXTURE_SKIP_REMOTE_CLEANUP_CHECK=1`
+only for a diagnostic run against a host that already has known stale artifacts;
+release-candidate evidence should leave the check enabled.
 
 ### TCP Hotpath Trace Summary
 
