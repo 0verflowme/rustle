@@ -335,216 +335,42 @@ async fn handle_agent_frame(
 ) -> Result<()> {
     match frame.kind {
         AgentFrameKind::Hello => {
-            let peer = AgentHello::decode(&frame.payload)?;
-            if peer.protocol_version != crate::agent_proto::AGENT_PROTOCOL_VERSION {
-                bail!(
-                    "unsupported agent protocol version {}",
-                    peer.protocol_version
-                );
-            }
-            if peer.capabilities & CAP_FLOW_CONTROL == 0 {
-                bail!("agent controller does not advertise flow-control support");
-            }
-            if peer.max_frame_payload == 0 {
-                bail!("agent controller advertised zero max frame payload");
-            }
-            *peer_max_frame_payload =
-                (peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD);
-            send_agent_frame(
+            handle_hello_frame(frame, config, out_tx, peer_max_frame_payload).await?;
+        }
+        AgentFrameKind::OpenTcp => {
+            handle_open_tcp_frame(
+                frame,
+                config,
                 out_tx,
-                AgentFrame::new(
-                    AgentFrameKind::Hello,
-                    0,
-                    AgentHello::current(config.mtu).encode(),
-                )?,
+                done_tx,
+                streams,
+                *peer_max_frame_payload,
             )
             .await?;
         }
-        AgentFrameKind::OpenTcp => {
-            if frame.stream_id == 0 {
-                bail!("agent TCP stream id must be non-zero");
-            }
-            remove_finished_stream_id(streams, frame.stream_id);
-            if streams.contains_key(&frame.stream_id) {
-                send_reset(out_tx, frame.stream_id, "stream id already exists").await?;
-                return Ok(());
-            }
-
-            let open = AgentOpenIpv4::decode(&frame.payload)?;
-            let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
-            let output_credit = Arc::new(Semaphore::new(0));
-            let options = AgentTcpStreamOptions {
-                connect_timeout: config.tcp_connect_timeout,
-                max_frame_payload: *peer_max_frame_payload,
-                done_tx: done_tx.clone(),
-            };
-            let task = tokio::spawn(run_tcp_stream(
-                frame.stream_id,
-                open,
-                from_local,
-                out_tx.clone(),
-                Arc::clone(&output_credit),
-                options,
-            ));
-            streams.insert(
-                frame.stream_id,
-                AgentStreamHandle::Tcp(AgentTcpHandle {
-                    to_remote,
-                    output_credit,
-                    task,
-                }),
-            );
-        }
         AgentFrameKind::OpenTcpHost => {
-            if frame.stream_id == 0 {
-                bail!("agent hostname TCP stream id must be non-zero");
-            }
-            remove_finished_stream_id(streams, frame.stream_id);
-            if streams.contains_key(&frame.stream_id) {
-                send_reset(out_tx, frame.stream_id, "stream id already exists").await?;
-                return Ok(());
-            }
-
-            let open = AgentOpenHost::decode(&frame.payload)?;
-            let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
-            let output_credit = Arc::new(Semaphore::new(0));
-            let options = AgentTcpStreamOptions {
-                connect_timeout: config.tcp_connect_timeout,
-                max_frame_payload: *peer_max_frame_payload,
-                done_tx: done_tx.clone(),
-            };
-            let task = tokio::spawn(run_tcp_host_stream(
-                frame.stream_id,
-                open,
-                from_local,
-                out_tx.clone(),
-                Arc::clone(&output_credit),
-                options,
-            ));
-            streams.insert(
-                frame.stream_id,
-                AgentStreamHandle::Tcp(AgentTcpHandle {
-                    to_remote,
-                    output_credit,
-                    task,
-                }),
-            );
+            handle_open_tcp_host_frame(
+                frame,
+                config,
+                out_tx,
+                done_tx,
+                streams,
+                *peer_max_frame_payload,
+            )
+            .await?;
         }
         AgentFrameKind::OpenUdp => {
-            if frame.stream_id == 0 {
-                bail!("agent UDP stream id must be non-zero");
-            }
-            remove_finished_stream_id(streams, frame.stream_id);
-            if streams.contains_key(&frame.stream_id) {
-                send_reset(out_tx, frame.stream_id, "stream id already exists").await?;
-                return Ok(());
-            }
-
-            let open = AgentOpenIpv4::decode(&frame.payload)?;
-            let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
-            let output_credit = Arc::new(Semaphore::new(0));
-            let task = tokio::spawn(run_udp_stream(
-                frame.stream_id,
-                open,
-                from_local,
-                out_tx.clone(),
-                Arc::clone(&output_credit),
-                done_tx.clone(),
-            ));
-            streams.insert(
-                frame.stream_id,
-                AgentStreamHandle::Udp(AgentUdpHandle {
-                    to_remote,
-                    output_credit,
-                    task,
-                }),
-            );
+            handle_open_udp_frame(frame, out_tx, done_tx, streams).await?;
         }
-        AgentFrameKind::Data => {
-            let stream_id = frame.stream_id;
-            let Some(stream) = streams.get(&stream_id) else {
-                send_reset(out_tx, frame.stream_id, "unknown stream id").await?;
-                return Ok(());
-            };
-            let reset_reason = match stream {
-                AgentStreamHandle::Tcp(stream) => {
-                    match stream
-                        .to_remote
-                        .try_send(AgentTcpInput::Data(frame.payload))
-                    {
-                        Ok(()) => None,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            Some("remote TCP stream input queue is full")
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            Some("remote TCP stream task is closed")
-                        }
-                    }
-                }
-                AgentStreamHandle::Udp(stream) => {
-                    match stream
-                        .to_remote
-                        .try_send(AgentUdpInput::Data(frame.payload))
-                    {
-                        Ok(()) => None,
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            Some("remote UDP stream input queue is full")
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            Some("remote UDP stream task is closed")
-                        }
-                    }
-                }
-            };
-            if let Some(reason) = reset_reason {
-                if let Some(stream) = streams.remove(&stream_id) {
-                    stream.abort();
-                }
-                send_reset(out_tx, stream_id, reason).await?;
-            }
-        }
-        AgentFrameKind::Eof => {
-            let stream_id = frame.stream_id;
-            let reset_reason = if let Some(AgentStreamHandle::Tcp(stream)) = streams.get(&stream_id)
-            {
-                match stream.to_remote.try_send(AgentTcpInput::Eof) {
-                    Ok(()) => None,
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        Some("remote TCP stream input queue is full")
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        Some("remote TCP stream task is closed")
-                    }
-                }
-            } else {
-                None
-            };
-            if let Some(reason) = reset_reason {
-                if let Some(stream) = streams.remove(&stream_id) {
-                    stream.abort();
-                }
-                send_reset(out_tx, stream_id, reason).await?;
-            }
-        }
+        AgentFrameKind::Data => handle_data_frame(frame, out_tx, streams).await?,
+        AgentFrameKind::Eof => handle_eof_frame(frame, out_tx, streams).await?,
         AgentFrameKind::Close | AgentFrameKind::Reset => {
             if let Some(stream) = streams.remove(&frame.stream_id) {
                 stream.abort();
             }
         }
         AgentFrameKind::Window => {
-            if frame.credit == 0 {
-                return Ok(());
-            }
-            if let Some(stream) = streams.get(&frame.stream_id) {
-                match stream {
-                    AgentStreamHandle::Tcp(stream) => {
-                        stream.output_credit.add_permits(frame.credit as usize);
-                    }
-                    AgentStreamHandle::Udp(stream) => {
-                        stream.output_credit.add_permits(frame.credit as usize);
-                    }
-                }
-            }
+            handle_window_frame(frame, streams);
         }
         AgentFrameKind::Opened => {
             send_reset(
@@ -554,21 +380,303 @@ async fn handle_agent_frame(
             )
             .await?;
         }
-        AgentFrameKind::Ping => {
-            if frame.stream_id != 0 {
-                bail!("agent heartbeat ping must use stream id 0");
+        AgentFrameKind::Ping => handle_ping_frame(frame, out_tx).await?,
+        AgentFrameKind::Pong => validate_pong_frame(frame)?,
+    }
+    Ok(())
+}
+
+async fn handle_hello_frame(
+    frame: AgentFrame,
+    config: AgentRuntimeConfig,
+    out_tx: &AgentFrameWriteQueue,
+    peer_max_frame_payload: &mut usize,
+) -> Result<()> {
+    let peer = AgentHello::decode(&frame.payload)?;
+    if peer.protocol_version != crate::agent_proto::AGENT_PROTOCOL_VERSION {
+        bail!(
+            "unsupported agent protocol version {}",
+            peer.protocol_version
+        );
+    }
+    if peer.capabilities & CAP_FLOW_CONTROL == 0 {
+        bail!("agent controller does not advertise flow-control support");
+    }
+    if peer.max_frame_payload == 0 {
+        bail!("agent controller advertised zero max frame payload");
+    }
+    *peer_max_frame_payload = (peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD);
+    send_agent_frame(
+        out_tx,
+        AgentFrame::new(
+            AgentFrameKind::Hello,
+            0,
+            AgentHello::current(config.mtu).encode(),
+        )?,
+    )
+    .await
+}
+
+async fn handle_open_tcp_frame(
+    frame: AgentFrame,
+    config: AgentRuntimeConfig,
+    out_tx: &AgentFrameWriteQueue,
+    done_tx: &mpsc::Sender<u64>,
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+    peer_max_frame_payload: usize,
+) -> Result<()> {
+    if !prepare_new_stream_id(
+        streams,
+        out_tx,
+        frame.stream_id,
+        "agent TCP stream id must be non-zero",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let open = AgentOpenIpv4::decode(&frame.payload)?;
+    let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
+    let output_credit = Arc::new(Semaphore::new(0));
+    let options = tcp_stream_options(config, peer_max_frame_payload, done_tx);
+    let task = tokio::spawn(run_tcp_stream(
+        frame.stream_id,
+        open,
+        from_local,
+        out_tx.clone(),
+        Arc::clone(&output_credit),
+        options,
+    ));
+    streams.insert(
+        frame.stream_id,
+        AgentStreamHandle::Tcp(AgentTcpHandle {
+            to_remote,
+            output_credit,
+            task,
+        }),
+    );
+    Ok(())
+}
+
+async fn handle_open_tcp_host_frame(
+    frame: AgentFrame,
+    config: AgentRuntimeConfig,
+    out_tx: &AgentFrameWriteQueue,
+    done_tx: &mpsc::Sender<u64>,
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+    peer_max_frame_payload: usize,
+) -> Result<()> {
+    if !prepare_new_stream_id(
+        streams,
+        out_tx,
+        frame.stream_id,
+        "agent hostname TCP stream id must be non-zero",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let open = AgentOpenHost::decode(&frame.payload)?;
+    let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
+    let output_credit = Arc::new(Semaphore::new(0));
+    let options = tcp_stream_options(config, peer_max_frame_payload, done_tx);
+    let task = tokio::spawn(run_tcp_host_stream(
+        frame.stream_id,
+        open,
+        from_local,
+        out_tx.clone(),
+        Arc::clone(&output_credit),
+        options,
+    ));
+    streams.insert(
+        frame.stream_id,
+        AgentStreamHandle::Tcp(AgentTcpHandle {
+            to_remote,
+            output_credit,
+            task,
+        }),
+    );
+    Ok(())
+}
+
+async fn handle_open_udp_frame(
+    frame: AgentFrame,
+    out_tx: &AgentFrameWriteQueue,
+    done_tx: &mpsc::Sender<u64>,
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+) -> Result<()> {
+    if !prepare_new_stream_id(
+        streams,
+        out_tx,
+        frame.stream_id,
+        "agent UDP stream id must be non-zero",
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
+    let open = AgentOpenIpv4::decode(&frame.payload)?;
+    let (to_remote, from_local) = mpsc::channel(AGENT_LOCAL_INPUT_FRAMES_PER_STREAM);
+    let output_credit = Arc::new(Semaphore::new(0));
+    let task = tokio::spawn(run_udp_stream(
+        frame.stream_id,
+        open,
+        from_local,
+        out_tx.clone(),
+        Arc::clone(&output_credit),
+        done_tx.clone(),
+    ));
+    streams.insert(
+        frame.stream_id,
+        AgentStreamHandle::Udp(AgentUdpHandle {
+            to_remote,
+            output_credit,
+            task,
+        }),
+    );
+    Ok(())
+}
+
+async fn prepare_new_stream_id(
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+    out_tx: &AgentFrameWriteQueue,
+    stream_id: u64,
+    zero_stream_error: &str,
+) -> Result<bool> {
+    if stream_id == 0 {
+        bail!("{zero_stream_error}");
+    }
+    remove_finished_stream_id(streams, stream_id);
+    if streams.contains_key(&stream_id) {
+        send_reset(out_tx, stream_id, "stream id already exists").await?;
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn tcp_stream_options(
+    config: AgentRuntimeConfig,
+    peer_max_frame_payload: usize,
+    done_tx: &mpsc::Sender<u64>,
+) -> AgentTcpStreamOptions {
+    AgentTcpStreamOptions {
+        connect_timeout: config.tcp_connect_timeout,
+        max_frame_payload: peer_max_frame_payload,
+        done_tx: done_tx.clone(),
+    }
+}
+
+async fn handle_data_frame(
+    frame: AgentFrame,
+    out_tx: &AgentFrameWriteQueue,
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+) -> Result<()> {
+    let stream_id = frame.stream_id;
+    let Some(stream) = streams.get(&stream_id) else {
+        send_reset(out_tx, frame.stream_id, "unknown stream id").await?;
+        return Ok(());
+    };
+    let reset_reason = queue_stream_data(stream, frame.payload);
+    reset_stream_with_reason(streams, out_tx, stream_id, reset_reason).await
+}
+
+async fn handle_eof_frame(
+    frame: AgentFrame,
+    out_tx: &AgentFrameWriteQueue,
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+) -> Result<()> {
+    let stream_id = frame.stream_id;
+    let reset_reason = if let Some(AgentStreamHandle::Tcp(stream)) = streams.get(&stream_id) {
+        queue_tcp_eof(stream)
+    } else {
+        None
+    };
+    reset_stream_with_reason(streams, out_tx, stream_id, reset_reason).await
+}
+
+fn queue_stream_data(stream: &AgentStreamHandle, payload: Bytes) -> Option<&'static str> {
+    match stream {
+        AgentStreamHandle::Tcp(stream) => {
+            match stream.to_remote.try_send(AgentTcpInput::Data(payload)) {
+                Ok(()) => None,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Some("remote TCP stream input queue is full")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Some("remote TCP stream task is closed")
+                }
             }
-            send_agent_frame(
-                out_tx,
-                AgentFrame::new(AgentFrameKind::Pong, 0, frame.payload)?,
-            )
-            .await?;
         }
-        AgentFrameKind::Pong => {
-            if frame.stream_id != 0 {
-                bail!("agent heartbeat pong must use stream id 0");
+        AgentStreamHandle::Udp(stream) => {
+            match stream.to_remote.try_send(AgentUdpInput::Data(payload)) {
+                Ok(()) => None,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    Some("remote UDP stream input queue is full")
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    Some("remote UDP stream task is closed")
+                }
             }
         }
+    }
+}
+
+fn queue_tcp_eof(stream: &AgentTcpHandle) -> Option<&'static str> {
+    match stream.to_remote.try_send(AgentTcpInput::Eof) {
+        Ok(()) => None,
+        Err(mpsc::error::TrySendError::Full(_)) => Some("remote TCP stream input queue is full"),
+        Err(mpsc::error::TrySendError::Closed(_)) => Some("remote TCP stream task is closed"),
+    }
+}
+
+async fn reset_stream_with_reason(
+    streams: &mut HashMap<u64, AgentStreamHandle>,
+    out_tx: &AgentFrameWriteQueue,
+    stream_id: u64,
+    reset_reason: Option<&str>,
+) -> Result<()> {
+    if let Some(reason) = reset_reason {
+        if let Some(stream) = streams.remove(&stream_id) {
+            stream.abort();
+        }
+        send_reset(out_tx, stream_id, reason).await?;
+    }
+    Ok(())
+}
+
+fn handle_window_frame(frame: AgentFrame, streams: &HashMap<u64, AgentStreamHandle>) {
+    if frame.credit == 0 {
+        return;
+    }
+    if let Some(stream) = streams.get(&frame.stream_id) {
+        match stream {
+            AgentStreamHandle::Tcp(stream) => {
+                stream.output_credit.add_permits(frame.credit as usize);
+            }
+            AgentStreamHandle::Udp(stream) => {
+                stream.output_credit.add_permits(frame.credit as usize);
+            }
+        }
+    }
+}
+
+async fn handle_ping_frame(frame: AgentFrame, out_tx: &AgentFrameWriteQueue) -> Result<()> {
+    if frame.stream_id != 0 {
+        bail!("agent heartbeat ping must use stream id 0");
+    }
+    send_agent_frame(
+        out_tx,
+        AgentFrame::new(AgentFrameKind::Pong, 0, frame.payload)?,
+    )
+    .await
+}
+
+fn validate_pong_frame(frame: AgentFrame) -> Result<()> {
+    if frame.stream_id != 0 {
+        bail!("agent heartbeat pong must use stream id 0");
     }
     Ok(())
 }
@@ -688,76 +796,146 @@ async fn run_tcp_connected_stream(
     stream_id: u64,
     stream: Result<TcpStream, std::io::Error>,
     remote_connect_elapsed: Option<Duration>,
-    mut from_local: mpsc::Receiver<AgentTcpInput>,
+    from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     max_frame_payload: usize,
 ) {
-    let stream = match stream {
+    let Some(stream) = prepare_connected_tcp_stream(stream, stream_id, &out_tx).await else {
+        return;
+    };
+
+    let (mut reader, writer) = stream.into_split();
+    let write_out_tx = out_tx.clone();
+    let writer_task = tokio::spawn(run_tcp_remote_writer(
+        stream_id,
+        writer,
+        from_local,
+        write_out_tx,
+    ));
+
+    if send_tcp_opened_frame(&out_tx, stream_id, remote_connect_elapsed)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+        return;
+    }
+
+    run_tcp_output_loop(
+        &mut reader,
+        stream_id,
+        &out_tx,
+        output_credit,
+        max_frame_payload,
+    )
+    .await;
+    close_tcp_connected_stream(&out_tx, stream_id, writer_task).await;
+}
+
+async fn prepare_connected_tcp_stream(
+    stream: Result<TcpStream, std::io::Error>,
+    stream_id: u64,
+    out_tx: &AgentFrameWriteQueue,
+) -> Option<TcpStream> {
+    match stream {
         Ok(stream) => {
             if let Err(err) = stream.set_nodelay(true) {
                 let _ = send_reset(
-                    &out_tx,
+                    out_tx,
                     stream_id,
                     &format!("failed to configure remote TCP stream: {err}"),
                 )
                 .await;
-                return;
+                return None;
             }
-            stream
+            Some(stream)
         }
         Err(err) => {
             let _ = send_reset(
-                &out_tx,
+                out_tx,
                 stream_id,
                 &format!("failed to connect remote TCP stream: {err}"),
             )
             .await;
-            return;
+            None
         }
-    };
+    }
+}
 
-    let (mut reader, mut writer) = stream.into_split();
-    let write_out_tx = out_tx.clone();
-    let writer_task = tokio::spawn(async move {
-        let mut receive_window = AgentCreditWindow::new();
-        while let Some(input) = from_local.recv().await {
-            match input {
-                AgentTcpInput::Data(bytes) => {
-                    let len = bytes.len();
-                    if let Err(err) = writer.write_all(&bytes).await {
-                        let _ = send_reset(
-                            &write_out_tx,
-                            stream_id,
-                            &format!("failed to write remote TCP stream: {err}"),
-                        )
-                        .await;
-                        return;
-                    }
-                    if record_receive_credit(&write_out_tx, stream_id, &mut receive_window, len)
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                AgentTcpInput::Eof => {
-                    if let Err(err) = writer.shutdown().await {
-                        let _ = send_reset(
-                            &write_out_tx,
-                            stream_id,
-                            &format!("failed to half-close remote TCP stream: {err}"),
-                        )
-                        .await;
-                    }
+async fn run_tcp_remote_writer(
+    stream_id: u64,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    mut from_local: mpsc::Receiver<AgentTcpInput>,
+    out_tx: AgentFrameWriteQueue,
+) {
+    let mut receive_window = AgentCreditWindow::new();
+    while let Some(input) = from_local.recv().await {
+        match input {
+            AgentTcpInput::Data(bytes) => {
+                if write_tcp_remote_data(
+                    stream_id,
+                    &mut writer,
+                    &out_tx,
+                    &mut receive_window,
+                    bytes,
+                )
+                .await
+                .is_err()
+                {
                     return;
                 }
             }
+            AgentTcpInput::Eof => {
+                shutdown_tcp_remote_writer(stream_id, &mut writer, &out_tx).await;
+                return;
+            }
         }
-    });
+    }
+}
 
-    if send_agent_frame(
-        &out_tx,
+async fn write_tcp_remote_data(
+    stream_id: u64,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    out_tx: &AgentFrameWriteQueue,
+    receive_window: &mut AgentCreditWindow,
+    bytes: Bytes,
+) -> Result<()> {
+    let len = bytes.len();
+    if let Err(err) = writer.write_all(&bytes).await {
+        let _ = send_reset(
+            out_tx,
+            stream_id,
+            &format!("failed to write remote TCP stream: {err}"),
+        )
+        .await;
+        return Err(err.into());
+    }
+    record_receive_credit(out_tx, stream_id, receive_window, len).await
+}
+
+async fn shutdown_tcp_remote_writer(
+    stream_id: u64,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    out_tx: &AgentFrameWriteQueue,
+) {
+    if let Err(err) = writer.shutdown().await {
+        let _ = send_reset(
+            out_tx,
+            stream_id,
+            &format!("failed to half-close remote TCP stream: {err}"),
+        )
+        .await;
+    }
+}
+
+async fn send_tcp_opened_frame(
+    out_tx: &AgentFrameWriteQueue,
+    stream_id: u64,
+    remote_connect_elapsed: Option<Duration>,
+) -> Result<()> {
+    send_agent_frame(
+        out_tx,
         AgentFrame::new(
             AgentFrameKind::Opened,
             stream_id,
@@ -767,12 +945,15 @@ async fn run_tcp_connected_stream(
         .with_credit(AgentCreditWindow::initial_credit() as u32),
     )
     .await
-    .is_err()
-    {
-        writer_task.abort();
-        return;
-    }
+}
 
+async fn run_tcp_output_loop(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    stream_id: u64,
+    out_tx: &AgentFrameWriteQueue,
+    output_credit: Arc<Semaphore>,
+    max_frame_payload: usize,
+) {
     let read_chunk = max_frame_payload.clamp(1, AGENT_TCP_READ_CHUNK);
     let mut read_buf = vec![0_u8; read_chunk];
     let mut output_timing = AgentTcpOutputTiming::default();
@@ -783,7 +964,7 @@ async fn run_tcp_connected_stream(
             Ok(0) => {
                 output_timing.record_remote_read_wait(read_started_at);
                 let _ = send_agent_frame(
-                    &out_tx,
+                    out_tx,
                     AgentFrame::new(AgentFrameKind::Eof, stream_id, output_timing.encode())
                         .expect("eof frame"),
                 )
@@ -801,7 +982,7 @@ async fn run_tcp_connected_stream(
                 output_timing.record_output_credit_wait(credit_started_at);
                 let send_started_at = Instant::now();
                 let send_result = send_agent_frame(
-                    &out_tx,
+                    out_tx,
                     AgentFrame::new(AgentFrameKind::Data, stream_id, bytes).expect("data frame"),
                 )
                 .await;
@@ -816,7 +997,7 @@ async fn run_tcp_connected_stream(
             Err(err) => {
                 output_timing.record_remote_read_wait(read_started_at);
                 let _ = send_reset(
-                    &out_tx,
+                    out_tx,
                     stream_id,
                     &format!("failed to read remote TCP stream: {err}"),
                 )
@@ -825,10 +1006,16 @@ async fn run_tcp_connected_stream(
             }
         }
     }
+}
 
+async fn close_tcp_connected_stream(
+    out_tx: &AgentFrameWriteQueue,
+    stream_id: u64,
+    writer_task: JoinHandle<()>,
+) {
     writer_task.abort();
     let _ = send_agent_frame(
-        &out_tx,
+        out_tx,
         AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()).expect("empty frame"),
     )
     .await;
