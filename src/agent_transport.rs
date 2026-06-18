@@ -8,6 +8,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
+mod heartbeat;
 mod reader_task;
 mod writer_metrics;
 mod writer_task;
@@ -19,6 +20,7 @@ use crate::agent_proto::{
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
+use heartbeat::{run_agent_heartbeat, AgentHeartbeat};
 #[cfg(test)]
 use reader_task::dispatch_agent_frame;
 use reader_task::read_agent_frames;
@@ -31,8 +33,6 @@ const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
 const AGENT_STREAM_RESET_BYTES: usize = 512;
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
-const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const _: () = assert!(
     AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_INBOUND_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
 );
@@ -77,23 +77,6 @@ struct StreamEntry {
     inbound: mpsc::Sender<AgentFrame>,
     send_credit: Arc<Semaphore>,
     optimistic_open_credit: usize,
-}
-
-#[derive(Clone, Debug)]
-struct AgentHeartbeat {
-    last_peer_activity: Instant,
-    sent: u64,
-    received_pongs: u64,
-}
-
-impl AgentHeartbeat {
-    fn new() -> Self {
-        Self {
-            last_peer_activity: Instant::now(),
-            sent: 0,
-            received_pongs: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -707,67 +690,6 @@ where
         .await?;
     *inbound = frame_reader.into_input();
     Ok(frame)
-}
-
-async fn run_agent_heartbeat(
-    outbound: mpsc::Sender<AgentFrameWriteItem>,
-    streams: StreamMap,
-    failure: FailureState,
-    writer_metrics: WriterMetrics,
-    heartbeat: HeartbeatState,
-) {
-    let mut tick = tokio::time::interval_at(
-        tokio::time::Instant::now() + AGENT_HEARTBEAT_INTERVAL,
-        AGENT_HEARTBEAT_INTERVAL,
-    );
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tick.tick().await;
-        if ensure_agent_ready(&failure).await.is_err() {
-            return;
-        }
-
-        let elapsed = {
-            let heartbeat = heartbeat.lock().await;
-            heartbeat.last_peer_activity.elapsed()
-        };
-        if elapsed > AGENT_HEARTBEAT_TIMEOUT {
-            mark_agent_failed(
-                &failure,
-                &streams,
-                format!(
-                    "agent heartbeat timed out after {}s without peer activity",
-                    AGENT_HEARTBEAT_TIMEOUT.as_secs()
-                ),
-            )
-            .await;
-            return;
-        }
-
-        {
-            let mut heartbeat = heartbeat.lock().await;
-            heartbeat.sent = heartbeat.sent.saturating_add(1);
-        }
-        let frame =
-            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).expect("empty heartbeat frame");
-        if send_agent_transport_frame(
-            AgentFrameSendContext {
-                outbound: &outbound,
-                streams: &streams,
-                failure: &failure,
-                writer_metrics: &writer_metrics,
-            },
-            frame,
-            AGENT_FRAME_SEND_TIMEOUT,
-            "agent heartbeat ping",
-        )
-        .await
-        .is_err()
-        {
-            return;
-        }
-    }
 }
 
 async fn reset_all_streams(streams: &StreamMap, message: String) {
