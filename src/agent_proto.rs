@@ -103,6 +103,37 @@ impl AgentFrame {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentOpenedTiming {
+    pub remote_connect_us: u64,
+}
+
+impl AgentOpenedTiming {
+    const WIRE_LEN: usize = 8;
+
+    pub fn encode(self) -> Bytes {
+        let mut payload = BytesMut::with_capacity(Self::WIRE_LEN);
+        payload.put_u64(self.remote_connect_us);
+        payload.freeze()
+    }
+
+    pub fn decode_optional(mut payload: &[u8]) -> Result<Option<Self>> {
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if payload.len() != Self::WIRE_LEN {
+            bail!(
+                "agent opened timing payload must be {} bytes, got {}",
+                Self::WIRE_LEN,
+                payload.len()
+            );
+        }
+        Ok(Some(Self {
+            remote_connect_us: payload.get_u64(),
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentHello {
     pub protocol_version: u16,
     pub mtu: u16,
@@ -358,6 +389,28 @@ mod tests {
 
         assert_eq!(decoded, frame);
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn opened_timing_payload_is_optional_and_stable() {
+        assert_eq!(AgentOpenedTiming::decode_optional(&[]).unwrap(), None);
+
+        let timing = AgentOpenedTiming {
+            remote_connect_us: 123_456,
+        };
+        assert_eq!(
+            AgentOpenedTiming::decode_optional(&timing.encode())
+                .unwrap()
+                .expect("timing payload"),
+            timing
+        );
+
+        let err = AgentOpenedTiming::decode_optional(&[0; 7])
+            .expect_err("truncated timing payload should fail");
+        assert!(
+            err.to_string().contains("opened timing payload"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

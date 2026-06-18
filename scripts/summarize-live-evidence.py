@@ -64,6 +64,7 @@ OUTPUT_COLUMNS = [
     "quic_failures",
     "diagnosis",
 ]
+PRESSURE_BYTES = 1024 * 1024
 
 
 def parse_float(value: str, field: str) -> float:
@@ -226,9 +227,12 @@ def diagnose(
         ):
             if parse_int(row.get(field, "0"), field) != 0:
                 return f"diagnostic_failure:{field}"
-    if bridge_event_queue_max > 0 and bridge_event_queue_max >= remote_backlog_max:
+    if (
+        bridge_event_queue_max >= PRESSURE_BYTES
+        and bridge_event_queue_max >= remote_backlog_max
+    ):
         return "supervisor_event_queue_pressure"
-    if remote_backlog_max > 0:
+    if remote_backlog_max >= PRESSURE_BYTES:
         return "packet_engine_backlog_pressure"
     if hotpath_bottleneck != "-":
         return f"hotpath:{hotpath_bottleneck}"
@@ -306,7 +310,7 @@ def self_test() -> None:
         (live_compare / "live-results.tsv").write_text(
             "\n".join(
                 [
-                    "rustle-agent\t1\t4\t2\t4\t0\t100\t12.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t8192\t0\t2048",
+                    "rustle-agent\t1\t4\t2\t4\t0\t100\t12.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t2097152\t0\t2048",
                     "sshuttle\t1\t4\t2\t4\t0\t120\t10.0\t22.0\t4096\t20.00\t33.33\t1.0\t2.0\t\t\t\t\t\t\t\t\t\t",
                 ]
             )
@@ -329,15 +333,22 @@ def self_test() -> None:
         assert row["path"] == "live-compare"
         assert row["rustle_success_rows"] == "1"
         assert row["agent_sshuttle_p50_ratio"] == "1.20"
-        assert row["max_remote_backlog_bytes"] == "8192"
+        assert row["max_remote_backlog_bytes"] == "2097152"
         assert row["diagnosis"] == "packet_engine_backlog_pressure"
 
         (live_compare / "live-results.tsv").write_text(
-            "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t0\t0\t4096\n",
+            "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t0\t0\t2097152\n",
             encoding="utf-8",
         )
         rows = summarize(root)
         assert rows[0]["diagnosis"] == "supervisor_event_queue_pressure"
+
+        (live_compare / "live-results.tsv").write_text(
+            "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t1024\t0\t2048\n",
+            encoding="utf-8",
+        )
+        rows = summarize(root)
+        assert rows[0]["diagnosis"] == "hotpath:body_drain"
 
 
 def main() -> None:

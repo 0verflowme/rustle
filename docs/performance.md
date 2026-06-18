@@ -585,16 +585,20 @@ experiment.
 The summary groups flows by transport and reports `stream_ready`, `opened`,
 first local payload, first local payload sent, first remote byte, duration,
 bytes, per-flow byte distribution, per-flow throughput distribution, and
-outcomes. It also derives `remote_open_wait`, `ready_wait`,
-`payload_queue_wait`, `first_byte_wait`, `post_open_first_byte_wait`,
-`body_drain`, cumulative `local_send_wait`, `tcp_recv_queue_wait`,
-`local_queue_wait`,
+outcomes. It also derives `remote_open_wait`, `agent_remote_connect`,
+`agent_open_transport_wait`, `ready_wait`, `payload_queue_wait`,
+`first_byte_wait`, `post_open_first_byte_wait`, `body_drain`, cumulative
+`local_send_wait`, `tcp_recv_queue_wait`, `local_queue_wait`,
 `pre_bridge_queue_wait`, framed-agent `agent_send_credit_wait` and
 `agent_send_outbound_wait`, `remote_event_wait`, and a `likely_bottleneck`
 label. `tcp_recv_queue_wait` is the age of payload inside smoltcp before the
-packet engine drains it; `local_queue_wait` is the bridge mpsc wait; and
-`pre_bridge_queue_wait` combines the two as a coarse "before the data-plane task
-can act" diagnostic. Use those derived terms to decide which fix comes first:
+packet engine drains it; `local_queue_wait` is the bridge mpsc wait;
+`agent_remote_connect` is measured inside the remote helper around its TCP
+connect call; `agent_open_transport_wait` is the remaining local
+`remote_open_wait` after subtracting that remote connect duration; and
+`pre_bridge_queue_wait` combines local pre-bridge waits as a coarse "before the
+data-plane task can act" diagnostic. Use those derived terms to decide which
+fix comes first:
 remote open latency, packet-engine bridge admission/drain delay, delayed first
 payload forwarding, local bridge queueing, remote first-byte delay, flow
 duration/windowing, per-flow starvation, framed-agent flow-control credit,
@@ -676,17 +680,20 @@ portable Linux sidecar instead of the local glibc release binary.
 
 | Fixture | Tool | Runs | Result |
 | --- | --- | ---: | --- |
-| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 241.7 ms |
-| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 253.5 ms |
+| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 238.3 ms |
+| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 251.4 ms |
 
 The trace summaries reported `rustle_agent_startup` success for all three agent
-starts with primary startup p50 10.4 s. The controller hotpath showed
-`first_byte_wait` p50 249.5 ms, but almost all of that overlapped remote open:
-`remote_open_wait` p50 was 249.0 ms and the post-open first-byte delay was
-under 1 ms. That means this run no longer points at helper startup or remote
-HTTP response delay once the portable sidecar is selected; the tiny-response
-path is dominated by remote open timing after the optimistic open and first
-local payload have been sent.
+starts with primary startup p50 9.7 s. The controller hotpath showed
+`first_byte_wait` p50 242.1 ms, but almost all of that overlapped remote open:
+`remote_open_wait` p50 was 242.0 ms and the post-open first-byte delay was
+0.034 ms. The remote agent's measured TCP connect component was only 0.217 ms
+p50, leaving 241.8 ms p50 as agent open transport wait. That means this run no
+longer points at helper startup, remote TCP connect, or remote HTTP response
+delay once the portable sidecar is selected; the tiny-response path is dominated
+by the SSH/framed-agent open round trip and scheduling between the local
+controller and remote helper after the optimistic open and first local payload
+have been sent.
 
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:

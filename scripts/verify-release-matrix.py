@@ -1310,6 +1310,8 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "paths",
     "remote_bytes_min",
     "remote_open_wait_p50_ms",
+    "agent_remote_connect_p50_ms",
+    "agent_open_transport_wait_p50_ms",
     "ready_wait_p50_ms",
     "payload_queue_wait_p50_ms",
     "first_byte_wait_p50_ms",

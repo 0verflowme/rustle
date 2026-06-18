@@ -19,6 +19,9 @@ TIMING_FIELDS = (
     "first_remote_us",
     "duration_us",
 )
+OPTIONAL_TIMING_FIELDS = (
+    "agent_remote_connect_us",
+)
 OPTIONAL_COUNTER_FIELDS = (
     "ready_wait_us",
     "local_send_wait_us",
@@ -127,6 +130,16 @@ def nonnegative_delta(row: dict[str, str], start_field: str, end_field: str) -> 
     return end - start
 
 
+def remote_open_transport_wait(row: dict[str, str]) -> int | None:
+    remote_open = nonnegative_delta(row, "stream_ready_us", "opened_us")
+    if remote_open is None or "agent_remote_connect_us" not in row:
+        return None
+    remote_connect = parse_optional_us(row["agent_remote_connect_us"])
+    if remote_connect is None or remote_open < remote_connect:
+        return None
+    return remote_open - remote_connect
+
+
 def flow_throughput_mib_s(row: dict[str, str]) -> float | None:
     duration_us = parse_optional_us(row["duration_us"])
     if duration_us is None or duration_us <= 0:
@@ -182,6 +195,9 @@ def parse_trace_line(line: str) -> dict[str, str] | None:
         if field not in fields:
             raise SystemExit(f"hotpath trace line missing {field}: {line!r}")
         parse_optional_us(fields[field])
+    for field in OPTIONAL_TIMING_FIELDS:
+        if field in fields:
+            parse_optional_us(fields[field])
     for field in OPTIONAL_COUNTER_FIELDS:
         if field in fields:
             parse_counter(fields[field], field)
@@ -230,6 +246,15 @@ def summarize(text: str) -> list[dict[str, object]]:
             ]
             for name, start, end in DERIVED_LATENCIES
         }
+        agent_remote_connect_values = [
+            value
+            for row in rows
+            if (raw := row.get("agent_remote_connect_us")) is not None
+            and (value := parse_optional_us(raw)) is not None
+        ]
+        open_transport_wait_values = [
+            value for row in rows if (value := remote_open_transport_wait(row)) is not None
+        ]
         derived_p50 = {
             name: percentile(values, 50) for name, values in derived_values.items()
         }
@@ -401,6 +426,12 @@ def summarize(text: str) -> list[dict[str, object]]:
                 "first_remote_p50_ms": format_ms(percentile(timing_values["first_remote_us"], 50)),
                 "first_remote_p95_ms": format_ms(percentile(timing_values["first_remote_us"], 95)),
                 "remote_open_wait_p50_ms": format_ms(derived_p50["remote_open_wait_us"]),
+                "agent_remote_connect_p50_ms": format_ms(
+                    percentile(agent_remote_connect_values, 50)
+                ),
+                "agent_open_transport_wait_p50_ms": format_ms(
+                    percentile(open_transport_wait_values, 50)
+                ),
                 "ready_wait_p50_ms": format_ms(wait_p50["ready_wait_us"]),
                 "ready_wait_total_ms": format_ms(ready_wait_total),
                 "payload_queue_wait_p50_ms": format_ms(derived_p50["payload_queue_wait_us"]),
@@ -515,6 +546,8 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "first_remote_p50_ms",
         "first_remote_p95_ms",
         "remote_open_wait_p50_ms",
+        "agent_remote_connect_p50_ms",
+        "agent_open_transport_wait_p50_ms",
         "ready_wait_p50_ms",
         "ready_wait_total_ms",
         "payload_queue_wait_p50_ms",
@@ -588,8 +621,8 @@ def self_test() -> None:
     sample = "\n".join(
         [
             "unrelated log line",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tready_wait_us=2000\tstream_ready_us=1000\topened_us=2000\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\tlocal_send_wait_us=7000\tlocal_send_wait_max_us=5000\tlocal_send_waits=2\ttcp_recv_queue_wait_us=4000\ttcp_recv_queue_wait_max_us=3000\ttcp_recv_queue_waits=2\tlocal_queue_wait_us=3000\tlocal_queue_wait_max_us=2000\tlocal_queue_waits=2\tagent_send_credit_wait_us=6000\tagent_send_credit_wait_max_us=4000\tagent_send_outbound_wait_us=1000\tagent_send_outbound_wait_max_us=1000\tagent_send_frames=2\tremote_event_wait_us=5000\tremote_event_wait_max_us=5000\tremote_event_waits=1\toutcome=remote_eof",
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tready_wait_us=5000\tstream_ready_us=1200\topened_us=2200\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\tlocal_send_wait_us=11000\tlocal_send_wait_max_us=8000\tlocal_send_waits=3\ttcp_recv_queue_wait_us=12000\ttcp_recv_queue_wait_max_us=10000\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=5000\tlocal_queue_wait_max_us=4000\tlocal_queue_waits=3\tagent_send_credit_wait_us=2000\tagent_send_credit_wait_max_us=2000\tagent_send_outbound_wait_us=9000\tagent_send_outbound_wait_max_us=6000\tagent_send_frames=3\tremote_event_wait_us=9000\tremote_event_wait_max_us=6000\tremote_event_waits=2\toutcome=closed",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->198.18.77.77:80\tgeneration=1\tready_wait_us=2000\tstream_ready_us=1000\topened_us=2000\tagent_remote_connect_us=250\tfirst_local_us=3000\tfirst_local_sent_us=4000\tfirst_remote_us=10000\tduration_us=20000\tlocal_bytes=64\tremote_bytes=1024\tlocal_send_wait_us=7000\tlocal_send_wait_max_us=5000\tlocal_send_waits=2\ttcp_recv_queue_wait_us=4000\ttcp_recv_queue_wait_max_us=3000\ttcp_recv_queue_waits=2\tlocal_queue_wait_us=3000\tlocal_queue_wait_max_us=2000\tlocal_queue_waits=2\tagent_send_credit_wait_us=6000\tagent_send_credit_wait_max_us=4000\tagent_send_outbound_wait_us=1000\tagent_send_outbound_wait_max_us=1000\tagent_send_frames=2\tremote_event_wait_us=5000\tremote_event_wait_max_us=5000\tremote_event_waits=1\toutcome=remote_eof",
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.2:49153->198.18.77.77:80\tgeneration=1\tready_wait_us=5000\tstream_ready_us=1200\topened_us=2200\tagent_remote_connect_us=400\tfirst_local_us=3200\tfirst_local_sent_us=4200\tfirst_remote_us=30000\tduration_us=50000\tlocal_bytes=64\tremote_bytes=2048\tlocal_send_wait_us=11000\tlocal_send_wait_max_us=8000\tlocal_send_waits=3\ttcp_recv_queue_wait_us=12000\ttcp_recv_queue_wait_max_us=10000\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=5000\tlocal_queue_wait_max_us=4000\tlocal_queue_waits=3\tagent_send_credit_wait_us=2000\tagent_send_credit_wait_max_us=2000\tagent_send_outbound_wait_us=9000\tagent_send_outbound_wait_max_us=6000\tagent_send_frames=3\tremote_event_wait_us=9000\tremote_event_wait_max_us=6000\tremote_event_waits=2\toutcome=closed",
             "rustle_hotpath_tcp\ttransport=quic-native\tflow=10.0.0.3:49154->198.18.77.77:80\tgeneration=1\tstream_ready_us=500\topened_us=1500\tfirst_local_us=-\tfirst_local_sent_us=-\tfirst_remote_us=-\tduration_us=2500\tlocal_bytes=0\tremote_bytes=0\toutcome=open_timeout",
         ]
     )
@@ -605,6 +638,8 @@ def self_test() -> None:
     assert agent["first_remote_p50_ms"] == "10.000"
     assert agent["first_remote_p95_ms"] == "30.000"
     assert agent["remote_open_wait_p50_ms"] == "1.000"
+    assert agent["agent_remote_connect_p50_ms"] == "0.250"
+    assert agent["agent_open_transport_wait_p50_ms"] == "0.600"
     assert agent["ready_wait_p50_ms"] == "2.000"
     assert agent["ready_wait_total_ms"] == "7.000"
     assert agent["payload_queue_wait_p50_ms"] == "1.000"
@@ -655,6 +690,8 @@ def self_test() -> None:
     assert native["first_remote_p50_ms"] == "-"
     assert native["first_byte_wait_p50_ms"] == "-"
     assert native["post_open_first_byte_wait_p50_ms"] == "-"
+    assert native["agent_remote_connect_p50_ms"] == "-"
+    assert native["agent_open_transport_wait_p50_ms"] == "-"
     assert native["local_send_wait_p50_ms"] == "-"
     assert native["likely_bottleneck"] == "remote_open_wait"
     assert native["outcomes"] == "open_timeout:1"

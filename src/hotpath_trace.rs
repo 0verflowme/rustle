@@ -15,6 +15,7 @@ pub(crate) struct TcpFlowTrace {
     ready_wait_us: u128,
     stream_ready_us: Option<u128>,
     opened_us: Option<u128>,
+    agent_remote_connect_us: Option<u128>,
     first_local_us: Option<u128>,
     first_local_sent_us: Option<u128>,
     first_remote_us: Option<u128>,
@@ -47,6 +48,7 @@ struct TcpFlowTraceSummary {
     ready_wait_us: u128,
     stream_ready_us: Option<u128>,
     opened_us: Option<u128>,
+    agent_remote_connect_us: Option<u128>,
     first_local_us: Option<u128>,
     first_local_sent_us: Option<u128>,
     first_remote_us: Option<u128>,
@@ -83,6 +85,7 @@ impl TcpFlowTrace {
             ready_wait_us: u128::from(ready_wait_ms).saturating_mul(1000),
             stream_ready_us: None,
             opened_us: None,
+            agent_remote_connect_us: None,
             first_local_us: None,
             first_local_sent_us: None,
             first_remote_us: None,
@@ -116,6 +119,13 @@ impl TcpFlowTrace {
 
     pub(crate) fn opened(&mut self) {
         self.record_elapsed_if_enabled(TraceField::Opened);
+    }
+
+    pub(crate) fn agent_remote_connect(&mut self, remote_connect_us: u64) {
+        if self.enabled {
+            self.agent_remote_connect_us
+                .get_or_insert(u128::from(remote_connect_us));
+        }
     }
 
     pub(crate) fn local_bytes(&mut self, bytes: usize) {
@@ -258,6 +268,7 @@ impl TcpFlowTrace {
                 ready_wait_us: self.ready_wait_us,
                 stream_ready_us: self.stream_ready_us,
                 opened_us: self.opened_us,
+                agent_remote_connect_us: self.agent_remote_connect_us,
                 first_local_us: self.first_local_us,
                 first_local_sent_us: self.first_local_sent_us,
                 first_remote_us: self.first_remote_us,
@@ -313,7 +324,7 @@ fn hotpath_trace_enabled() -> bool {
 fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
     let key = summary.id.key;
     format!(
-        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\ttcp_recv_queue_wait_us={}\ttcp_recv_queue_wait_max_us={}\ttcp_recv_queue_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
+        "rustle_hotpath_tcp\ttransport={}\tflow={}:{}->{}:{}\tgeneration={}\tready_wait_us={}\tstream_ready_us={}\topened_us={}\tagent_remote_connect_us={}\tfirst_local_us={}\tfirst_local_sent_us={}\tfirst_remote_us={}\tduration_us={}\tlocal_bytes={}\tremote_bytes={}\tlocal_send_wait_us={}\tlocal_send_wait_max_us={}\tlocal_send_waits={}\ttcp_recv_queue_wait_us={}\ttcp_recv_queue_wait_max_us={}\ttcp_recv_queue_waits={}\tlocal_queue_wait_us={}\tlocal_queue_wait_max_us={}\tlocal_queue_waits={}\tagent_send_credit_wait_us={}\tagent_send_credit_wait_max_us={}\tagent_send_outbound_wait_us={}\tagent_send_outbound_wait_max_us={}\tagent_send_frames={}\tremote_event_wait_us={}\tremote_event_wait_max_us={}\tremote_event_waits={}\toutcome={}",
         summary.transport,
         key.src_ip,
         key.src_port,
@@ -323,6 +334,7 @@ fn format_tcp_flow_trace_summary(summary: &TcpFlowTraceSummary) -> String {
         summary.ready_wait_us,
         format_optional_us(summary.stream_ready_us),
         format_optional_us(summary.opened_us),
+        format_optional_us(summary.agent_remote_connect_us),
         format_optional_us(summary.first_local_us),
         format_optional_us(summary.first_local_sent_us),
         format_optional_us(summary.first_remote_us),
@@ -377,6 +389,7 @@ mod tests {
             ready_wait_us: 12_000,
             stream_ready_us: Some(10),
             opened_us: Some(20),
+            agent_remote_connect_us: Some(5),
             first_local_us: Some(30),
             first_local_sent_us: Some(40),
             first_remote_us: None,
@@ -405,7 +418,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\ttcp_recv_queue_wait_us=14\ttcp_recv_queue_wait_max_us=10\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
+            "rustle_hotpath_tcp\ttransport=agent\tflow=10.0.0.1:49152->203.0.113.10:443\tgeneration=7\tready_wait_us=12000\tstream_ready_us=10\topened_us=20\tagent_remote_connect_us=5\tfirst_local_us=30\tfirst_local_sent_us=40\tfirst_remote_us=-\tduration_us=50\tlocal_bytes=123\tremote_bytes=456\tlocal_send_wait_us=9\tlocal_send_wait_max_us=8\tlocal_send_waits=2\ttcp_recv_queue_wait_us=14\ttcp_recv_queue_wait_max_us=10\ttcp_recv_queue_waits=3\tlocal_queue_wait_us=7\tlocal_queue_wait_max_us=6\tlocal_queue_waits=1\tagent_send_credit_wait_us=4\tagent_send_credit_wait_max_us=3\tagent_send_outbound_wait_us=5\tagent_send_outbound_wait_max_us=4\tagent_send_frames=6\tremote_event_wait_us=11\tremote_event_wait_max_us=10\tremote_event_waits=3\toutcome=closed"
         );
         assert!(!line.contains("payload"));
     }

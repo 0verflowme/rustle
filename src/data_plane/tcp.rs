@@ -118,6 +118,7 @@ where
                         Ok(Some(frame)) => match frame.kind {
                             agent_proto::AgentFrameKind::Opened => {
                                 if !open_reported {
+                                    record_agent_opened_timing(&mut trace, &frame);
                                     trace.opened();
                                     if !report_agent_stream_opened(&event_tx, id, open_started_at)
                                         .await
@@ -477,6 +478,12 @@ fn tcp_open_request(id: tcp_core::FlowId) -> DataPlaneIpv4Open {
         originator_ip: id.key.src_ip,
         originator_port: id.key.src_port,
         flow_generation: Some(id.generation),
+    }
+}
+
+fn record_agent_opened_timing(trace: &mut TcpFlowTrace, frame: &agent_proto::AgentFrame) {
+    if let Ok(Some(timing)) = agent_proto::AgentOpenedTiming::decode_optional(&frame.payload) {
+        trace.agent_remote_connect(timing.remote_connect_us);
     }
 }
 

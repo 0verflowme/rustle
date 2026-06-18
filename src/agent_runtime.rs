@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -13,8 +13,8 @@ use tokio::task::JoinHandle;
 
 use crate::agent_io::{AgentFrameBurstWriter, AgentFrameReader};
 use crate::agent_proto::{
-    AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
-    CAP_FLOW_CONTROL,
+    AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AgentOpenedTiming,
+    AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
 };
 use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
@@ -547,11 +547,14 @@ async fn run_tcp_stream_inner(
     options: AgentTcpStreamOptions,
 ) {
     let destination = SocketAddrV4::new(open.destination_ip, open.destination_port);
+    let connect_started_at = Instant::now();
     let stream =
         tcp_connect_with_timeout(TcpStream::connect(destination), options.connect_timeout).await;
+    let connect_elapsed = connect_started_at.elapsed();
     run_tcp_connected_stream(
         stream_id,
         stream,
+        Some(connect_elapsed),
         from_local,
         out_tx,
         output_credit,
@@ -568,14 +571,17 @@ async fn run_tcp_host_stream_inner(
     output_credit: Arc<Semaphore>,
     options: AgentTcpStreamOptions,
 ) {
+    let connect_started_at = Instant::now();
     let stream = tcp_connect_with_timeout(
         TcpStream::connect((open.destination_host.as_str(), open.destination_port)),
         options.connect_timeout,
     )
     .await;
+    let connect_elapsed = connect_started_at.elapsed();
     run_tcp_connected_stream(
         stream_id,
         stream,
+        Some(connect_elapsed),
         from_local,
         out_tx,
         output_credit,
@@ -606,6 +612,7 @@ where
 async fn run_tcp_connected_stream(
     stream_id: u64,
     stream: Result<TcpStream, std::io::Error>,
+    remote_connect_elapsed: Option<Duration>,
     mut from_local: mpsc::Receiver<AgentTcpInput>,
     out_tx: mpsc::Sender<AgentFrame>,
     output_credit: Arc<Semaphore>,
@@ -676,9 +683,13 @@ async fn run_tcp_connected_stream(
 
     if send_agent_frame(
         &out_tx,
-        AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
-            .expect("empty frame")
-            .with_credit(AgentCreditWindow::initial_credit() as u32),
+        AgentFrame::new(
+            AgentFrameKind::Opened,
+            stream_id,
+            opened_timing_payload(remote_connect_elapsed),
+        )
+        .expect("opened frame")
+        .with_credit(AgentCreditWindow::initial_credit() as u32),
     )
     .await
     .is_err()
@@ -737,6 +748,20 @@ async fn run_tcp_connected_stream(
         AgentFrame::new(AgentFrameKind::Close, stream_id, Bytes::new()).expect("empty frame"),
     )
     .await;
+}
+
+fn opened_timing_payload(remote_connect_elapsed: Option<Duration>) -> Bytes {
+    let Some(elapsed) = remote_connect_elapsed else {
+        return Bytes::new();
+    };
+    AgentOpenedTiming {
+        remote_connect_us: duration_micros_u64(elapsed),
+    }
+    .encode()
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 async fn run_udp_stream(
@@ -1577,6 +1602,7 @@ mod tests {
                 std::io::ErrorKind::TimedOut,
                 "timed out after 1ms connecting remote TCP stream",
             )),
+            None,
             from_local,
             out_tx,
             Arc::new(Semaphore::new(0)),
@@ -1624,6 +1650,7 @@ mod tests {
         let task = tokio::spawn(run_tcp_connected_stream(
             7,
             Ok(client_stream),
+            None,
             from_local,
             out_tx,
             Arc::new(Semaphore::new(AGENT_STREAM_WINDOW_BYTES)),
