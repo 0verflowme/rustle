@@ -193,16 +193,34 @@ fn configure_system_dns_for_platform(_if_name: &str, dns_ip: Ipv4Addr) -> Result
 
 #[cfg(target_os = "linux")]
 fn configure_system_dns_for_platform(if_name: &str, dns_ip: Ipv4Addr) -> Result<DnsConfigGuard> {
+    configure_linux_system_dns_with_runner(if_name, dns_ip, run_command)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn configure_linux_system_dns_with_runner<F>(
+    if_name: &str,
+    dns_ip: Ipv4Addr,
+    mut run: F,
+) -> Result<DnsConfigGuard>
+where
+    F: FnMut(&CommandSpec) -> Result<String>,
+{
     let set_dns = linux_set_dns_command(if_name, dns_ip);
     let set_domain = linux_set_route_domain_command(if_name);
     let restore = linux_restore_dns_command(if_name);
 
-    run_command(&set_dns).context("failed to configure systemd-resolved DNS server")?;
-    if let Err(err) =
-        run_command(&set_domain).context("failed to configure systemd-resolved route-only domain")
+    run(&set_dns).context("failed to configure systemd-resolved DNS server")?;
+    if let Err(domain_err) =
+        run(&set_domain).context("failed to configure systemd-resolved route-only domain")
     {
-        let _ = run_command(&restore);
-        return Err(err);
+        if let Err(restore_err) = run(&restore).context(
+            "failed to roll back systemd-resolved DNS server after route-only domain failure",
+        ) {
+            return Err(anyhow::anyhow!(
+                "failed to configure systemd-resolved route-only domain and failed to roll back DNS server\nset-domain error: {domain_err:#}\nrollback error: {restore_err:#}"
+            ));
+        }
+        return Err(domain_err);
     }
 
     eprintln!("dns: set systemd-resolved link {if_name} resolver to {dns_ip}");
@@ -1017,6 +1035,61 @@ USB 10/100/1000 LAN
             linux_restore_dns_command("tun0"),
             CommandSpec::new("resolvectl", ["revert", "tun0"])
         );
+    }
+
+    #[test]
+    fn linux_dns_configuration_rolls_back_when_domain_configuration_fails() {
+        let dns_ip = Ipv4Addr::new(10, 255, 255, 53);
+        let set_dns = linux_set_dns_command("tun0", dns_ip);
+        let set_domain = linux_set_route_domain_command("tun0");
+        let restore = linux_restore_dns_command("tun0");
+        let mut executed = Vec::new();
+
+        let err = configure_linux_system_dns_with_runner("tun0", dns_ip, |command| {
+            executed.push(command.clone());
+            if command == &set_domain {
+                Err(anyhow::anyhow!("domain rejected"))
+            } else {
+                Ok(String::new())
+            }
+        })
+        .expect_err("domain failure should be reported");
+        let err = format!("{err:#}");
+
+        assert_eq!(
+            executed,
+            vec![set_dns.clone(), set_domain.clone(), restore.clone()]
+        );
+        assert!(err.contains("failed to configure systemd-resolved route-only domain"));
+        assert!(err.contains("domain rejected"));
+    }
+
+    #[test]
+    fn linux_dns_configuration_reports_rollback_failure_after_domain_failure() {
+        let dns_ip = Ipv4Addr::new(10, 255, 255, 53);
+        let set_dns = linux_set_dns_command("tun0", dns_ip);
+        let set_domain = linux_set_route_domain_command("tun0");
+        let restore = linux_restore_dns_command("tun0");
+        let mut executed = Vec::new();
+
+        let err = configure_linux_system_dns_with_runner("tun0", dns_ip, |command| {
+            executed.push(command.clone());
+            if command == &set_domain {
+                Err(anyhow::anyhow!("domain rejected"))
+            } else if command == &restore {
+                Err(anyhow::anyhow!("restore rejected"))
+            } else {
+                Ok(String::new())
+            }
+        })
+        .expect_err("domain and rollback failures should be reported together");
+        let err = err.to_string();
+
+        assert_eq!(executed, vec![set_dns, set_domain, restore]);
+        assert!(err.contains("failed to configure systemd-resolved route-only domain"));
+        assert!(err.contains("failed to roll back DNS server"));
+        assert!(err.contains("domain rejected"));
+        assert!(err.contains("restore rejected"));
     }
 
     #[test]

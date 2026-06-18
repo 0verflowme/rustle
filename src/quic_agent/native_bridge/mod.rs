@@ -6,7 +6,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::{BufMut, Bytes, BytesMut};
 use quinn::{Connection, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+    TcpStream, UdpSocket,
+};
+use tokio::task::JoinHandle;
 
 use crate::agent_proto::{AgentOpenHost, AgentOpenIpv4};
 
@@ -481,19 +485,48 @@ async fn run_bridge_tcp_stream(
 
 async fn relay_quic_bridge_tcp_stream(
     mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    recv: quinn::RecvStream,
     stream: TcpStream,
 ) -> Result<()> {
     send.write_all(&[QUIC_BRIDGE_STATUS_OK])
         .await
         .context("failed to write native QUIC bridge open status")?;
-    let (mut tcp_read, mut tcp_write) = stream.into_split();
-    let local_to_remote = tokio::spawn(async move {
-        let result = tokio::io::copy(&mut recv, &mut tcp_write).await;
-        let _ = tcp_write.shutdown().await;
-        result
-    });
+    let (tcp_read, tcp_write) = stream.into_split();
+    let local_to_remote = tokio::spawn(copy_quic_bridge_request_to_tcp(recv, tcp_write));
+    let remote_to_local = tokio::spawn(copy_remote_tcp_to_quic_bridge(tcp_read, send));
 
+    observe_quic_bridge_tcp_relay(local_to_remote, remote_to_local).await
+}
+
+async fn copy_quic_bridge_request_to_tcp(
+    mut recv: quinn::RecvStream,
+    mut tcp_write: OwnedWriteHalf,
+) -> Result<()> {
+    let copied = tokio::io::copy(&mut recv, &mut tcp_write)
+        .await
+        .context("failed to copy native QUIC bridge request to remote TCP stream");
+    let shutdown = tcp_write
+        .shutdown()
+        .await
+        .context("failed to finish remote TCP stream after native QUIC bridge request");
+
+    match (copied, shutdown) {
+        (Ok(_), Ok(())) => Ok(()),
+        (Err(err), Ok(())) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+        (Err(copy_err), Err(shutdown_err)) => {
+            eprintln!(
+                "quic-bridge-agent: failed to finish remote TCP stream after native QUIC bridge request: {shutdown_err:#}"
+            );
+            Err(copy_err)
+        }
+    }
+}
+
+async fn copy_remote_tcp_to_quic_bridge(
+    mut tcp_read: OwnedReadHalf,
+    mut send: quinn::SendStream,
+) -> Result<()> {
     let mut buf = BytesMut::with_capacity(QUIC_BRIDGE_TCP_CHUNK);
     loop {
         if buf.capacity() < QUIC_BRIDGE_TCP_CHUNK {
@@ -510,9 +543,153 @@ async fn relay_quic_bridge_tcp_stream(
             .await
             .context("failed to write native QUIC bridge response")?;
     }
-    let _ = send.shutdown().await;
-    local_to_remote.abort();
+    send.shutdown()
+        .await
+        .context("failed to finish native QUIC bridge response stream")?;
     Ok(())
+}
+
+async fn observe_quic_bridge_tcp_relay(
+    mut local_to_remote: JoinHandle<Result<()>>,
+    mut remote_to_local: JoinHandle<Result<()>>,
+) -> Result<()> {
+    tokio::select! {
+        local_result = &mut local_to_remote => {
+            let local_result =
+                quic_bridge_tcp_relay_task_result("local-to-remote", local_result);
+            let abort_remote = relay_abort_after_failure(
+                "local-to-remote",
+                &local_result,
+                "remote-to-local",
+                &remote_to_local,
+            );
+            if abort_remote {
+                remote_to_local.abort();
+            }
+            let remote_result = quic_bridge_tcp_relay_task_result_after_possible_abort(
+                "remote-to-local",
+                remote_to_local.await,
+                abort_remote.then_some(RelayAbortReason::OppositeDirectionFailed),
+            );
+            finish_quic_bridge_tcp_relay(
+                "local-to-remote",
+                local_result,
+                "remote-to-local",
+                remote_result,
+            )
+        }
+        remote_result = &mut remote_to_local => {
+            let remote_result =
+                quic_bridge_tcp_relay_task_result("remote-to-local", remote_result);
+            let abort_local = relay_local_to_remote_after_remote_result(
+                &remote_result,
+                &local_to_remote,
+            );
+            if abort_local.is_some() {
+                local_to_remote.abort();
+            }
+            let local_result = quic_bridge_tcp_relay_task_result_after_possible_abort(
+                "local-to-remote",
+                local_to_remote.await,
+                abort_local,
+            );
+            finish_quic_bridge_tcp_relay(
+                "remote-to-local",
+                remote_result,
+                "local-to-remote",
+                local_result,
+            )
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RelayAbortReason {
+    OppositeDirectionFailed,
+    RemoteToLocalFinished,
+}
+
+fn relay_abort_after_failure(
+    failed_direction: &'static str,
+    result: &Result<()>,
+    pending_direction: &'static str,
+    pending: &JoinHandle<Result<()>>,
+) -> bool {
+    let Err(err) = result else {
+        return false;
+    };
+    if pending.is_finished() {
+        return false;
+    }
+    eprintln!(
+        "quic-bridge-agent: aborting native QUIC bridge {pending_direction} TCP relay after {failed_direction} relay failed: {err:#}"
+    );
+    true
+}
+
+fn relay_local_to_remote_after_remote_result(
+    remote_result: &Result<()>,
+    local_to_remote: &JoinHandle<Result<()>>,
+) -> Option<RelayAbortReason> {
+    match remote_result {
+        Ok(_) if !local_to_remote.is_finished() => Some(RelayAbortReason::RemoteToLocalFinished),
+        Err(_) => relay_abort_after_failure(
+            "remote-to-local",
+            remote_result,
+            "local-to-remote",
+            local_to_remote,
+        )
+        .then_some(RelayAbortReason::OppositeDirectionFailed),
+        _ => None,
+    }
+}
+
+fn quic_bridge_tcp_relay_task_result(
+    direction: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+) -> Result<()> {
+    result
+        .with_context(|| format!("native QUIC bridge {direction} relay task failed"))?
+        .with_context(|| format!("native QUIC bridge {direction} relay failed"))
+}
+
+fn quic_bridge_tcp_relay_task_result_after_possible_abort(
+    direction: &'static str,
+    result: std::result::Result<Result<()>, tokio::task::JoinError>,
+    abort_reason: Option<RelayAbortReason>,
+) -> Result<()> {
+    match result {
+        Err(err) if abort_reason.is_some() && err.is_cancelled() => {
+            if matches!(
+                abort_reason,
+                Some(RelayAbortReason::OppositeDirectionFailed)
+            ) {
+                eprintln!(
+                    "quic-bridge-agent: native QUIC bridge {direction} TCP relay cancelled after opposite direction failed"
+                );
+            }
+            Ok(())
+        }
+        other => quic_bridge_tcp_relay_task_result(direction, other),
+    }
+}
+
+fn finish_quic_bridge_tcp_relay(
+    first_direction: &'static str,
+    first_result: Result<()>,
+    second_direction: &'static str,
+    second_result: Result<()>,
+) -> Result<()> {
+    match (first_result, second_result) {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(err), Ok(_)) | (Ok(_), Err(err)) => Err(err),
+        (Err(first_err), Err(second_err)) => {
+            eprintln!(
+                "quic-bridge-agent: native QUIC bridge {second_direction} TCP relay also failed after {first_direction} failed: {second_err:#}"
+            );
+            Err(first_err)
+        }
+    }
 }
 
 async fn run_bridge_tcp_host_stream(
@@ -649,6 +826,185 @@ mod tests {
             !diagnostics.contains("abababababab"),
             "diagnostics must not expose raw auth token bytes"
         );
+    }
+
+    async fn wait_until_finished<T>(task: &tokio::task::JoinHandle<T>) {
+        for _ in 0..100 {
+            if task.is_finished() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("task did not finish");
+    }
+
+    fn pending_relay_task() -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async { std::future::pending::<Result<()>>().await })
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_relay_abort_policy_requires_failure_and_pending_peer() {
+        let pending = pending_relay_task();
+        let failure = Err(anyhow::anyhow!("copy failed"));
+        assert!(relay_abort_after_failure(
+            "local-to-remote",
+            &failure,
+            "remote-to-local",
+            &pending
+        ));
+        assert!(!relay_abort_after_failure(
+            "local-to-remote",
+            &Ok(()),
+            "remote-to-local",
+            &pending
+        ));
+        pending.abort();
+        let _ = pending.await;
+
+        let finished = tokio::spawn(async { Ok(()) });
+        wait_until_finished(&finished).await;
+        assert!(!relay_abort_after_failure(
+            "local-to-remote",
+            &Err(anyhow::anyhow!("copy failed")),
+            "remote-to-local",
+            &finished
+        ));
+        finished
+            .await
+            .expect("finished relay task")
+            .expect("relay ok");
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_remote_result_aborts_only_pending_request_relay() {
+        let pending = pending_relay_task();
+        assert_eq!(
+            relay_local_to_remote_after_remote_result(&Ok(()), &pending),
+            Some(RelayAbortReason::RemoteToLocalFinished)
+        );
+        assert_eq!(
+            relay_local_to_remote_after_remote_result(
+                &Err(anyhow::anyhow!("response failed")),
+                &pending
+            ),
+            Some(RelayAbortReason::OppositeDirectionFailed)
+        );
+        pending.abort();
+        let _ = pending.await;
+
+        let finished = tokio::spawn(async { Ok(()) });
+        wait_until_finished(&finished).await;
+        assert_eq!(
+            relay_local_to_remote_after_remote_result(&Ok(()), &finished),
+            None
+        );
+        finished
+            .await
+            .expect("finished relay task")
+            .expect("relay ok");
+    }
+
+    #[test]
+    fn quic_bridge_relay_task_result_preserves_direction_context() {
+        quic_bridge_tcp_relay_task_result("local-to-remote", Ok(Ok(())))
+            .expect("successful relay task");
+
+        let err = quic_bridge_tcp_relay_task_result(
+            "local-to-remote",
+            Ok(Err(anyhow::anyhow!("copy failed"))),
+        )
+        .expect_err("relay task error should propagate");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("native QUIC bridge local-to-remote relay failed"));
+        assert!(detail.contains("copy failed"));
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_possible_abort_accepts_only_expected_cancellation() {
+        let cancelled = pending_relay_task();
+        cancelled.abort();
+        let cancelled = cancelled.await;
+        quic_bridge_tcp_relay_task_result_after_possible_abort(
+            "local-to-remote",
+            cancelled,
+            Some(RelayAbortReason::RemoteToLocalFinished),
+        )
+        .expect("expected cancellation should be accepted");
+
+        let unexpected_cancelled = pending_relay_task();
+        unexpected_cancelled.abort();
+        let unexpected_cancelled = unexpected_cancelled.await;
+        let err = quic_bridge_tcp_relay_task_result_after_possible_abort(
+            "local-to-remote",
+            unexpected_cancelled,
+            None,
+        )
+        .expect_err("unexpected cancellation should fail");
+        assert!(format!("{err:#}").contains("native QUIC bridge local-to-remote relay task failed"));
+
+        let panic_task = tokio::spawn(async {
+            panic!("synthetic relay panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        let panic_result = panic_task.await;
+        let err = quic_bridge_tcp_relay_task_result_after_possible_abort(
+            "local-to-remote",
+            panic_result,
+            Some(RelayAbortReason::RemoteToLocalFinished),
+        )
+        .expect_err("panic join error must not be accepted as cancellation");
+        assert!(format!("{err:#}").contains("native QUIC bridge local-to-remote relay task failed"));
+    }
+
+    #[test]
+    fn quic_bridge_finish_relay_propagates_directional_failures() {
+        finish_quic_bridge_tcp_relay("local-to-remote", Ok(()), "remote-to-local", Ok(()))
+            .expect("both directions succeeded");
+
+        let err = finish_quic_bridge_tcp_relay(
+            "local-to-remote",
+            Err(anyhow::anyhow!("local failed")),
+            "remote-to-local",
+            Ok(()),
+        )
+        .expect_err("local failure should propagate");
+        assert!(format!("{err:#}").contains("local failed"));
+
+        let err = finish_quic_bridge_tcp_relay(
+            "local-to-remote",
+            Ok(()),
+            "remote-to-local",
+            Err(anyhow::anyhow!("remote failed")),
+        )
+        .expect_err("remote failure should propagate");
+        assert!(format!("{err:#}").contains("remote failed"));
+
+        let err = finish_quic_bridge_tcp_relay(
+            "local-to-remote",
+            Err(anyhow::anyhow!("first failed")),
+            "remote-to-local",
+            Err(anyhow::anyhow!("second failed")),
+        )
+        .expect_err("first failure should be returned when both fail");
+        assert!(format!("{err:#}").contains("first failed"));
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_observer_propagates_first_direction_failure() {
+        let local_to_remote = tokio::spawn(async { Err(anyhow::anyhow!("request copy failed")) });
+        let remote_to_local = pending_relay_task();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            observe_quic_bridge_tcp_relay(local_to_remote, remote_to_local),
+        )
+        .await
+        .expect("relay observer should not hang after first direction failure")
+        .expect_err("first relay failure should fail observer");
+        let detail = format!("{err:#}");
+        assert!(detail.contains("local-to-remote"));
+        assert!(detail.contains("request copy failed"));
     }
 
     #[tokio::test]
@@ -788,6 +1144,100 @@ mod tests {
         client.close("test complete");
         bridge_task.await.expect("bridge task");
         server_task.await.expect("TCP server task");
+    }
+
+    #[tokio::test]
+    async fn quic_bridge_tcp_relay_finishes_after_remote_eof_with_open_client_request() {
+        let tcp_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind relay TCP listener");
+        let tcp_addr = tcp_listener.local_addr().expect("TCP listener address");
+        let tcp_connect =
+            tokio::spawn(async move { TcpStream::connect(tcp_addr).await.expect("connect TCP") });
+        let (mut remote_tcp, _) = tcp_listener.accept().await.expect("accept TCP stream");
+        let relay_tcp = tcp_connect.await.expect("TCP connect task");
+
+        let quic_server =
+            start_quic_bridge_server(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .expect("start native QUIC bridge");
+        let quic_addr = quic_server.local_addr().expect("QUIC local address");
+        let bootstrap = quic_server.bootstrap().clone();
+        let server_endpoint = quic_server.endpoint.clone();
+        let server_auth_token = bootstrap.auth_token.clone();
+        let accept_task = tokio::spawn(async move {
+            let incoming = server_endpoint
+                .accept()
+                .await
+                .expect("accept QUIC connection");
+            let connection = incoming.await.expect("establish QUIC connection");
+            authenticate_quic_bridge_connection_on_server(&connection, &server_auth_token)
+                .await
+                .expect("authenticate QUIC connection");
+            connection.accept_bi().await.expect("accept relay stream")
+        });
+
+        let client = connect_quic_bridge(quic_addr, &bootstrap)
+            .await
+            .expect("connect native QUIC bridge");
+        let (mut client_send, mut client_recv) = client
+            .inner
+            .connection
+            .open_bi()
+            .await
+            .expect("open client relay stream");
+        client_send
+            .write_all(b"request")
+            .await
+            .expect("write client request");
+        let (server_send, server_recv) = accept_task.await.expect("accept task");
+        let relay_task = tokio::spawn(relay_quic_bridge_tcp_stream(
+            server_send,
+            server_recv,
+            relay_tcp,
+        ));
+
+        let mut status = [0_u8; 1];
+        client_recv
+            .read_exact(&mut status)
+            .await
+            .expect("read relay open status");
+        assert_eq!(status[0], QUIC_BRIDGE_STATUS_OK);
+
+        let mut request = [0_u8; 7];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut remote_tcp, &mut request),
+        )
+        .await
+        .expect("remote TCP sees request")
+        .expect("read request");
+        assert_eq!(&request, b"request");
+        tokio::io::AsyncWriteExt::write_all(&mut remote_tcp, b"response")
+            .await
+            .expect("write response");
+        tokio::io::AsyncWriteExt::shutdown(&mut remote_tcp)
+            .await
+            .expect("finish remote TCP response");
+
+        let mut response = Vec::new();
+        let mut buf = [0_u8; 1024];
+        while let Some(len) = client_recv
+            .read(&mut buf)
+            .await
+            .expect("read relay response")
+        {
+            response.extend_from_slice(&buf[..len]);
+        }
+        assert_eq!(response, b"response");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay_task)
+            .await
+            .expect("relay task finishes")
+            .expect("relay task join")
+            .expect("remote EOF should finish relay without waiting for client request EOF");
+
+        drop(client_send);
+        client.close("test complete");
     }
 
     #[tokio::test]

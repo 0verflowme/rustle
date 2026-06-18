@@ -9,6 +9,7 @@ use crate::ssh_control::Client;
 pub(crate) const POSIX_REMOTE_PLATFORM_PROBE_COMMAND: &str =
     "uname -s 2>/dev/null; uname -m 2>/dev/null";
 pub(crate) const WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND: &str = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Write-Output 'Windows'; if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'ARM64') { Write-Output 'arm64' } elseif ($env:PROCESSOR_ARCHITECTURE -eq 'AMD64') { Write-Output 'AMD64' } elseif ($env:PROCESSOR_ARCHITEW6432 -eq 'AMD64') { Write-Output 'AMD64' } else { Write-Output $env:PROCESSOR_ARCHITECTURE }\"";
+const REMOTE_PLATFORM_PROBE_OUTPUT_LIMIT: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RemotePlatform {
@@ -39,29 +40,103 @@ impl RemotePlatform {
 }
 
 pub(crate) async fn probe_remote_platform(handle: &Handle<Client>) -> Result<RemotePlatform> {
-    if let Ok(output) =
-        run_remote_command_collect(handle, POSIX_REMOTE_PLATFORM_PROBE_COMMAND, None).await
-    {
-        if let Some(platform) = parse_successful_posix_platform_probe(&output) {
-            return Ok(platform);
-        }
-    }
+    let posix_failure =
+        match run_remote_command_collect(handle, POSIX_REMOTE_PLATFORM_PROBE_COMMAND, None).await {
+            Ok(output) => {
+                if let Some(platform) = parse_successful_posix_platform_probe(&output)? {
+                    return Ok(platform);
+                }
+                anyhow!(
+                    "POSIX remote platform probe did not complete successfully ({})",
+                    remote_probe_output_summary(&output)
+                )
+            }
+            Err(err) => err.context("failed to run POSIX remote platform probe"),
+        };
 
-    let output = run_remote_command_collect(handle, WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND, None)
-        .await
-        .context("failed to probe remote platform")?;
-    output.ensure_success("remote platform probe")?;
+    let output =
+        match run_remote_command_collect(handle, WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND, None).await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return Err(combine_remote_platform_probe_errors(
+                    Some(posix_failure),
+                    err.context("failed to run Windows remote platform probe"),
+                ));
+            }
+        };
+    if let Err(err) = output.ensure_success("Windows remote platform probe") {
+        return Err(combine_remote_platform_probe_errors(
+            Some(posix_failure),
+            err.context(format!(
+                "Windows remote platform probe did not complete successfully ({})",
+                remote_probe_output_summary(&output)
+            )),
+        ));
+    }
     parse_remote_platform_probe(&output.stdout)
+        .with_context(|| {
+            format!(
+                "Windows remote platform probe returned unsupported output ({})",
+                remote_probe_output_summary(&output)
+            )
+        })
+        .map_err(|err| combine_remote_platform_probe_errors(Some(posix_failure), err))
 }
 
 fn parse_successful_posix_platform_probe(
     output: &crate::remote_exec::RemoteCommandOutput,
-) -> Option<RemotePlatform> {
+) -> Result<Option<RemotePlatform>> {
     if output.exit_status == Some(0) {
-        parse_remote_platform_probe(&output.stdout).ok()
+        parse_remote_platform_probe(&output.stdout)
+            .with_context(|| {
+                format!(
+                    "POSIX remote platform probe returned unsupported output ({})",
+                    remote_probe_output_summary(output)
+                )
+            })
+            .map(Some)
     } else {
-        None
+        Ok(None)
     }
+}
+
+fn combine_remote_platform_probe_errors(
+    posix_failure: Option<anyhow::Error>,
+    windows_failure: anyhow::Error,
+) -> anyhow::Error {
+    match posix_failure {
+        Some(posix_failure) => anyhow!(
+            "failed to probe remote platform with POSIX or Windows probes\nPOSIX probe: {posix_failure:#}\nWindows probe: {windows_failure:#}"
+        ),
+        None => windows_failure.context("failed to probe remote platform"),
+    }
+}
+
+fn remote_probe_output_summary(output: &crate::remote_exec::RemoteCommandOutput) -> String {
+    format!(
+        "exit status {:?}, stdout: {}, stderr: {}",
+        output.exit_status,
+        trimmed_probe_output(&output.stdout),
+        trimmed_probe_output(&output.stderr)
+    )
+}
+
+fn trimmed_probe_output(output: &[u8]) -> String {
+    let output = String::from_utf8_lossy(output);
+    let output = output.trim();
+    if output.is_empty() {
+        return "<empty>".to_owned();
+    }
+
+    let mut excerpt: String = output
+        .chars()
+        .take(REMOTE_PLATFORM_PROBE_OUTPUT_LIMIT)
+        .collect();
+    if output.chars().count() > REMOTE_PLATFORM_PROBE_OUTPUT_LIMIT {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 pub(crate) fn parse_remote_platform_probe(stdout: &[u8]) -> Result<RemotePlatform> {
@@ -208,7 +283,7 @@ mod tests {
             exit_status: Some(0),
         };
         assert_eq!(
-            parse_successful_posix_platform_probe(&successful_linux),
+            parse_successful_posix_platform_probe(&successful_linux).unwrap(),
             Some(RemotePlatform {
                 os: "linux",
                 arch: "x86_64",
@@ -221,7 +296,7 @@ mod tests {
             exit_status: Some(127),
         };
         assert_eq!(
-            parse_successful_posix_platform_probe(&failed_but_parseable),
+            parse_successful_posix_platform_probe(&failed_but_parseable).unwrap(),
             None
         );
 
@@ -231,7 +306,7 @@ mod tests {
             exit_status: None,
         };
         assert_eq!(
-            parse_successful_posix_platform_probe(&missing_exit_status),
+            parse_successful_posix_platform_probe(&missing_exit_status).unwrap(),
             None
         );
 
@@ -240,9 +315,48 @@ mod tests {
             stderr: Vec::new(),
             exit_status: Some(0),
         };
-        assert_eq!(
-            parse_successful_posix_platform_probe(&successful_but_invalid),
-            None
+        let err = parse_successful_posix_platform_probe(&successful_but_invalid)
+            .expect_err("successful POSIX probe with unsupported output should be diagnostic");
+        let err = format!("{err:#}");
+        assert!(err.contains("POSIX remote platform probe returned unsupported output"));
+        assert!(err.contains("stdout: Plan9"));
+        assert!(err.contains("riscv64"));
+        assert!(err.contains("remote OS probe did not return a supported OS"));
+    }
+
+    #[test]
+    fn platform_probe_combined_error_reports_posix_and_windows_failures() {
+        let err = combine_remote_platform_probe_errors(
+            Some(anyhow!("POSIX command failed")),
+            anyhow!("Windows command failed"),
         );
+        let err = err.to_string();
+
+        assert!(err.contains("failed to probe remote platform with POSIX or Windows probes"));
+        assert!(err.contains("POSIX probe: POSIX command failed"));
+        assert!(err.contains("Windows probe: Windows command failed"));
+    }
+
+    #[test]
+    fn platform_probe_output_summary_is_trimmed_and_bounded() {
+        let exact = crate::remote_exec::RemoteCommandOutput {
+            stdout: vec![b'a'; REMOTE_PLATFORM_PROBE_OUTPUT_LIMIT],
+            stderr: b"\n".to_vec(),
+            exit_status: Some(1),
+        };
+        let exact_summary = remote_probe_output_summary(&exact);
+        assert!(!exact_summary.contains("..."));
+
+        let output = crate::remote_exec::RemoteCommandOutput {
+            stdout: vec![b'a'; REMOTE_PLATFORM_PROBE_OUTPUT_LIMIT + 1],
+            stderr: b"\n".to_vec(),
+            exit_status: Some(1),
+        };
+        let summary = remote_probe_output_summary(&output);
+
+        assert!(summary.contains("exit status Some(1)"));
+        assert!(summary.contains("stdout: "));
+        assert!(summary.contains("..."));
+        assert!(summary.contains("stderr: <empty>"));
     }
 }

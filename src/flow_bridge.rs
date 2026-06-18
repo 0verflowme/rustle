@@ -21,6 +21,7 @@ pub const BRIDGE_EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct FlowBridge {
     pub id: FlowId,
     local_tx: mpsc::Sender<QueuedLocalData>,
+    task: tokio::task::JoinHandle<()>,
     queued_local_bytes: Arc<AtomicUsize>,
     max_local_queue_bytes: usize,
 }
@@ -67,6 +68,12 @@ impl FlowBridge {
                 anyhow::bail!("bridge local channel is closed")
             }
         }
+    }
+}
+
+impl Drop for FlowBridge {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
@@ -321,10 +328,11 @@ where
 {
     let (local_tx, local_rx) = mpsc::channel(FLOW_CHANNEL_DEPTH);
     let queued_local_bytes = Arc::new(AtomicUsize::new(0));
-    tokio::spawn(run(id, LocalDataReceiver { rx: local_rx }, event_tx));
+    let task = tokio::spawn(run(id, LocalDataReceiver { rx: local_rx }, event_tx));
     FlowBridge {
         id,
         local_tx,
+        task,
         queued_local_bytes,
         max_local_queue_bytes: FLOW_CHANNEL_BYTES,
     }
@@ -343,6 +351,16 @@ mod tests {
 
     use super::*;
     use crate::tcp_core::{FlowManager, FlowState, Ipv4NetParts, PacketQueueDevice};
+
+    struct AbortReport(Option<oneshot::Sender<()>>);
+
+    impl Drop for AbortReport {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn fake_bridge_round_trips_flow_manager_stream_bytes() {
@@ -486,6 +504,36 @@ mod tests {
             .expect("oversized local bytes should be rejected cleanly"));
         assert_eq!(bridge.local_queue_bytes(), 0);
         assert_eq!(bridge.local_queue_remaining_bytes(), FLOW_CHANNEL_BYTES);
+    }
+
+    #[tokio::test]
+    async fn flow_bridge_drop_aborts_owned_bridge_task() {
+        let flow = crate::tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(172, 16, 0, 9),
+            443,
+        );
+        let id = FlowId::new(flow, 1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (abort_tx, abort_rx) = oneshot::channel();
+        let bridge = spawn_bridge_task(id, event_tx, move |_id, _local_rx, _event_tx| async move {
+            let _report = AbortReport(Some(abort_tx));
+            started_tx.send(()).expect("report bridge task start");
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started_rx)
+            .await
+            .expect("bridge task should start")
+            .expect("start report should be delivered");
+        drop(bridge);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), abort_rx)
+            .await
+            .expect("bridge task should be aborted when handle is dropped")
+            .expect("abort report should be delivered");
     }
 
     #[tokio::test]
