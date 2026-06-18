@@ -26,6 +26,7 @@ LIVE_EVIDENCE = REPO / "scripts" / "verify-live-evidence.py"
 LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
+AGENT_STARTUP_SUMMARY = REPO / "scripts" / "summarize-agent-startup-trace.py"
 QUIC_DIAGNOSTIC_SUMMARY = REPO / "scripts" / "summarize-quic-diagnostics.py"
 LIVE_DIAGNOSIS_SUMMARY = REPO / "scripts" / "summarize-live-evidence.py"
 RELEASE_ARCHIVES = REPO / "scripts" / "verify-release-archives.py"
@@ -755,6 +756,7 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "publish_live_artifact",
     "live-results.tsv",
     "hotpath-summary.tsv",
+    "startup-summary.tsv",
     "quic-diagnostics.tsv",
     "live-diagnosis.tsv",
     "RUSTLE_BENCH_AGENT_PATH",
@@ -777,6 +779,8 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "RUSTLE_HOTPATH_TRACE",
     "summarize_hotpath_trace_logs",
     "summarize-hotpath-trace.py",
+    "summarize_agent_startup_trace_logs",
+    "summarize-agent-startup-trace.py",
     "summarize_quic_diagnostic_logs",
     "summarize-quic-diagnostics.py",
     "summarize_live_evidence_artifacts",
@@ -819,6 +823,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         BRIDGE_BENCH,
         "summarize_hotpath_trace_logs",
+    ),
+    (
+        BRIDGE_BENCH,
+        "summarize_agent_startup_trace_logs",
     ),
     (
         SMOKE_LIB,
@@ -1039,6 +1047,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         VERIFY_LOCAL,
         "summarize-hotpath-trace.py",
+    ),
+    (
+        VERIFY_LOCAL,
+        "summarize-agent-startup-trace.py",
     ),
     (
         VERIFY_LOCAL,
@@ -1272,9 +1284,12 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
     "fixture-results.tsv",
     "live-results.tsv",
     "hotpath-summary.tsv",
+    "startup-summary.tsv",
     "quic-diagnostics.tsv",
     "live-diagnosis.tsv",
     "LIVE_DIAGNOSIS_COLUMNS",
+    "AGENT_STARTUP_COLUMNS",
+    "verify_optional_agent_startup_summary",
     "verify_optional_live_diagnosis",
     "--require-hotpath",
     "--self-test",
@@ -1324,6 +1339,22 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "flow_throughput_min_mib_s",
     "first_remote_p95_ms",
     "avg_flow_throughput_mib_s",
+    "--self-test",
+    "assert_rejects",
+]
+
+REQUIRED_AGENT_STARTUP_SUMMARY_SNIPPETS = [
+    "rustle_agent_startup",
+    "paths",
+    "mode",
+    "starts",
+    "failed_starts",
+    "missing_total",
+    "primary_p50_ms",
+    "duration_p50_ms",
+    "extra_total_ms",
+    "retry_total_ms",
+    "outcomes",
     "--self-test",
     "assert_rejects",
 ]
@@ -1845,6 +1876,7 @@ def main() -> None:
     live_fixture = LIVE_FIXTURE.read_text(encoding="utf-8")
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
+    agent_startup_summary = AGENT_STARTUP_SUMMARY.read_text(encoding="utf-8")
     quic_diagnostic_summary = QUIC_DIAGNOSTIC_SUMMARY.read_text(encoding="utf-8")
     live_diagnosis_summary = LIVE_DIAGNOSIS_SUMMARY.read_text(encoding="utf-8")
     release_archives = RELEASE_ARCHIVES.read_text(encoding="utf-8")
@@ -2010,6 +2042,17 @@ def main() -> None:
         fail(
             "scripts/summarize-hotpath-trace.py is missing required snippets: "
             f"{missing_hotpath_trace_summary!r}"
+        )
+
+    missing_agent_startup_summary = [
+        snippet
+        for snippet in REQUIRED_AGENT_STARTUP_SUMMARY_SNIPPETS
+        if snippet not in agent_startup_summary
+    ]
+    if missing_agent_startup_summary:
+        fail(
+            "scripts/summarize-agent-startup-trace.py is missing required snippets: "
+            f"{missing_agent_startup_summary!r}"
         )
 
     missing_quic_diagnostic_summary = [

@@ -339,6 +339,27 @@ summarize_hotpath_trace_logs() {
   fi
 }
 
+summarize_agent_startup_trace_logs() {
+  [[ -n "${RUSTLE_AGENT_STARTUP_TRACE:-}${RUSTLE_HOTPATH_TRACE:-}" ]] || return 0
+  [[ -x "${SCRIPT_DIR}/summarize-agent-startup-trace.py" ]] || return 0
+
+  local logs=()
+  local log
+  while IFS= read -r -d '' log; do
+    logs+=("$log")
+  done < <(find "$TMPDIR" -name rustle.log -print0)
+
+  [[ "${#logs[@]}" -gt 0 ]] || return 0
+  grep -q 'rustle_agent_startup' "${logs[@]}" 2>/dev/null || return 0
+
+  local summary="${TMPDIR}/startup-summary.tsv"
+  smoke_info "agent startup trace summary for live benchmark logs"
+  if "${SCRIPT_DIR}/summarize-agent-startup-trace.py" "${logs[@]}" >"$summary"; then
+    cat "$summary" >&2
+    publish_live_artifact "$summary" "startup-summary.tsv"
+  fi
+}
+
 summarize_quic_diagnostic_logs() {
   [[ -x "${SCRIPT_DIR}/summarize-quic-diagnostics.py" ]] || return 0
 
@@ -386,6 +407,7 @@ cleanup() {
     delete_target_route_best_effort
   fi
   summarize_hotpath_trace_logs
+  summarize_agent_startup_trace_logs
   summarize_quic_diagnostic_logs
   summarize_live_evidence_artifacts
   publish_live_artifact "$RESULTS_TSV" "live-results.tsv"

@@ -99,6 +99,7 @@ verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-fixture-rows.py" --self-
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-live-evidence.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/summarize-live-evidence.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/summarize-hotpath-trace.py" --self-test
+verify_run "$(smoke_python)" "${SCRIPT_DIR}/summarize-agent-startup-trace.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/summarize-quic-diagnostics.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-release-archives.py" --self-test
 verify_run "$(smoke_python)" "${SCRIPT_DIR}/verify-windows-tun-smoke.py"

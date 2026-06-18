@@ -41,6 +41,17 @@ QUIC_DIAGNOSTIC_COLUMNS = {
     "max_elapsed_ms",
     "stages",
 }
+AGENT_STARTUP_COLUMNS = {
+    "mode",
+    "starts",
+    "failed_starts",
+    "desired_total",
+    "established_total",
+    "missing_total",
+    "primary_p50_ms",
+    "duration_p50_ms",
+    "outcomes",
+}
 LIVE_DIAGNOSIS_COLUMNS = {
     "path",
     "rows",
@@ -135,6 +146,38 @@ def verify_optional_quic_diagnostics(directory: pathlib.Path) -> None:
         verify_quic_diagnostics(diagnostics)
 
 
+def verify_agent_startup_summary(path: pathlib.Path) -> None:
+    header, rows = read_tsv(require_file(path))
+    missing = sorted(AGENT_STARTUP_COLUMNS.difference(header))
+    if missing:
+        raise SystemExit(f"agent startup summary {path} missing columns {missing!r}")
+    starts_index = header.index("starts")
+    failed_index = header.index("failed_starts")
+    desired_index = header.index("desired_total")
+    established_index = header.index("established_total")
+    missing_index = header.index("missing_total")
+    for row in rows:
+        starts = int(row[starts_index])
+        failed = int(row[failed_index])
+        desired = int(row[desired_index])
+        established = int(row[established_index])
+        missing = int(row[missing_index])
+        if starts < 1:
+            raise SystemExit(f"agent startup summary {path} has non-positive start count")
+        if failed < 0 or failed > starts:
+            raise SystemExit(f"agent startup summary {path} has invalid failed start count")
+        if established < 0 or desired < established:
+            raise SystemExit(f"agent startup summary {path} has invalid lane totals")
+        if missing != desired - established:
+            raise SystemExit(f"agent startup summary {path} has invalid missing total")
+
+
+def verify_optional_agent_startup_summary(directory: pathlib.Path) -> None:
+    startup = directory / "startup-summary.tsv"
+    if startup.exists():
+        verify_agent_startup_summary(startup)
+
+
 def verify_live_diagnosis(path: pathlib.Path) -> None:
     header, rows = read_tsv(require_file(path))
     missing = sorted(LIVE_DIAGNOSIS_COLUMNS.difference(header))
@@ -179,6 +222,7 @@ def verify_live_compare(directory: pathlib.Path, require_hotpath: bool) -> None:
     if require_hotpath:
         verify_hotpath_summary(live_compare / "hotpath-summary.tsv")
     verify_optional_quic_diagnostics(live_compare)
+    verify_optional_agent_startup_summary(live_compare)
     verify_optional_live_diagnosis(live_compare)
 
 
@@ -207,6 +251,7 @@ def verify_fixtures(directory: pathlib.Path, require_hotpath: bool) -> None:
         if require_hotpath:
             verify_hotpath_summary(fixture_dir / "hotpath-summary.tsv")
         verify_optional_quic_diagnostics(fixture_dir)
+        verify_optional_agent_startup_summary(fixture_dir)
         verify_optional_live_diagnosis(fixture_dir)
 
 
@@ -328,6 +373,31 @@ def write_sample_quic_diagnostics(path: pathlib.Path) -> None:
     )
 
 
+def write_sample_agent_startup(path: pathlib.Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                (
+                    "mode\tstarts\tok_starts\tdegraded_starts\tfailed_starts\t"
+                    "desired_total\testablished_total\tmissing_total\tprimary_ok\t"
+                    "primary_fail\tprimary_p50_ms\tprimary_p95_ms\tduration_p50_ms\t"
+                    "duration_p95_ms\textra_batches\textra_connects\textra_success\t"
+                    "extra_fail\textra_total_ms\textra_max_ms\tretry_batches\t"
+                    "retry_connects\tretry_success\tretry_fail\tretry_total_ms\t"
+                    "retry_max_ms\toutcomes"
+                ),
+                (
+                    "initial\t2\t1\t1\t0\t6\t5\t1\t2\t0\t10.000\t20.000\t"
+                    "55.000\t115.000\t2\t4\t3\t1\t100.000\t60.000\t1\t1\t0\t"
+                    "1\t30.000\t30.000\tdegraded:1,ok:1"
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_sample_live_diagnosis(path: pathlib.Path, relative_path: str) -> None:
     path.write_text(
         "\n".join(
@@ -358,10 +428,12 @@ def populate_sample_evidence(directory: pathlib.Path) -> None:
     write_sample_live_results(live_compare / "live-results.tsv")
     write_sample_hotpath(live_compare / "hotpath-summary.tsv")
     write_sample_quic_diagnostics(live_compare / "quic-diagnostics.tsv")
+    write_sample_agent_startup(live_compare / "startup-summary.tsv")
     write_sample_live_diagnosis(live_compare / "live-diagnosis.tsv", ".")
     write_sample_live_results(fixture / "live-results.tsv", body_bytes=1048576)
     write_sample_fixture_results(fixture / "fixture-results.tsv", body_bytes=1048576)
     write_sample_hotpath(fixture / "hotpath-summary.tsv")
+    write_sample_agent_startup(fixture / "startup-summary.tsv")
     write_sample_live_diagnosis(fixture / "live-diagnosis.tsv", ".")
 
 

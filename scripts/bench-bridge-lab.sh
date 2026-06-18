@@ -23,10 +23,28 @@ summarize_hotpath_trace_logs() {
   "${SCRIPT_DIR}/summarize-hotpath-trace.py" "${logs[@]}" >&2 || true
 }
 
+summarize_agent_startup_trace_logs() {
+  [[ -n "${RUSTLE_AGENT_STARTUP_TRACE:-}${RUSTLE_HOTPATH_TRACE:-}" ]] || return 0
+  [[ -x "${SCRIPT_DIR}/summarize-agent-startup-trace.py" ]] || return 0
+
+  local logs=()
+  local log
+  while IFS= read -r -d '' log; do
+    logs+=("$log")
+  done < <(find "$TMPDIR" -name 'bench-*.err' -print0)
+
+  [[ "${#logs[@]}" -gt 0 ]] || return 0
+  grep -q 'rustle_agent_startup' "${logs[@]}" 2>/dev/null || return 0
+
+  smoke_info "agent startup trace summary for bridge benchmark logs"
+  "${SCRIPT_DIR}/summarize-agent-startup-trace.py" "${logs[@]}" >&2 || true
+}
+
 cleanup() {
   smoke_stop_pid "${SMOKE_HTTP_PID:-}"
   smoke_stop_pid "${SMOKE_SSHD_PID:-}"
   summarize_hotpath_trace_logs
+  summarize_agent_startup_trace_logs
   rm -rf "$TMPDIR"
 }
 trap cleanup EXIT
