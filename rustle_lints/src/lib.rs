@@ -1,19 +1,23 @@
 #![feature(rustc_private)]
 
 extern crate rustc_hir;
+extern crate rustc_lint;
+extern crate rustc_session;
 extern crate rustc_span;
 
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::source::SpanRangeExt;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{self as hir, Body, FnDecl};
-use rustc_lint::{LateContext, LateLintPass};
-use rustc_span::def_id::LocalDefId;
+use rustc_hir::{self as hir, Body, Expr, FnDecl};
+use rustc_lint::{LateContext, LateLintPass, LintStore};
 use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
 
 const ASYNC_FN_LINE_THRESHOLD: u64 = 120;
 
-dylint_linting::declare_late_lint! {
+dylint_linting::dylint_library!();
+
+rustc_session::declare_lint! {
     /// ### What it does
     ///
     /// Warns when an async function body is large enough to become an implicit
@@ -36,7 +40,39 @@ dylint_linting::declare_late_lint! {
     "large async function should be split into explicit state transitions or I/O actions"
 }
 
-impl<'tcx> LateLintPass<'tcx> for OversizedAsyncStateMachine {
+rustc_session::declare_lint! {
+    /// ### What it does
+    ///
+    /// Warns on direct `.unwrap()` and `.expect(...)` calls.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Tunnel runtime paths should return or handle recoverable failures instead
+    /// of turning them into production panics.
+    ///
+    /// ### Known problems
+    ///
+    /// This is name-based and may flag non-standard methods named `unwrap` or
+    /// `expect`.
+    pub PRODUCTION_PANIC_METHOD,
+    Warn,
+    "unwrap/expect can panic in production tunnel paths"
+}
+
+struct RustleLints;
+
+rustc_session::impl_lint_pass!(
+    RustleLints => [OVERSIZED_ASYNC_STATE_MACHINE, PRODUCTION_PANIC_METHOD]
+);
+
+#[unsafe(no_mangle)]
+pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut LintStore) {
+    dylint_linting::init_config(sess);
+    lint_store.register_lints(&[OVERSIZED_ASYNC_STATE_MACHINE, PRODUCTION_PANIC_METHOD]);
+    lint_store.register_late_pass(|_| Box::new(RustleLints));
+}
+
+impl<'tcx> LateLintPass<'tcx> for RustleLints {
     fn check_fn(
         &mut self,
         cx: &LateContext<'tcx>,
@@ -71,6 +107,49 @@ impl<'tcx> LateLintPass<'tcx> for OversizedAsyncStateMachine {
             );
         }
     }
+
+    fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
+        if expr.span.from_expansion() {
+            return;
+        }
+
+        let hir::ExprKind::MethodCall(segment, _receiver, _args, _span) = expr.kind else {
+            return;
+        };
+        if segment.ident.span.from_expansion() {
+            return;
+        }
+
+        let method_name = segment.ident.name.as_str();
+        if !is_panic_method(&method_name) {
+            return;
+        }
+        if !is_source_written_method_call(cx, expr, method_name) {
+            return;
+        }
+
+        let call = if method_name == "expect" {
+            ".expect(...)"
+        } else {
+            ".unwrap()"
+        };
+
+        span_lint(
+            cx,
+            PRODUCTION_PANIC_METHOD,
+            segment.ident.span,
+            format!("production code should not call `{call}`; return or handle the failure"),
+        );
+    }
+}
+
+fn is_panic_method(method_name: &str) -> bool {
+    matches!(method_name, "unwrap" | "expect")
+}
+
+fn is_source_written_method_call(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str) -> bool {
+    let needle = format!(".{method_name}");
+    expr.span.check_source_text(cx, |src| src.contains(&needle))
 }
 
 fn source_body_without_outer_braces(src: &str) -> &str {
@@ -91,7 +170,10 @@ fn source_line_has_code(line: &str) -> bool {
 
 #[test]
 fn strips_outer_body_braces() {
-    assert_eq!(source_body_without_outer_braces("{\n    let x = 1;\n}"), "\n    let x = 1;\n");
+    assert_eq!(
+        source_body_without_outer_braces("{\n    let x = 1;\n}"),
+        "\n    let x = 1;\n"
+    );
 }
 
 #[test]
@@ -99,4 +181,16 @@ fn recognizes_code_lines() {
     assert!(!source_line_has_code(""));
     assert!(!source_line_has_code("   // comment"));
     assert!(source_line_has_code("let x = 1;"));
+}
+
+#[test]
+fn recognizes_panic_methods() {
+    assert!(is_panic_method("unwrap"));
+    assert!(is_panic_method("expect"));
+    assert!(!is_panic_method("unwrap_or"));
+}
+
+#[test]
+fn ui() {
+    dylint_testing::ui_test(env!("CARGO_PKG_NAME"), "ui");
 }

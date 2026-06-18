@@ -1,4 +1,13 @@
 // edition:2024
+// normalize-stderr-test: "\nwarning: 3 warnings emitted\n\n\z" -> ""
+
+fn production_unwrap(value: Option<u8>) -> u8 {
+    value.unwrap()
+}
+
+fn production_expect(value: Result<u8, &'static str>) -> u8 {
+    value.expect("ready")
+}
 
 async fn oversized_async_state_machine() {
     let mut acc = 0_u64;

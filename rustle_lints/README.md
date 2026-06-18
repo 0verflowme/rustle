@@ -1,41 +1,15 @@
 # rustle_lints
 
-### What it does
+Rustle-specific Dylint checks for production tunnel robustness.
 
-Warns when an async function is large enough to become an implicit protocol
-state machine.
+## Lints
 
-### Why is this bad?
+- `oversized_async_state_machine`: warns when an async function is large enough
+  to hide protocol decisions, queue accounting, I/O, tracing, and cleanup inside
+  one generated future.
+- `production_panic_method`: warns on direct `.unwrap()` and `.expect(...)`
+  calls. Runtime tunnel paths should return or handle recoverable failures
+  instead of turning them into production panics.
 
-Rustle's highest-risk production code lives in tunnel loops, helper bootstrap,
-remote stream pumps, and scheduler paths. Large async functions in those areas
-hide too many responsibilities behind one future: protocol decisions, buffer
-accounting, I/O, timeout policy, tracing, and cleanup. That makes failure
-behavior harder to audit and makes mutation tests less meaningful.
-
-### Known problems
-
-This is a heuristic audit lint. Long integration-test helpers may trip it.
-Warnings should be reviewed by humans before forcing a split.
-
-### Example
-
-```rust
-async fn tunnel_loop() {
-    // many protocol branches, queue updates, I/O calls, and cleanup cases
-}
-```
-
-Use instead:
-
-```rust
-async fn tunnel_loop() {
-    while let Some(event) = next_event().await {
-        handle_event(event).await;
-    }
-}
-
-async fn handle_event(event: Event) {
-    // named transition/action
-}
-```
+Both lints are heuristic audit warnings. Review findings in context before
+forcing mechanical rewrites.

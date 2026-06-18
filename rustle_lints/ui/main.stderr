@@ -1,9 +1,21 @@
+warning: production code should not call `.unwrap()`; return or handle the failure
+  --> $DIR/main.rs:5:11
+   |
+LL |     value.unwrap()
+   |           ^^^^^^
+   |
+   = note: `#[warn(production_panic_method)]` on by default
+
+warning: production code should not call `.expect(...)`; return or handle the failure
+  --> $DIR/main.rs:9:11
+   |
+LL |     value.expect("ready")
+   |           ^^^^^^
+
 warning: async function has 127 code lines; split state transitions and I/O actions below 120
-  --> $DIR/main.rs:3:1
+  --> $DIR/main.rs:12:1
    |
 LL | async fn oversized_async_state_machine() {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |
    = note: `#[warn(oversized_async_state_machine)]` on by default
-
-warning: 1 warning emitted

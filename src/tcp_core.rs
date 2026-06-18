@@ -950,7 +950,10 @@ impl RxToken for QueueRxToken {
     where
         F: FnOnce(&[u8]) -> R,
     {
-        let packet = self.packet.take().expect("RX token must hold packet");
+        let Some(packet) = self.packet.take() else {
+            debug_assert!(false, "RX token must hold packet");
+            return f(&[]);
+        };
         let result = f(&packet);
         self.inner.borrow_mut().recycle(packet);
         result
@@ -975,7 +978,13 @@ impl TxToken for QueueTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut packet = self.packet.take().expect("TX token must hold packet");
+        let mut packet = match self.packet.take() {
+            Some(packet) => packet,
+            None => {
+                debug_assert!(false, "TX token must hold packet");
+                BytesMut::with_capacity(len)
+            }
+        };
         debug_assert!(len <= packet.capacity());
         packet.resize(len, 0);
         let result = f(&mut packet);
@@ -1011,10 +1020,11 @@ impl PacketBuf {
 
 impl AsRef<[u8]> for PacketBuf {
     fn as_ref(&self) -> &[u8] {
-        self.packet
-            .as_ref()
-            .expect("packet buffer must hold bytes")
-            .as_ref()
+        let Some(packet) = self.packet.as_ref() else {
+            debug_assert!(false, "packet buffer must hold bytes");
+            return &[];
+        };
+        packet.as_ref()
     }
 }
 
