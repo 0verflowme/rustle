@@ -5,15 +5,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
 mod writer_metrics;
+mod writer_task;
 
-use crate::agent_io::{
-    write_agent_frame_unflushed, AgentFrameBurstWriter, AgentFrameReader, AgentFrameWriteItem,
-    AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
-};
+use crate::agent_io::{AgentFrameReader, AgentFrameWriteItem};
 use crate::agent_proto::{
     AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
     AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
@@ -22,6 +20,7 @@ use crate::agent_window::{AgentCreditWindow, AGENT_STREAM_MAX_WINDOW_BYTES};
 
 use writer_metrics::AgentWriterMetrics;
 pub(crate) use writer_metrics::AgentWriterSnapshot;
+use writer_task::{write_agent_frame, write_agent_frames};
 
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
@@ -689,55 +688,6 @@ async fn send_agent_transport_frame_with_metrics(
     }
 }
 
-async fn write_agent_frames<W>(
-    mut writer: W,
-    mut outbound_rx: mpsc::Receiver<AgentFrameWriteItem>,
-    streams: StreamMap,
-    failure: FailureState,
-    writer_metrics: WriterMetrics,
-) where
-    W: AsyncWrite + Unpin,
-{
-    let mut burst_writer = AgentFrameBurstWriter::new();
-    let mut burst_items = Vec::with_capacity(AGENT_FRAME_WRITE_BURST);
-    while let Some(first) = outbound_rx.recv().await {
-        burst_items.clear();
-        let mut burst_bytes = first.encoded_len();
-        burst_items.push(first);
-        for _ in 1..AGENT_FRAME_WRITE_BURST {
-            if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
-                break;
-            }
-            match outbound_rx.try_recv() {
-                Ok(item) => {
-                    burst_bytes = burst_bytes.saturating_add(item.encoded_len());
-                    burst_items.push(item);
-                }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-        writer_metrics.record_dequeued(&burst_items);
-        match burst_writer.write_items(&mut writer, &burst_items).await {
-            Ok(stats) => writer_metrics.record_burst(stats),
-            Err(err) => {
-                mark_agent_failed(&failure, &streams, err.to_string()).await;
-                return;
-            }
-        }
-    }
-    let _ = writer.shutdown().await;
-}
-
-async fn write_agent_frame<W>(writer: &mut W, frame: &AgentFrame) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
-    write_agent_frame_unflushed(writer, frame).await?;
-    writer.flush().await.context("failed to flush agent frame")
-}
-
 async fn read_agent_frames<R>(
     mut reader: R,
     mut frame_reader: AgentFrameReader,
@@ -955,7 +905,7 @@ mod tests {
     use std::time::Duration;
 
     use bytes::BytesMut;
-    use tokio::io::{duplex, split, AsyncReadExt, AsyncWrite};
+    use tokio::io::{duplex, split, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::{TcpListener, UdpSocket};
     use tokio::time::timeout;
 
