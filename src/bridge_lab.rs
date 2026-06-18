@@ -21,7 +21,7 @@ use crate::packet_engine::{
     prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
 use crate::transport_model::TunnelRuntimeOptions;
-use crate::{ssh_bridge, tcp_core};
+use crate::{flow_bridge, tcp_core};
 
 const BRIDGE_LAB_EVENT_BATCH: usize = 32;
 
@@ -222,10 +222,10 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         });
     }
 
-    let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+    let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
     let (event_tx, mut event_rx) = mpsc::channel(1024);
-    let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
-    let mut pending_bridge_events = VecDeque::<ssh_bridge::BridgeEvent>::new();
+    let mut bridges = HashMap::<tcp_core::FlowKey, flow_bridge::FlowBridge>::new();
+    let mut pending_bridge_events = VecDeque::<flow_bridge::BridgeEvent>::new();
     let mut remote_backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
     let mut ready_flow_ids = Vec::new();
     let mut flow_keys = Vec::new();
@@ -318,8 +318,8 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
             };
             processed_bridge_events += 1;
             match &event {
-                ssh_bridge::BridgeEvent::Closed { id }
-                | ssh_bridge::BridgeEvent::RemoteEof { id }
+                flow_bridge::BridgeEvent::Closed { id }
+                | flow_bridge::BridgeEvent::RemoteEof { id }
                     if clients.iter().any(|client| client.flow == id.key) =>
                 {
                     if let Some(client) = clients.iter_mut().find(|client| client.flow == id.key) {
@@ -476,10 +476,10 @@ struct BridgeLabCleanupScratch<'a> {
 async fn settle_bridge_lab_cleanup(
     started_at: StdInstant,
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     remote_backlogs: &mut RemoteBacklogs,
     clients: &mut [BridgeLabClient],
-    event_rx: &mut mpsc::Receiver<ssh_bridge::BridgeEvent>,
+    event_rx: &mut mpsc::Receiver<flow_bridge::BridgeEvent>,
     scratch: BridgeLabCleanupScratch<'_>,
 ) -> Result<usize> {
     for iteration in 0..64_usize {

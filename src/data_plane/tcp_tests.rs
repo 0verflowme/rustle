@@ -9,7 +9,7 @@ use crate::agent_bridge::{
     ReconnectingAgentBridge,
 };
 use crate::defaults::DEFAULT_MTU;
-use crate::{agent_proto, agent_transport, ssh_bridge, tcp_core};
+use crate::{agent_proto, agent_transport, flow_bridge, tcp_core};
 
 async fn read_test_agent_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -138,7 +138,7 @@ async fn agent_tcp_bridge_sends_local_data_before_agent_opened() {
         .expect("opened event")
         .expect("bridge event");
     assert!(
-        matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
+        matches!(event, flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
     );
 
     drop(bridge);
@@ -288,10 +288,10 @@ async fn agent_tcp_bridge_retries_pre_open_close_and_replays_local_data() {
         .expect("opened event after retry")
         .expect("bridge event");
     assert!(
-        matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id),
+        matches!(event, flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id),
         "expected opened event after retry, got {event:?}"
     );
-    if let Ok(Some(ssh_bridge::BridgeEvent::Failed { message, .. })) =
+    if let Ok(Some(flow_bridge::BridgeEvent::Failed { message, .. })) =
         tokio::time::timeout(std::time::Duration::from_millis(50), event_rx.recv()).await
     {
         panic!("bridge emitted failure after successful retry: {message}");
@@ -378,7 +378,7 @@ async fn agent_tcp_bridge_gives_queued_local_data_a_turn_after_remote_event() {
     let id = test_flow_id();
     let (event_tx, mut event_rx) = mpsc::channel(1);
     event_tx
-        .send(ssh_bridge::BridgeEvent::Closed { id })
+        .send(flow_bridge::BridgeEvent::Closed { id })
         .await
         .expect("prefill event queue");
     let bridge = spawn_agent_tcp_bridge(id, event_tx, agent);
@@ -397,14 +397,14 @@ async fn agent_tcp_bridge_gives_queued_local_data_a_turn_after_remote_event() {
     let blocker = event_rx.recv().await.expect("prefilled event");
     assert!(matches!(
         blocker,
-        ssh_bridge::BridgeEvent::Closed { id: event_id } if event_id == id
+        flow_bridge::BridgeEvent::Closed { id: event_id } if event_id == id
     ));
     let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
         .await
         .expect("opened event")
         .expect("bridge event");
     assert!(
-        matches!(event, ssh_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
+        matches!(event, flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id)
     );
 
     tokio::time::timeout(std::time::Duration::from_secs(1), local_seen_rx)
@@ -416,7 +416,7 @@ async fn agent_tcp_bridge_gives_queued_local_data_a_turn_after_remote_event() {
         .expect("remote data event")
         .expect("bridge event");
     match event {
-        ssh_bridge::BridgeEvent::RemoteData {
+        flow_bridge::BridgeEvent::RemoteData {
             id: event_id,
             bytes,
         } => {

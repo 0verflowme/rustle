@@ -447,7 +447,7 @@ async fn quic_native_data_plane_spawn_tcp_bridge_round_trips() {
         id,
         0,
         event_tx,
-        crate::ssh_bridge::BridgeEventAccounting::new(),
+        crate::flow_bridge::BridgeEventAccounting::new(),
     );
 
     assert!(
@@ -464,18 +464,18 @@ async fn quic_native_data_plane_spawn_tcp_bridge_round_trips() {
             .expect("timed out waiting for bridge event")
             .expect("bridge event channel closed");
         match event {
-            crate::ssh_bridge::BridgeEvent::Opened { id: event_id, .. } => {
+            crate::flow_bridge::BridgeEvent::Opened { id: event_id, .. } => {
                 assert_eq!(event_id, id);
                 opened = true;
             }
-            crate::ssh_bridge::BridgeEvent::RemoteData {
+            crate::flow_bridge::BridgeEvent::RemoteData {
                 id: event_id,
                 bytes,
             } => {
                 assert_eq!(event_id, id);
                 response.extend_from_slice(bytes.as_ref());
             }
-            crate::ssh_bridge::BridgeEvent::Failed { message, .. } => {
+            crate::flow_bridge::BridgeEvent::Failed { message, .. } => {
                 panic!("native QUIC TCP bridge failed: {message}");
             }
             _ => {}

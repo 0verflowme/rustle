@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant as StdInstant};
 
-use crate::ssh_bridge;
+use crate::flow_bridge;
 use crate::transport_model::DataPlaneRuntimeSnapshot;
 
 use super::admission::AdmissionSnapshot;
@@ -136,26 +136,26 @@ impl TunnelStats {
         self.record_udp_response(delivered);
     }
 
-    pub(crate) fn record_bridge_event(&mut self, event: &ssh_bridge::BridgeEvent) {
+    pub(crate) fn record_bridge_event(&mut self, event: &flow_bridge::BridgeEvent) {
         match event {
-            ssh_bridge::BridgeEvent::Opened { open_ms, .. } => {
+            flow_bridge::BridgeEvent::Opened { open_ms, .. } => {
                 self.ssh_opened = self.ssh_opened.saturating_add(1);
                 self.ssh_open_latency_total_ms =
                     self.ssh_open_latency_total_ms.saturating_add(*open_ms);
                 self.ssh_open_latency_max_ms = self.ssh_open_latency_max_ms.max(*open_ms);
             }
-            ssh_bridge::BridgeEvent::RemoteData { bytes, .. } => {
+            flow_bridge::BridgeEvent::RemoteData { bytes, .. } => {
                 self.remote_to_local_bytes = self
                     .remote_to_local_bytes
                     .saturating_add(bytes.len() as u64);
             }
-            ssh_bridge::BridgeEvent::RemoteEof { .. } => {
+            flow_bridge::BridgeEvent::RemoteEof { .. } => {
                 self.ssh_remote_eof = self.ssh_remote_eof.saturating_add(1);
             }
-            ssh_bridge::BridgeEvent::Closed { .. } => {
+            flow_bridge::BridgeEvent::Closed { .. } => {
                 self.ssh_closed = self.ssh_closed.saturating_add(1);
             }
-            ssh_bridge::BridgeEvent::Failed { .. } => {
+            flow_bridge::BridgeEvent::Failed { .. } => {
                 self.ssh_failed = self.ssh_failed.saturating_add(1);
             }
         }
@@ -324,7 +324,7 @@ pub(crate) struct TunnelStatusSnapshot {
     pub(crate) dns: AdmissionSnapshot,
     pub(crate) udp: AdmissionSnapshot,
     pub(crate) agent: DataPlaneRuntimeSnapshot,
-    pub(crate) bridge_events: ssh_bridge::BridgeEventQueueSnapshot,
+    pub(crate) bridge_events: flow_bridge::BridgeEventQueueSnapshot,
 }
 
 pub(crate) fn format_duration(duration: Duration) -> String {
@@ -358,7 +358,7 @@ mod tests {
 
     use super::*;
     use crate::transport_model::DataPlaneReconnectSnapshot;
-    use crate::{ssh_bridge, tcp_core};
+    use crate::{flow_bridge, tcp_core};
 
     #[test]
     fn stats_formatting_uses_stable_units() {
@@ -378,9 +378,9 @@ mod tests {
             443,
         );
         let id = tcp_core::FlowId::new(flow, 1);
-        stats.record_bridge_event(&ssh_bridge::BridgeEvent::Opened { id, open_ms: 21 });
-        stats.record_bridge_event(&ssh_bridge::BridgeEvent::Opened { id, open_ms: 43 });
-        stats.record_bridge_event(&ssh_bridge::BridgeEvent::RemoteData {
+        stats.record_bridge_event(&flow_bridge::BridgeEvent::Opened { id, open_ms: 21 });
+        stats.record_bridge_event(&flow_bridge::BridgeEvent::Opened { id, open_ms: 43 });
+        stats.record_bridge_event(&flow_bridge::BridgeEvent::RemoteData {
             id,
             bytes: Bytes::from_static(b"remote"),
         });
@@ -416,7 +416,7 @@ mod tests {
                 backlog_bytes: 4096,
                 backlog_bytes_max: 8192,
             },
-            bridge_events: ssh_bridge::BridgeEventQueueSnapshot {
+            bridge_events: flow_bridge::BridgeEventQueueSnapshot {
                 remote_bytes: 4096,
                 remote_bytes_max: 8192,
             },

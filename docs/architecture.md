@@ -559,7 +559,7 @@ channel, relay bytes in both directions, and preserve backpressure and cleanup.
 
 Current runtime progress:
 
-- `ssh_bridge` creates one bounded async bridge task per flow.
+- `flow_bridge` creates one bounded async bridge task per flow.
 - The bridge task opens `russh` `direct-tcpip` to the original destination
   IP/port and sends bridge events back to the central loop.
 - Bridge local queues are bounded by item count and total queued bytes. Queue
@@ -602,7 +602,7 @@ Current runtime progress:
   resolver pointed elsewhere; the DNS takeover smoke checks the global
   `scutil --dns` section separately from scoped service resolvers and fails with
   that resolver state when the OS does not actually use Rustle for default DNS.
-- `ssh_bridge::tests::fake_bridge_round_trips_flow_manager_stream_bytes` proves
+- `flow_bridge::tests::fake_bridge_round_trips_flow_manager_stream_bytes` proves
   the bridge architecture without root or a real SSH server.
 - `bridge-lab` proves the same FlowManager plus real `russh` direct-tcpip bridge
   without root by using synthetic smoltcp clients instead of a TUN device. Its

@@ -7,12 +7,12 @@ use tokio::sync::mpsc;
 use crate::transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
 };
-use crate::{ssh_bridge, tcp_core};
+use crate::{flow_bridge, tcp_core};
 
 use super::backlog::{RemoteBacklogPush, RemoteBacklogs};
 
 pub(crate) const LOCAL_DRAIN_CHUNK_BYTES: usize = tcp_core::TCP_RECV_BUFFER_BYTES;
-const _: () = assert!(LOCAL_DRAIN_CHUNK_BYTES <= ssh_bridge::FLOW_CHANNEL_BYTES);
+const _: () = assert!(LOCAL_DRAIN_CHUNK_BYTES <= flow_bridge::FLOW_CHANNEL_BYTES);
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
 pub(crate) struct BridgeAdmissionStats {
@@ -52,15 +52,15 @@ pub(crate) struct BridgeEventStats {
 
 pub(crate) fn ensure_bridges<F>(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     limits: BridgeAdmissionLimits,
     mut spawn_bridge: F,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    event_tx: mpsc::Sender<flow_bridge::BridgeEvent>,
     ready_flow_ids: &mut Vec<tcp_core::FlowId>,
     now: SmolInstant,
 ) -> Result<BridgeAdmissionStats>
 where
-    F: FnMut(TcpBridgeStart, mpsc::Sender<ssh_bridge::BridgeEvent>) -> ssh_bridge::FlowBridge,
+    F: FnMut(TcpBridgeStart, mpsc::Sender<flow_bridge::BridgeEvent>) -> flow_bridge::FlowBridge,
 {
     let mut starts = Vec::new();
     let mut opening_flow_keys = Vec::new();
@@ -82,7 +82,7 @@ where
 
 pub(crate) fn plan_bridge_starts(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     limits: BridgeAdmissionLimits,
     ready_flow_ids: &mut Vec<tcp_core::FlowId>,
     opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
@@ -122,7 +122,7 @@ pub(crate) fn plan_bridge_starts(
 
 fn active_bridge_reservations(
     flow_manager: &tcp_core::FlowManager,
-    bridges: &HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     opening_flow_keys: &mut Vec<tcp_core::FlowKey>,
 ) -> usize {
     flow_manager.opening_flow_keys_into(opening_flow_keys);
@@ -135,9 +135,9 @@ fn active_bridge_reservations(
 
 pub(crate) fn register_tcp_bridge(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     start: TcpBridgeStart,
-    bridge: ssh_bridge::FlowBridge,
+    bridge: flow_bridge::FlowBridge,
 ) -> Result<()> {
     if bridge.id != start.id {
         anyhow::bail!(
@@ -162,7 +162,7 @@ pub(crate) fn register_tcp_bridge(
 
 pub(crate) fn drain_local_bytes_to_bridges(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     flow_keys: &mut Vec<tcp_core::FlowKey>,
     now: SmolInstant,
 ) -> Result<LocalDrainStats> {
@@ -243,7 +243,7 @@ fn local_drain_chunk_limit(remaining_bridge_bytes: usize) -> usize {
 
 #[cfg(test)]
 pub(crate) fn handle_bridge_event(
-    event: ssh_bridge::BridgeEvent,
+    event: flow_bridge::BridgeEvent,
     flow_manager: &mut tcp_core::FlowManager,
     remote_backlogs: &mut RemoteBacklogs,
     now: SmolInstant,
@@ -259,7 +259,7 @@ pub(crate) fn handle_bridge_event(
 }
 
 pub(crate) fn handle_bridge_event_into(
-    event: ssh_bridge::BridgeEvent,
+    event: flow_bridge::BridgeEvent,
     flow_manager: &mut tcp_core::FlowManager,
     remote_backlogs: &mut RemoteBacklogs,
     now: SmolInstant,
@@ -297,7 +297,7 @@ pub(crate) fn handle_bridge_event_into(
     }
 
     match event {
-        ssh_bridge::BridgeEvent::Opened { id, open_ms } => {
+        flow_bridge::BridgeEvent::Opened { id, open_ms } => {
             let flow = id.key;
             flow_manager.mark_flow_state_at(flow, tcp_core::FlowState::Relaying, now)?;
             eprintln!(
@@ -306,7 +306,7 @@ pub(crate) fn handle_bridge_event_into(
             );
             Ok(BridgeEventStats::default())
         }
-        ssh_bridge::BridgeEvent::RemoteData { id, bytes } => {
+        flow_bridge::BridgeEvent::RemoteData { id, bytes } => {
             let flow = id.key;
             match remote_backlogs.push(id, bytes) {
                 RemoteBacklogPush::Accepted => {}
@@ -340,12 +340,12 @@ pub(crate) fn handle_bridge_event_into(
             remote_backlogs.flush_flow_into(flow_manager, id, now, closed_flows)?;
             Ok(BridgeEventStats::default())
         }
-        ssh_bridge::BridgeEvent::RemoteEof { id } => {
+        flow_bridge::BridgeEvent::RemoteEof { id } => {
             remote_backlogs.close_after_flush(id);
             remote_backlogs.flush_flow_into(flow_manager, id, now, closed_flows)?;
             Ok(BridgeEventStats::default())
         }
-        ssh_bridge::BridgeEvent::Closed { id } => {
+        flow_bridge::BridgeEvent::Closed { id } => {
             let flow = id.key;
             remote_backlogs.close_after_flush(id);
             remote_backlogs.flush_flow_into(flow_manager, id, now, closed_flows)?;
@@ -354,7 +354,7 @@ pub(crate) fn handle_bridge_event_into(
             }
             Ok(BridgeEventStats::default())
         }
-        ssh_bridge::BridgeEvent::Failed { id, phase, message } => {
+        flow_bridge::BridgeEvent::Failed { id, phase, message } => {
             let flow = id.key;
             eprintln!("bridge: {phase:?} failed for {flow:?}: {message}");
             remote_backlogs.remove_id(id);
@@ -365,33 +365,33 @@ pub(crate) fn handle_bridge_event_into(
     }
 }
 
-pub(crate) fn should_log_stale_bridge_event(event: &ssh_bridge::BridgeEvent) -> bool {
-    !matches!(event, ssh_bridge::BridgeEvent::RemoteData { .. })
+pub(crate) fn should_log_stale_bridge_event(event: &flow_bridge::BridgeEvent) -> bool {
+    !matches!(event, flow_bridge::BridgeEvent::RemoteData { .. })
 }
 
-pub(crate) fn bridge_event_id(event: &ssh_bridge::BridgeEvent) -> tcp_core::FlowId {
+pub(crate) fn bridge_event_id(event: &flow_bridge::BridgeEvent) -> tcp_core::FlowId {
     match event {
-        ssh_bridge::BridgeEvent::Opened { id, .. }
-        | ssh_bridge::BridgeEvent::RemoteData { id, .. }
-        | ssh_bridge::BridgeEvent::RemoteEof { id }
-        | ssh_bridge::BridgeEvent::Closed { id }
-        | ssh_bridge::BridgeEvent::Failed { id, .. } => *id,
+        flow_bridge::BridgeEvent::Opened { id, .. }
+        | flow_bridge::BridgeEvent::RemoteData { id, .. }
+        | flow_bridge::BridgeEvent::RemoteEof { id }
+        | flow_bridge::BridgeEvent::Closed { id }
+        | flow_bridge::BridgeEvent::Failed { id, .. } => *id,
     }
 }
 
-pub(crate) fn bridge_event_name(event: &ssh_bridge::BridgeEvent) -> &'static str {
+pub(crate) fn bridge_event_name(event: &flow_bridge::BridgeEvent) -> &'static str {
     match event {
-        ssh_bridge::BridgeEvent::Opened { .. } => "opened",
-        ssh_bridge::BridgeEvent::RemoteData { .. } => "remote-data",
-        ssh_bridge::BridgeEvent::RemoteEof { .. } => "remote-eof",
-        ssh_bridge::BridgeEvent::Closed { .. } => "closed",
-        ssh_bridge::BridgeEvent::Failed { .. } => "failed",
+        flow_bridge::BridgeEvent::Opened { .. } => "opened",
+        flow_bridge::BridgeEvent::RemoteData { .. } => "remote-data",
+        flow_bridge::BridgeEvent::RemoteEof { .. } => "remote-eof",
+        flow_bridge::BridgeEvent::Closed { .. } => "closed",
+        flow_bridge::BridgeEvent::Failed { .. } => "failed",
     }
 }
 
 pub(crate) fn expire_stale_flows(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     remote_backlogs: &mut RemoteBacklogs,
     now: SmolInstant,
     expired: &mut Vec<tcp_core::FlowKey>,
@@ -408,7 +408,7 @@ pub(crate) fn expire_stale_flows(
 
 pub(crate) fn prune_closed_flows(
     flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     remote_backlogs: &mut RemoteBacklogs,
     removable: &mut Vec<tcp_core::FlowKey>,
 ) -> Result<usize> {
@@ -512,7 +512,7 @@ mod tests {
             destination_port,
             client_port,
         );
-        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let bridges = HashMap::<tcp_core::FlowKey, flow_bridge::FlowBridge>::new();
         let mut ready_flow_ids = Vec::new();
         let mut opening_flow_keys = Vec::new();
         let mut starts = Vec::new();
@@ -563,7 +563,7 @@ mod tests {
             destination_port,
             client_port,
         );
-        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let bridges = HashMap::<tcp_core::FlowKey, flow_bridge::FlowBridge>::new();
         let mut ready_flow_ids = Vec::new();
         let mut opening_flow_keys = Vec::new();
         let mut starts = Vec::new();
@@ -645,7 +645,7 @@ mod tests {
             destination_port,
             client_port,
         );
-        let mut bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let mut bridges = HashMap::<tcp_core::FlowKey, flow_bridge::FlowBridge>::new();
         let mut ready_flow_ids = Vec::new();
         let mut opening_flow_keys = Vec::new();
         let mut starts = Vec::new();
@@ -667,7 +667,7 @@ mod tests {
 
         let (event_tx, _event_rx) = mpsc::channel(1);
         let bridge =
-            ssh_bridge::spawn_bridge_task(start.id, event_tx, |_id, _local_rx, _event_tx| async {
+            flow_bridge::spawn_bridge_task(start.id, event_tx, |_id, _local_rx, _event_tx| async {
                 std::future::pending::<()>().await;
             });
         register_tcp_bridge(&mut manager, &mut bridges, start, bridge)
@@ -717,7 +717,7 @@ mod tests {
             destination_port,
             second_client_port,
         );
-        let bridges = HashMap::<tcp_core::FlowKey, ssh_bridge::FlowBridge>::new();
+        let bridges = HashMap::<tcp_core::FlowKey, flow_bridge::FlowBridge>::new();
         let limits = BridgeAdmissionLimits {
             active: 1,
             opening: 128,
@@ -799,7 +799,7 @@ mod tests {
         let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
 
         let outcome = handle_bridge_event(
-            ssh_bridge::BridgeEvent::Closed {
+            flow_bridge::BridgeEvent::Closed {
                 id: tcp_core::FlowId::new(flow, 1),
             },
             &mut manager,
@@ -847,7 +847,7 @@ mod tests {
 
         for tick in 0..2048 {
             let stats = handle_bridge_event_into(
-                ssh_bridge::BridgeEvent::RemoteData {
+                flow_bridge::BridgeEvent::RemoteData {
                     id,
                     bytes: payload.clone(),
                 },
@@ -915,7 +915,7 @@ mod tests {
         for round in 0..STALE_ROUNDS {
             for id in &ids {
                 let stats = handle_bridge_event_into(
-                    ssh_bridge::BridgeEvent::RemoteData {
+                    flow_bridge::BridgeEvent::RemoteData {
                         id: *id,
                         bytes: payload.clone(),
                     },
@@ -950,13 +950,13 @@ mod tests {
         let id = tcp_core::FlowId::new(flow, 7);
 
         assert!(!should_log_stale_bridge_event(
-            &ssh_bridge::BridgeEvent::RemoteData {
+            &flow_bridge::BridgeEvent::RemoteData {
                 id,
                 bytes: Bytes::from_static(b"stale")
             }
         ));
         assert!(should_log_stale_bridge_event(
-            &ssh_bridge::BridgeEvent::Closed { id }
+            &flow_bridge::BridgeEvent::Closed { id }
         ));
     }
 
@@ -999,7 +999,7 @@ mod tests {
             RemoteBacklogPush::Accepted
         );
         let outcome = handle_bridge_event(
-            ssh_bridge::BridgeEvent::Closed { id: old_id },
+            flow_bridge::BridgeEvent::Closed { id: old_id },
             &mut manager,
             &mut backlogs,
             SmolInstant::from_millis(0),
@@ -1037,7 +1037,7 @@ mod tests {
         let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
 
         let close_outcome = handle_bridge_event(
-            ssh_bridge::BridgeEvent::Closed { id },
+            flow_bridge::BridgeEvent::Closed { id },
             &mut manager,
             &mut backlogs,
             SmolInstant::from_millis(1),
@@ -1051,7 +1051,7 @@ mod tests {
         let late_bytes = Bytes::from_static(b"late remote bytes after close marker");
         let expected_len = late_bytes.len() as u64;
         let data_outcome = handle_bridge_event(
-            ssh_bridge::BridgeEvent::RemoteData {
+            flow_bridge::BridgeEvent::RemoteData {
                 id,
                 bytes: late_bytes,
             },
@@ -1137,7 +1137,7 @@ mod tests {
         let capacity = closed_flows.capacity();
 
         let stats = handle_bridge_event_into(
-            ssh_bridge::BridgeEvent::RemoteData {
+            flow_bridge::BridgeEvent::RemoteData {
                 id,
                 bytes: Bytes::from_static(b"remote bytes"),
             },
@@ -1325,7 +1325,7 @@ mod tests {
         let id = manager.flow_id(flow).expect("flow id");
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (received_tx, received_rx) = oneshot::channel();
-        let bridge = ssh_bridge::spawn_bridge_task(
+        let bridge = flow_bridge::spawn_bridge_task(
             id,
             event_tx,
             move |_id, mut local_rx, _event_tx| async move {
@@ -1535,11 +1535,11 @@ mod tests {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let id = manager.flow_id(flow).expect("flow id");
         let bridge =
-            ssh_bridge::spawn_bridge_task(id, event_tx, |_id, local_rx, _event_tx| async {
+            flow_bridge::spawn_bridge_task(id, event_tx, |_id, local_rx, _event_tx| async {
                 let _local_rx = local_rx;
                 std::future::pending::<()>().await;
             });
-        for index in 0..ssh_bridge::FLOW_CHANNEL_DEPTH {
+        for index in 0..flow_bridge::FLOW_CHANNEL_DEPTH {
             assert!(
                 bridge
                     .try_send_local_data(vec![index as u8])

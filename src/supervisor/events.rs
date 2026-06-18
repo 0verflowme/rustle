@@ -2,8 +2,8 @@ use std::time::Instant as StdInstant;
 
 use anyhow::Result;
 
+use crate::flow_bridge::{self, BridgeEvent};
 use crate::packet_engine::TunnelEngine;
-use crate::ssh_bridge::{self, BridgeEvent};
 
 const BRIDGE_EVENT_BATCH_LIMIT: usize = 32;
 
@@ -11,7 +11,7 @@ pub(super) fn handle_bridge_event_batch(
     engine: &mut TunnelEngine,
     first: BridgeEvent,
     event_rx: &mut tokio::sync::mpsc::Receiver<BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<usize> {
     let started_at = StdInstant::now();
     let mut handled = 0_usize;
@@ -78,7 +78,7 @@ mod tests {
     fn bridge_event_batch_is_bounded() {
         let mut engine = test_engine();
         let id = test_flow_id();
-        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(BRIDGE_EVENT_BATCH_LIMIT + 1);
         for _ in 0..BRIDGE_EVENT_BATCH_LIMIT {
             tx.try_send(BridgeEvent::Closed { id })
@@ -108,7 +108,7 @@ mod tests {
     fn bridge_event_batch_records_stats() {
         let mut engine = test_engine();
         let id = test_flow_id();
-        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         tx.try_send(BridgeEvent::Closed { id })
             .expect("queue bridge event");
@@ -134,7 +134,7 @@ mod tests {
     fn bridge_event_batch_handles_receiver_disconnect_after_first_event() {
         let mut engine = test_engine();
         let id = test_flow_id();
-        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         drop(tx);
 
@@ -157,7 +157,7 @@ mod tests {
     async fn bridge_event_batch_releases_accounted_remote_data_on_dequeue() {
         let mut engine = test_engine();
         let id = test_flow_id();
-        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
         let first = BridgeEvent::RemoteData {
             id,
@@ -169,10 +169,10 @@ mod tests {
         };
 
         assert!(
-            ssh_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, first).await
+            flow_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, first).await
         );
         assert!(
-            ssh_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, second).await
+            flow_bridge::send_bridge_event_accounted(&tx, &bridge_event_accounting, second).await
         );
         assert_eq!(bridge_event_accounting.snapshot().remote_bytes, 11);
         assert_eq!(bridge_event_accounting.snapshot().remote_bytes_max, 11);

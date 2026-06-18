@@ -10,7 +10,7 @@ use crate::packet_engine::{
 };
 use crate::transport_model::{Destination, UdpAssociationEvents};
 use crate::tun_io::TunWriter;
-use crate::{ssh_bridge, tcp_core};
+use crate::{flow_bridge, tcp_core};
 
 mod dns;
 mod events;
@@ -80,7 +80,7 @@ impl TunnelSupervisor {
         let mut buf = vec![0_u8; PACKET_BUF_SIZE];
         let mut tcp_bridge_starts = Vec::new();
         let mut udp_actions = Vec::new();
-        let bridge_event_accounting = ssh_bridge::BridgeEventAccounting::new();
+        let bridge_event_accounting = flow_bridge::BridgeEventAccounting::new();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1024);
         let (dns_tx, mut dns_rx) = tokio::sync::mpsc::channel(DNS_EVENT_CHANNEL_DEPTH);
         let (udp_response_tx, mut udp_response_rx) =

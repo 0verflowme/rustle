@@ -3,8 +3,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::data_plane::{spawn_tcp_bridge_on_data_plane, DataPlane};
+use crate::flow_bridge;
 use crate::packet_engine::{TcpBridgeStart, TunnelEngine};
-use crate::ssh_bridge;
 use crate::tun_io::TunWriter;
 
 use super::tun;
@@ -15,8 +15,8 @@ pub(super) async fn execute_ingress_packet(
     packet: &[u8],
     starts: &mut Vec<TcpBridgeStart>,
     data_plane: &Arc<dyn DataPlane>,
-    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
+    event_tx: &tokio::sync::mpsc::Sender<flow_bridge::BridgeEvent>,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<()> {
     engine
         .ingest_tcp_packet(packet)
@@ -48,8 +48,8 @@ pub(super) async fn execute_tick_cycle(
     tun: &TunWriter<'_>,
     starts: &mut Vec<TcpBridgeStart>,
     data_plane: &Arc<dyn DataPlane>,
-    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
+    event_tx: &tokio::sync::mpsc::Sender<flow_bridge::BridgeEvent>,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<()> {
     engine.poll_tcp();
     flush_remote_backlogs_to_tun(engine, tun).await?;
@@ -68,8 +68,8 @@ fn plan_and_start_bridges(
     engine: &mut TunnelEngine,
     starts: &mut Vec<TcpBridgeStart>,
     data_plane: &Arc<dyn DataPlane>,
-    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
+    event_tx: &tokio::sync::mpsc::Sender<flow_bridge::BridgeEvent>,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<()> {
     engine.plan_bridge_starts(data_plane.admission_limits(), starts)?;
     execute_bridge_starts(
@@ -94,8 +94,8 @@ fn execute_bridge_starts(
     engine: &mut TunnelEngine,
     starts: &mut Vec<TcpBridgeStart>,
     data_plane: &Arc<dyn DataPlane>,
-    event_tx: &tokio::sync::mpsc::Sender<ssh_bridge::BridgeEvent>,
-    bridge_event_accounting: &ssh_bridge::BridgeEventAccounting,
+    event_tx: &tokio::sync::mpsc::Sender<flow_bridge::BridgeEvent>,
+    bridge_event_accounting: &flow_bridge::BridgeEventAccounting,
 ) -> Result<()> {
     for start in starts.drain(..) {
         let bridge = spawn_tcp_bridge_on_data_plane(

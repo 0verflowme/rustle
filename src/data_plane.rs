@@ -11,7 +11,7 @@ use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneRuntimeSnapshot,
     DataPlaneTcpOpen, DataPlaneTcpOpenMode, UdpAssociationEvents, UdpFlowKey,
 };
-use crate::{ssh_bridge, tcp_core};
+use crate::{flow_bridge, tcp_core};
 
 mod adapters;
 #[cfg(test)]
@@ -55,9 +55,9 @@ pub(crate) fn spawn_tcp_bridge_on_data_plane(
     data_plane: Arc<dyn DataPlane>,
     id: tcp_core::FlowId,
     ready_wait_ms: u64,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    event_accounting: ssh_bridge::BridgeEventAccounting,
-) -> ssh_bridge::FlowBridge {
+    event_tx: mpsc::Sender<flow_bridge::BridgeEvent>,
+    event_accounting: flow_bridge::BridgeEventAccounting,
+) -> flow_bridge::FlowBridge {
     let flow = id.key;
     let label = data_plane.udp_label().unwrap_or_else(|| data_plane.label());
     if data_plane.caps().udp_associations {

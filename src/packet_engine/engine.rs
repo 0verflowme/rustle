@@ -8,7 +8,7 @@ use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneRuntimeSnapshot, UdpAssociation, UdpAssociationEvents,
     UdpFlowKey,
 };
-use crate::{dns, ssh_bridge, tcp_core};
+use crate::{dns, flow_bridge, tcp_core};
 
 use super::admission::AdmissionCounter;
 use super::backlog::{RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW};
@@ -28,7 +28,7 @@ use super::udp::{
 
 pub(crate) struct TunnelEngine {
     flow_manager: tcp_core::FlowManager,
-    bridges: HashMap<tcp_core::FlowKey, ssh_bridge::FlowBridge>,
+    bridges: HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
     udp_associations: HashMap<UdpFlowKey, UdpAssociation>,
     remote_backlogs: RemoteBacklogs,
     dns_admission: AdmissionCounter,
@@ -126,7 +126,7 @@ impl TunnelEngine {
     pub(crate) fn status_line(
         &self,
         agent: DataPlaneRuntimeSnapshot,
-        bridge_events: ssh_bridge::BridgeEventQueueSnapshot,
+        bridge_events: flow_bridge::BridgeEventQueueSnapshot,
     ) -> String {
         self.stats.status_line(TunnelStatusSnapshot {
             tcp: TcpRuntimeSnapshot {
@@ -177,7 +177,7 @@ impl TunnelEngine {
     pub(crate) fn register_tcp_bridge(
         &mut self,
         start: TcpBridgeStart,
-        bridge: ssh_bridge::FlowBridge,
+        bridge: flow_bridge::FlowBridge,
     ) -> Result<()> {
         register_tcp_bridge(&mut self.flow_manager, &mut self.bridges, start, bridge)
     }
@@ -229,7 +229,7 @@ impl TunnelEngine {
 
     pub(crate) fn handle_bridge_event(
         &mut self,
-        event: ssh_bridge::BridgeEvent,
+        event: flow_bridge::BridgeEvent,
     ) -> Result<BridgeEventStats> {
         self.stats.record_bridge_event(&event);
         let now = self.now();

@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use crate::agent_bridge::ReconnectingAgentBridge;
 use crate::hotpath_trace::TcpFlowTrace;
 use crate::transport_model::DataPlaneIpv4Open;
-use crate::{agent_proto, ssh_bridge, tcp_core};
+use crate::{agent_proto, flow_bridge, tcp_core};
 
 use super::stream::AgentIoStream;
 
@@ -18,20 +18,20 @@ const AGENT_PRE_OPEN_RETRY_LIMIT: usize = 1;
 enum BridgeInput {
     OpenTimeout,
     Remote(Result<Option<agent_proto::AgentFrame>>),
-    Local(Option<ssh_bridge::ReceivedLocalData>),
+    Local(Option<flow_bridge::ReceivedLocalData>),
 }
 
 #[cfg(test)]
 pub(crate) fn spawn_agent_tcp_bridge(
     id: tcp_core::FlowId,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
+    event_tx: mpsc::Sender<flow_bridge::BridgeEvent>,
     agent: ReconnectingAgentBridge,
-) -> ssh_bridge::FlowBridge {
+) -> flow_bridge::FlowBridge {
     let open = tcp_open_request(id);
     spawn_data_plane_tcp_bridge_with_open(
         id,
         event_tx,
-        ssh_bridge::BridgeEventAccounting::new(),
+        flow_bridge::BridgeEventAccounting::new(),
         0,
         "agent",
         open_agent_tcp_stream(agent, open),
@@ -40,16 +40,16 @@ pub(crate) fn spawn_agent_tcp_bridge(
 
 pub(super) fn spawn_data_plane_tcp_bridge_with_open<Fut>(
     id: tcp_core::FlowId,
-    event_tx: mpsc::Sender<ssh_bridge::BridgeEvent>,
-    event_accounting: ssh_bridge::BridgeEventAccounting,
+    event_tx: mpsc::Sender<flow_bridge::BridgeEvent>,
+    event_accounting: flow_bridge::BridgeEventAccounting,
     ready_wait_ms: u64,
     transport_label: &'static str,
     open_stream: Fut,
-) -> ssh_bridge::FlowBridge
+) -> flow_bridge::FlowBridge
 where
     Fut: Future<Output = Result<AgentIoStream>> + Send + 'static,
 {
-    ssh_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
+    flow_bridge::spawn_bridge_task(id, event_tx, move |id, mut local_rx, event_tx| async move {
         let mut trace = TcpFlowTrace::new(transport_label, id, ready_wait_ms);
         let open_started_at = StdInstant::now();
         let open = tcp_open_request(id);
@@ -57,11 +57,11 @@ where
             Ok(stream) => stream,
             Err(err) => {
                 trace.finish("open_error");
-                let _ = ssh_bridge::send_bridge_event(
+                let _ = flow_bridge::send_bridge_event(
                     &event_tx,
-                    ssh_bridge::BridgeEvent::Failed {
+                    flow_bridge::BridgeEvent::Failed {
                         id,
-                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                        phase: flow_bridge::BridgeFailurePhase::Open,
                         message: format!("failed to open {transport_label} stream: {err:#}"),
                     },
                 )
@@ -75,7 +75,7 @@ where
         let mut pre_open_local = VecDeque::<Bytes>::new();
         let mut pre_open_retries = 0_usize;
         let mut prefer_local_after_remote = false;
-        let open_timeout = tokio::time::sleep(ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT);
+        let open_timeout = tokio::time::sleep(flow_bridge::AGENT_STREAM_OPEN_TIMEOUT);
         tokio::pin!(open_timeout);
 
         loop {
@@ -98,14 +98,14 @@ where
             match input {
                 BridgeInput::OpenTimeout => {
                     trace.finish("open_timeout");
-                    let _ = ssh_bridge::send_bridge_event(
+                    let _ = flow_bridge::send_bridge_event(
                         &event_tx,
-                        ssh_bridge::BridgeEvent::Failed {
+                        flow_bridge::BridgeEvent::Failed {
                             id,
-                            phase: ssh_bridge::BridgeFailurePhase::Open,
+                            phase: flow_bridge::BridgeFailurePhase::Open,
                             message: format!(
                                 "timed out after {}ms waiting for {transport_label} stream open confirmation",
-                                ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT.as_millis()
+                                flow_bridge::AGENT_STREAM_OPEN_TIMEOUT.as_millis()
                             ),
                         },
                     )
@@ -146,10 +146,10 @@ where
                                 }
                                 trace.remote_bytes(frame.payload.len());
                                 let event_started_at = StdInstant::now();
-                                let event_sent = ssh_bridge::send_bridge_event_accounted(
+                                let event_sent = flow_bridge::send_bridge_event_accounted(
                                     &event_tx,
                                     &event_accounting,
-                                    ssh_bridge::BridgeEvent::RemoteData {
+                                    flow_bridge::BridgeEvent::RemoteData {
                                         id,
                                         bytes: frame.payload,
                                     },
@@ -163,9 +163,9 @@ where
                             }
                             agent_proto::AgentFrameKind::Eof => {
                                 trace.outcome("remote_eof");
-                                let _ = ssh_bridge::send_bridge_event(
+                                let _ = flow_bridge::send_bridge_event(
                                     &event_tx,
-                                    ssh_bridge::BridgeEvent::RemoteEof { id },
+                                    flow_bridge::BridgeEvent::RemoteEof { id },
                                 )
                                 .await;
                                 break;
@@ -188,17 +188,17 @@ where
                                                 stream = replacement;
                                                 open_timeout.as_mut().reset(
                                                     tokio::time::Instant::now()
-                                                        + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                        + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                                 );
                                                 continue;
                                             }
                                             Err(err) => {
                                                 trace.finish("pre_open_reopen_error");
-                                                let _ = ssh_bridge::send_bridge_event(
+                                                let _ = flow_bridge::send_bridge_event(
                                                     &event_tx,
-                                                    ssh_bridge::BridgeEvent::Failed {
+                                                    flow_bridge::BridgeEvent::Failed {
                                                         id,
-                                                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                        phase: flow_bridge::BridgeFailurePhase::Open,
                                                         message: format!(
                                                             "failed to reopen agent stream after pre-open close: {err:#}"
                                                         ),
@@ -210,11 +210,11 @@ where
                                         }
                                     }
                                     trace.finish("remote_close_before_open");
-                                    let _ = ssh_bridge::send_bridge_event(
+                                    let _ = flow_bridge::send_bridge_event(
                                         &event_tx,
-                                        ssh_bridge::BridgeEvent::Failed {
+                                        flow_bridge::BridgeEvent::Failed {
                                             id,
-                                            phase: ssh_bridge::BridgeFailurePhase::Open,
+                                            phase: flow_bridge::BridgeFailurePhase::Open,
                                             message: format!("{transport_label} stream closed before open confirmation"),
                                         },
                                     )
@@ -242,17 +242,17 @@ where
                                             stream = replacement;
                                             open_timeout.as_mut().reset(
                                                 tokio::time::Instant::now()
-                                                    + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                    + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                             );
                                             continue;
                                         }
                                         Err(err) => {
                                             trace.finish("pre_open_reopen_error");
-                                            let _ = ssh_bridge::send_bridge_event(
+                                            let _ = flow_bridge::send_bridge_event(
                                                 &event_tx,
-                                                ssh_bridge::BridgeEvent::Failed {
+                                                flow_bridge::BridgeEvent::Failed {
                                                     id,
-                                                    phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                    phase: flow_bridge::BridgeFailurePhase::Open,
                                                     message: format!(
                                                         "failed to reopen agent stream after pre-open reset ({message}): {err:#}"
                                                     ),
@@ -264,14 +264,14 @@ where
                                     }
                                 }
                                 let phase = if open_reported {
-                                    ssh_bridge::BridgeFailurePhase::Write
+                                    flow_bridge::BridgeFailurePhase::Write
                                 } else {
-                                    ssh_bridge::BridgeFailurePhase::Open
+                                    flow_bridge::BridgeFailurePhase::Open
                                 };
                                 trace.finish("remote_reset");
-                                let _ = ssh_bridge::send_bridge_event(
+                                let _ = flow_bridge::send_bridge_event(
                                     &event_tx,
-                                    ssh_bridge::BridgeEvent::Failed {
+                                    flow_bridge::BridgeEvent::Failed {
                                         id,
                                         phase,
                                         message: format!(
@@ -302,17 +302,17 @@ where
                                         stream = replacement;
                                         open_timeout.as_mut().reset(
                                             tokio::time::Instant::now()
-                                                + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                         );
                                         continue;
                                     }
                                     Err(err) => {
                                         trace.finish("pre_open_reopen_error");
-                                        let _ = ssh_bridge::send_bridge_event(
+                                        let _ = flow_bridge::send_bridge_event(
                                             &event_tx,
-                                            ssh_bridge::BridgeEvent::Failed {
+                                            flow_bridge::BridgeEvent::Failed {
                                                 id,
-                                                phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                phase: flow_bridge::BridgeFailurePhase::Open,
                                                 message: format!(
                                                     "failed to reopen agent stream after pre-open EOF: {err:#}"
                                                 ),
@@ -328,14 +328,14 @@ where
                         }
                         Err(err) => {
                             let phase = if open_reported {
-                                ssh_bridge::BridgeFailurePhase::Write
+                                flow_bridge::BridgeFailurePhase::Write
                             } else {
-                                ssh_bridge::BridgeFailurePhase::Open
+                                flow_bridge::BridgeFailurePhase::Open
                             };
                             trace.finish("read_error");
-                            let _ = ssh_bridge::send_bridge_event(
+                            let _ = flow_bridge::send_bridge_event(
                                 &event_tx,
-                                ssh_bridge::BridgeEvent::Failed {
+                                flow_bridge::BridgeEvent::Failed {
                                     id,
                                     phase,
                                     message: format!(
@@ -361,7 +361,7 @@ where
                             }
                             let send_started_at = StdInstant::now();
                             let send_result = tokio::time::timeout(
-                                ssh_bridge::BRIDGE_WRITE_TIMEOUT,
+                                flow_bridge::BRIDGE_WRITE_TIMEOUT,
                                 stream.send_data_with_metrics(bytes.clone()),
                             )
                             .await;
@@ -393,17 +393,17 @@ where
                                                 stream = replacement;
                                                 open_timeout.as_mut().reset(
                                                     tokio::time::Instant::now()
-                                                        + ssh_bridge::AGENT_STREAM_OPEN_TIMEOUT,
+                                                        + flow_bridge::AGENT_STREAM_OPEN_TIMEOUT,
                                                 );
                                                 continue;
                                             }
                                             Err(retry_err) => {
                                                 trace.finish("pre_open_reopen_error");
-                                                let _ = ssh_bridge::send_bridge_event(
+                                                let _ = flow_bridge::send_bridge_event(
                                                     &event_tx,
-                                                    ssh_bridge::BridgeEvent::Failed {
+                                                    flow_bridge::BridgeEvent::Failed {
                                                         id,
-                                                        phase: ssh_bridge::BridgeFailurePhase::Open,
+                                                        phase: flow_bridge::BridgeFailurePhase::Open,
                                                         message: format!(
                                                             "failed to reopen agent stream after pre-open write failure ({err:#}): {retry_err:#}"
                                                         ),
@@ -415,14 +415,14 @@ where
                                         }
                                     }
                                     let phase = if open_reported {
-                                        ssh_bridge::BridgeFailurePhase::Write
+                                        flow_bridge::BridgeFailurePhase::Write
                                     } else {
-                                        ssh_bridge::BridgeFailurePhase::Open
+                                        flow_bridge::BridgeFailurePhase::Open
                                     };
                                     trace.finish("write_error");
-                                    let _ = ssh_bridge::send_bridge_event(
+                                    let _ = flow_bridge::send_bridge_event(
                                         &event_tx,
-                                        ssh_bridge::BridgeEvent::Failed {
+                                        flow_bridge::BridgeEvent::Failed {
                                             id,
                                             phase,
                                         message: format!("failed to write to {transport_label} stream: {err:#}"),
@@ -433,19 +433,19 @@ where
                                 }
                                 Err(_) => {
                                     let phase = if open_reported {
-                                        ssh_bridge::BridgeFailurePhase::Write
+                                        flow_bridge::BridgeFailurePhase::Write
                                     } else {
-                                        ssh_bridge::BridgeFailurePhase::Open
+                                        flow_bridge::BridgeFailurePhase::Open
                                     };
                                     trace.finish("write_timeout");
-                                    let _ = ssh_bridge::send_bridge_event(
+                                    let _ = flow_bridge::send_bridge_event(
                                         &event_tx,
-                                        ssh_bridge::BridgeEvent::Failed {
+                                        flow_bridge::BridgeEvent::Failed {
                                             id,
                                             phase,
                                             message: format!(
                                                 "timed out after {}ms writing to {transport_label} stream",
-                                                ssh_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
+                                                flow_bridge::BRIDGE_WRITE_TIMEOUT.as_millis()
                                             ),
                                         },
                                     )
@@ -466,8 +466,8 @@ where
 
         let _ = stream.close().await;
         trace.finish_current_or("closed");
-        let _ =
-            ssh_bridge::send_bridge_event(&event_tx, ssh_bridge::BridgeEvent::Closed { id }).await;
+        let _ = flow_bridge::send_bridge_event(&event_tx, flow_bridge::BridgeEvent::Closed { id })
+            .await;
     })
 }
 
@@ -524,7 +524,7 @@ async fn retry_agent_pre_open_stream(
 }
 
 async fn report_agent_stream_opened(
-    event_tx: &mpsc::Sender<ssh_bridge::BridgeEvent>,
+    event_tx: &mpsc::Sender<flow_bridge::BridgeEvent>,
     id: tcp_core::FlowId,
     open_started_at: StdInstant,
 ) -> bool {
@@ -533,5 +533,5 @@ async fn report_agent_stream_opened(
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX);
-    ssh_bridge::send_bridge_event(event_tx, ssh_bridge::BridgeEvent::Opened { id, open_ms }).await
+    flow_bridge::send_bridge_event(event_tx, flow_bridge::BridgeEvent::Opened { id, open_ms }).await
 }

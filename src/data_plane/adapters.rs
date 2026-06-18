@@ -6,7 +6,7 @@ use crate::transport_model::{
     BridgeAdmissionLimits, DataPlaneCaps, DataPlaneIpv4Open, DataPlaneReconnectSnapshot,
     DataPlaneRuntimeSnapshot, DataPlaneTcpOpen, DataPlaneTcpOpenMode,
 };
-use crate::{agent_proto, ssh_bridge, tcp_core};
+use crate::{agent_proto, flow_bridge, tcp_core};
 
 use super::stream::AgentIoStream;
 use super::{udp, DataPlane, DataPlaneSnapshotFuture, OpenTcpFuture, OpenUdpFuture};
@@ -123,19 +123,19 @@ impl DataPlane for DirectTcpipDataPlane {
                         open.flow_generation.expect("checked flow generation"),
                     );
                     tokio::time::timeout(
-                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                        flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
                         ssh.open_direct_tcpip_for_flow(id),
                     )
                     .await
                     .map_err(|_| {
                         anyhow::anyhow!(
                             "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                            ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                            flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
                         )
                     })??
                 }
                 DataPlaneTcpOpen::Ipv4(open) => tokio::time::timeout(
-                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                    flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
                     ssh.open_background_direct_tcpip(
                         open.destination_ip.to_string(),
                         u32::from(open.destination_port),
@@ -147,7 +147,7 @@ impl DataPlane for DirectTcpipDataPlane {
                 .map_err(|_| {
                     anyhow::anyhow!(
                         "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                        flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
                     )
                 })??,
                 DataPlaneTcpOpen::Host {
@@ -156,7 +156,7 @@ impl DataPlane for DirectTcpipDataPlane {
                     originator_ip,
                     originator_port,
                 } => tokio::time::timeout(
-                    ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
+                    flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT,
                     ssh.open_background_direct_tcpip(
                         destination_host,
                         u32::from(destination_port),
@@ -168,7 +168,7 @@ impl DataPlane for DirectTcpipDataPlane {
                 .map_err(|_| {
                     anyhow::anyhow!(
                         "timed out after {}ms opening direct-tcpip stream to {destination_label}",
-                        ssh_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
+                        flow_bridge::DIRECT_TCPIP_OPEN_TIMEOUT.as_millis()
                     )
                 })??,
             };

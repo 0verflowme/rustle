@@ -18,6 +18,7 @@ mod control_plane;
 mod data_plane;
 mod defaults;
 mod dns;
+mod flow_bridge;
 mod helper_runtime;
 mod hotpath_trace;
 mod known_hosts;
