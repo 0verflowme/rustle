@@ -101,6 +101,8 @@ package_target() {
   cp "${REPO_ROOT}/README.md" "${stage}/${package}/"
   cp "${REPO_ROOT}/docs/architecture.md" "${stage}/${package}/ARCHITECTURE.md"
   cp "${REPO_ROOT}/docs/release.md" "${stage}/${package}/RELEASE.md"
+  cp "${REPO_ROOT}/docs/status.md" "${stage}/${package}/STATUS.md"
+  cp "${REPO_ROOT}/docs/troubleshooting.md" "${stage}/${package}/TROUBLESHOOTING.md"
 
   local archive="${ARCHIVE_DIR}/$(archive_name "$target")"
   rm -f "$archive"

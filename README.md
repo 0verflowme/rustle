@@ -191,6 +191,9 @@ scripts/verify-release-candidate.sh
 
 This fails on privileged/live skips, includes DNS takeover and live UDP, runs
 the controlled 1 MiB / 10 MiB / 100 MiB fixture benchmarks, and compares `rustle-agent` p50 latency against sshuttle.
+The same gate is available in GitHub Actions through
+`.github/workflows/release-candidate.yml`; run it only on a privileged
+self-hosted runner that already has SSH access and passwordless sudo.
 Live UDP uses the default SSH-agent path; set
 `RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT=quic-native` for a separate opt-in proof that
 the target allows Rustle's SSH-bootstrapped UDP/QUIC helper data plane. When

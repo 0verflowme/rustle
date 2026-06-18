@@ -18,6 +18,7 @@ DOC_FILES = [
     "README.md",
     "ARCHITECTURE.md",
     "RELEASE.md",
+    "STATUS.md",
     "TROUBLESHOOTING.md",
 ]
 

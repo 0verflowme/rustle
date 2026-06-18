@@ -1,0 +1,162 @@
+name: Release Candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        description: JSON runs-on labels for the privileged live runner.
+        required: true
+        default: '["self-hosted","rustle-live"]'
+      live_remote:
+        description: SSH remote or OpenSSH Host alias.
+        required: true
+      live_target_cidr:
+        description: CIDR routed through Rustle during live proof.
+        required: true
+      live_url:
+        description: URL reachable only through the live tunnel.
+        required: true
+      fixture_host:
+        description: Controlled TCP fixture host used for 1 MiB / 10 MiB / 100 MiB live benchmarks.
+        required: true
+      live_udp_host:
+        description: UDP fixture host used for live UDP proof.
+        required: true
+      ssh_config:
+        description: Optional SSH config path available to the privileged runner.
+        required: false
+      agent_dir:
+        description: Optional prepared Rustle sidecar store for remote helper upload bootstrap.
+        required: false
+      verify_transports:
+        description: Optional live smoke transport matrix. Leave empty for verifier default.
+        required: false
+      bench_transports:
+        description: Optional live benchmark Rustle transport matrix. Leave empty for verifier default.
+        required: false
+      keep_logs:
+        description: Preserve tunnel logs in the uploaded live evidence artifact.
+        required: true
+        type: boolean
+        default: true
+      require_quic_native_gates:
+        description: Also require quic-native to meet the configured agent ratio gates.
+        required: true
+        type: boolean
+        default: false
+      quic_native_min_throughput_ratio:
+        description: Required quic-native/agent throughput ratio when native QUIC gates are enabled.
+        required: false
+        default: '1.00'
+      quic_native_max_p50_ratio:
+        description: Maximum quic-native/agent p50 latency ratio when native QUIC gates are enabled.
+        required: false
+        default: '1.00'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-proof:
+    name: Privileged live release proof
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      RUSTLE_BIN: target/release/rustle
+      RUSTLE_LIVE_REMOTE: ${{ inputs.live_remote }}
+      RUSTLE_LIVE_TARGET_CIDR: ${{ inputs.live_target_cidr }}
+      RUSTLE_LIVE_URL: ${{ inputs.live_url }}
+      RUSTLE_FIXTURE_HOST: ${{ inputs.fixture_host }}
+      RUSTLE_LIVE_UDP_HOST: ${{ inputs.live_udp_host }}
+      RUSTLE_BENCH_KEEP_LOGS: ${{ inputs.keep_logs && '1' || '0' }}
+      RUSTLE_BENCH_ARTIFACT_DIR: target/live-evidence/release-candidate-${{ github.run_id }}
+      RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO: '1.00'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary for live proof
+        run: cargo build --locked --release
+
+      - name: Install live proof dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo -n apt-get update
+            sudo -n apt-get install -y curl iproute2 openssh-client openssh-server python3 sshuttle
+          elif command -v brew >/dev/null 2>&1; then
+            brew list sshuttle >/dev/null 2>&1 || brew install sshuttle
+          fi
+
+      - name: Normalize optional live inputs
+        shell: bash
+        env:
+          INPUT_SSH_CONFIG: ${{ inputs.ssh_config }}
+          INPUT_AGENT_DIR: ${{ inputs.agent_dir }}
+          INPUT_VERIFY_TRANSPORTS: ${{ inputs.verify_transports }}
+          INPUT_BENCH_TRANSPORTS: ${{ inputs.bench_transports }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$INPUT_SSH_CONFIG" ]]; then
+            printf 'RUSTLE_LIVE_SSH_CONFIG=%s\n' "$INPUT_SSH_CONFIG" >> "$GITHUB_ENV"
+            printf 'RUSTLE_FIXTURE_SSH_CONFIG=%s\n' "$INPUT_SSH_CONFIG" >> "$GITHUB_ENV"
+            printf 'RUSTLE_LIVE_UDP_SSH_CONFIG=%s\n' "$INPUT_SSH_CONFIG" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "$INPUT_AGENT_DIR" ]]; then
+            printf 'RUSTLE_AGENT_DIR=%s\n' "$INPUT_AGENT_DIR" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "$INPUT_VERIFY_TRANSPORTS" ]]; then
+            printf 'RUSTLE_VERIFY_LIVE_TRANSPORTS=%s\n' "$INPUT_VERIFY_TRANSPORTS" >> "$GITHUB_ENV"
+          fi
+          if [[ -n "$INPUT_BENCH_TRANSPORTS" ]]; then
+            printf 'RUSTLE_BENCH_RUSTLE_TRANSPORTS=%s\n' "$INPUT_BENCH_TRANSPORTS" >> "$GITHUB_ENV"
+          fi
+
+      - name: Enable native QUIC release gates
+        if: inputs.require_quic_native_gates
+        shell: bash
+        env:
+          QUIC_NATIVE_MIN_THROUGHPUT_RATIO: ${{ inputs.quic_native_min_throughput_ratio }}
+          QUIC_NATIVE_MAX_P50_RATIO: ${{ inputs.quic_native_max_p50_ratio }}
+        run: |
+          set -euo pipefail
+          printf 'RUSTLE_BENCH_RUSTLE_TRANSPORTS=%s\n' 'agent direct-tcpip quic-native' >> "$GITHUB_ENV"
+          printf 'RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO=%s\n' "$QUIC_NATIVE_MIN_THROUGHPUT_RATIO" >> "$GITHUB_ENV"
+          printf 'RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO=%s\n' "$QUIC_NATIVE_MAX_P50_RATIO" >> "$GITHUB_ENV"
+
+      - name: Check privileged runner contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -n true
+          sshuttle --version
+          if [[ -n "${RUSTLE_LIVE_SSH_CONFIG:-}" ]]; then
+            ssh -F "$RUSTLE_LIVE_SSH_CONFIG" -G "$RUSTLE_LIVE_REMOTE" >/dev/null
+          else
+            ssh -G "$RUSTLE_LIVE_REMOTE" >/dev/null
+          fi
+
+      - name: Release-candidate verification
+        shell: bash
+        run: scripts/verify-release-candidate.sh
+
+      - name: Upload live evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustle-live-evidence-${{ github.run_id }}
+          path: |
+            target/live-evidence
+            target/code-health
+          if-no-files-found: warn

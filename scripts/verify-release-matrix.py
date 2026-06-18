@@ -11,6 +11,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 RELEASE_WORKFLOW = REPO / ".github" / "workflows" / "release.yml"
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
+RELEASE_CANDIDATE_WORKFLOW = REPO / ".github" / "workflows" / "release-candidate.yml"
 BUILD_SCRIPT = REPO / "build.rs"
 MAIN_SOURCE = REPO / "src" / "main.rs"
 README_FILE = REPO / "README.md"
@@ -129,13 +130,17 @@ REQUIRED_WORKFLOW_SNIPPETS = [
     "cp README.md",
     "cp docs/architecture.md",
     "cp docs/release.md",
+    "cp docs/status.md",
     "cp docs/troubleshooting.md",
     "Copy-Item \"README.md\"",
     "Copy-Item \"docs/architecture.md\"",
     "Copy-Item \"docs/release.md\"",
+    "Copy-Item \"docs/status.md\"",
     "Copy-Item \"docs/troubleshooting.md\"",
     "$secretName is required for release Windows archives",
     "unexpected Windows archive contents",
+    "STATUS.md",
+    "missing STATUS.md",
     "TROUBLESHOOTING.md",
     "missing TROUBLESHOOTING.md",
     "Windows release archive must not ship wintun.dll beside rustle.exe",
@@ -156,6 +161,32 @@ REQUIRED_WORKFLOW_SNIPPETS = [
     "rustle-agent-macos-aarch64",
     "rustle-agent-windows-x86_64.exe",
     "rustle-agent-windows-aarch64.exe",
+]
+
+REQUIRED_RELEASE_CANDIDATE_WORKFLOW_SNIPPETS = [
+    "name: Release Candidate",
+    "workflow_dispatch:",
+    "runs_on:",
+    '["self-hosted","rustle-live"]',
+    "Privileged live release proof",
+    "RUSTLE_LIVE_REMOTE",
+    "RUSTLE_LIVE_TARGET_CIDR",
+    "RUSTLE_LIVE_URL",
+    "RUSTLE_BIN: target/release/rustle",
+    "RUSTLE_FIXTURE_HOST",
+    "RUSTLE_LIVE_UDP_HOST",
+    "RUSTLE_BENCH_MAX_AGENT_SSHUTTLE_P50_RATIO",
+    "RUSTLE_BENCH_RUSTLE_TRANSPORTS",
+    "RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO",
+    "RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO",
+    "cargo build --locked --release",
+    "sudo -n true",
+    "sshuttle --version",
+    "ssh -F \"$RUSTLE_LIVE_SSH_CONFIG\" -G \"$RUSTLE_LIVE_REMOTE\"",
+    "ssh -G \"$RUSTLE_LIVE_REMOTE\"",
+    "scripts/verify-release-candidate.sh",
+    "actions/upload-artifact@v4",
+    "target/live-evidence",
 ]
 
 REQUIRED_BUILD_SCRIPT_SNIPPETS = [
@@ -459,6 +490,7 @@ REQUIRED_CI_SNIPPETS = [
 REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "automatic remote-agent bootstrap",
     "troubleshooting guide",
+    "`STATUS.md`",
     "`TROUBLESHOOTING.md`",
     "rustle-x86_64-unknown-linux-musl/rustle",
     "scripts/prepare-agent-sidecars.sh",
@@ -477,6 +509,10 @@ REQUIRED_RELEASE_NOTE_SNIPPETS = [
     "scripts/bench-agent-dns-lab.sh",
     "scripts/bench-agent-reconnect-lab.sh",
     "scripts/verify-release-candidate.sh",
+    ".github/workflows/release-candidate.yml",
+    "Release Candidate workflow",
+    "self-hosted",
+    "target/live-evidence",
     "Linux network namespace gates remain required on Linux",
     "RUSTLE_BENCH_AGENT_DNS_MAX_P50_US",
     "RUSTLE_BENCH_AGENT_RECONNECT_MAX_ELAPSED_MS",
@@ -649,6 +685,8 @@ REQUIRED_AGENT_SIDECAR_BUILD_SNIPPETS = [
     "README.md",
     "ARCHITECTURE.md",
     "RELEASE.md",
+    "STATUS.md",
+    "TROUBLESHOOTING.md",
     "SHA256SUMS",
     "RUSTLE_AGENT_REQUIRE_ALL=1",
     "RUSTLE_AGENT_FORCE=1",
@@ -1889,6 +1927,7 @@ def docs_targets(notes: str) -> list[str]:
 def main() -> None:
     workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
     ci_workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    release_candidate_workflow = RELEASE_CANDIDATE_WORKFLOW.read_text(encoding="utf-8")
     build_script = BUILD_SCRIPT.read_text(encoding="utf-8")
     rust_sources = rust_source_text()
     readme = README_FILE.read_text(encoding="utf-8")
@@ -1945,6 +1984,17 @@ def main() -> None:
     missing = [snippet for snippet in REQUIRED_WORKFLOW_SNIPPETS if snippet not in workflow]
     if missing:
         fail(f"release.yml is missing required verification snippets: {missing!r}")
+
+    missing_rc_workflow = [
+        snippet
+        for snippet in REQUIRED_RELEASE_CANDIDATE_WORKFLOW_SNIPPETS
+        if snippet not in release_candidate_workflow
+    ]
+    if missing_rc_workflow:
+        fail(
+            ".github/workflows/release-candidate.yml is missing required "
+            f"verification snippets: {missing_rc_workflow!r}"
+        )
 
     missing_build = [
         snippet for snippet in REQUIRED_BUILD_SCRIPT_SNIPPETS if snippet not in build_script

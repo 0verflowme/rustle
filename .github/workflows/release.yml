@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   matrix-check:
     name: Release preflight
@@ -159,6 +163,7 @@ jobs:
           cp README.md "dist/${{ matrix.package }}/"
           cp docs/architecture.md "dist/${{ matrix.package }}/ARCHITECTURE.md"
           cp docs/release.md "dist/${{ matrix.package }}/RELEASE.md"
+          cp docs/status.md "dist/${{ matrix.package }}/STATUS.md"
           cp docs/troubleshooting.md "dist/${{ matrix.package }}/TROUBLESHOOTING.md"
           tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.package }}"
 
@@ -172,6 +177,7 @@ jobs:
           grep -Fx "${{ matrix.package }}/README.md" "dist/${{ matrix.package }}.contents"
           grep -Fx "${{ matrix.package }}/ARCHITECTURE.md" "dist/${{ matrix.package }}.contents"
           grep -Fx "${{ matrix.package }}/RELEASE.md" "dist/${{ matrix.package }}.contents"
+          grep -Fx "${{ matrix.package }}/STATUS.md" "dist/${{ matrix.package }}.contents"
           grep -Fx "${{ matrix.package }}/TROUBLESHOOTING.md" "dist/${{ matrix.package }}.contents"
           rm -rf verify
           mkdir -p verify
@@ -180,6 +186,7 @@ jobs:
           test -f "verify/${{ matrix.package }}/README.md"
           test -f "verify/${{ matrix.package }}/ARCHITECTURE.md"
           test -f "verify/${{ matrix.package }}/RELEASE.md"
+          test -f "verify/${{ matrix.package }}/STATUS.md"
           test -f "verify/${{ matrix.package }}/TROUBLESHOOTING.md"
           "verify/${{ matrix.package }}/rustle" --help >/dev/null
           if [[ "${{ matrix.target }}" == *"unknown-linux-musl" ]]; then
@@ -200,6 +207,7 @@ jobs:
           Copy-Item "README.md" "dist/${{ matrix.package }}/"
           Copy-Item "docs/architecture.md" "dist/${{ matrix.package }}/ARCHITECTURE.md"
           Copy-Item "docs/release.md" "dist/${{ matrix.package }}/RELEASE.md"
+          Copy-Item "docs/status.md" "dist/${{ matrix.package }}/STATUS.md"
           Copy-Item "docs/troubleshooting.md" "dist/${{ matrix.package }}/TROUBLESHOOTING.md"
           Compress-Archive -Path "dist/${{ matrix.package }}" -DestinationPath "dist/${{ matrix.archive }}"
 
@@ -214,8 +222,9 @@ jobs:
           if (!(Test-Path "$package/README.md")) { throw "missing README.md" }
           if (!(Test-Path "$package/ARCHITECTURE.md")) { throw "missing ARCHITECTURE.md" }
           if (!(Test-Path "$package/RELEASE.md")) { throw "missing RELEASE.md" }
+          if (!(Test-Path "$package/STATUS.md")) { throw "missing STATUS.md" }
           if (!(Test-Path "$package/TROUBLESHOOTING.md")) { throw "missing TROUBLESHOOTING.md" }
-          $expected = @("ARCHITECTURE.md", "README.md", "RELEASE.md", "TROUBLESHOOTING.md", "rustle.exe")
+          $expected = @("ARCHITECTURE.md", "README.md", "RELEASE.md", "STATUS.md", "TROUBLESHOOTING.md", "rustle.exe")
           $actual = Get-ChildItem -LiteralPath $package -File | ForEach-Object Name | Sort-Object
           if (@($actual).Count -ne $expected.Count) {
             throw "unexpected Windows archive file count: $($actual -join ', ')"

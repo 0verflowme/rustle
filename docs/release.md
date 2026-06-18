@@ -38,7 +38,8 @@ The release workflow builds native archives for:
 - `aarch64-pc-windows-msvc`
 
 Each archive contains the Rustle binary, the README, the architecture notes,
-this release note, and the troubleshooting guide. Before any archive builds,
+this release note, `STATUS.md`, and the troubleshooting guide. Before any
+archive builds,
 the release workflow runs a preflight with `cargo fmt --check`, `cargo test`,
 `cargo clippy --all-targets -- -D warnings`, `scripts/verify-release-matrix.py`,
 `scripts/verify-windows-tun-smoke.py`,
@@ -55,6 +56,13 @@ The checksum job also runs `scripts/prepare-agent-sidecars.sh` against the
 assembled release archives with `RUSTLE_AGENT_REQUIRE_ALL=1`, proving the release
 can produce the full `RUSTLE_AGENT_DIR` sidecar store used by automatic
 remote-agent bootstrap.
+The `.github/workflows/release-candidate.yml` Release Candidate workflow is the
+manual live gate. It is designed for a `self-hosted` privileged runner with
+passwordless sudo, SSH access to the live remote, `sshuttle`, and any prepared
+sidecar store. It maps workflow inputs onto the same live variables consumed by
+`scripts/verify-release-candidate.sh`, builds and tests `target/release/rustle`,
+uploads `target/live-evidence`, and can optionally require native QUIC to
+satisfy the configured agent ratio gates.
 `scripts/verify-release-matrix.py` keeps this target list, the release workflow
 matrix, archive naming, checksum/archive manifest gate, CI operating-system matrix,
 and required smoke coverage in sync.
@@ -149,8 +157,9 @@ self-extracting single binaries. Development and CI builds can still use the
 external DLL lookup order above.
 
 Windows release archive verification rejects sidecar `wintun.dll` files. The
-zip may contain `rustle.exe`, `README.md`, `ARCHITECTURE.md`, `RELEASE.md`, and
-`TROUBLESHOOTING.md`; the Wintun bytes must be embedded into `rustle.exe`.
+zip may contain `rustle.exe`, `README.md`, `ARCHITECTURE.md`, `RELEASE.md`,
+`STATUS.md`, and `TROUBLESHOOTING.md`; the Wintun bytes must be embedded into
+`rustle.exe`.
 
 ## Verification Tiers
 
