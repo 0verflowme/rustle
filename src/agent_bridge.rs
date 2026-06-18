@@ -788,6 +788,49 @@ impl ReconnectingAgentBridge {
 
             match lane.current_transport().await {
                 Some(transport) => {
+                    let writer = transport.writer_snapshot();
+                    snapshot.writer_queued_frames = snapshot
+                        .writer_queued_frames
+                        .saturating_add(writer.queued_frames);
+                    snapshot.writer_queued_bytes = snapshot
+                        .writer_queued_bytes
+                        .saturating_add(writer.queued_bytes);
+                    snapshot.writer_queued_frames_max = snapshot
+                        .writer_queued_frames_max
+                        .max(writer.queued_frames_max);
+                    snapshot.writer_queued_bytes_max = snapshot
+                        .writer_queued_bytes_max
+                        .max(writer.queued_bytes_max);
+                    snapshot.writer_bursts = snapshot.writer_bursts.saturating_add(writer.bursts);
+                    snapshot.writer_burst_frames = snapshot
+                        .writer_burst_frames
+                        .saturating_add(writer.burst_frames);
+                    snapshot.writer_burst_bytes = snapshot
+                        .writer_burst_bytes
+                        .saturating_add(writer.burst_bytes);
+                    snapshot.writer_burst_frames_max = snapshot
+                        .writer_burst_frames_max
+                        .max(writer.burst_frames_max);
+                    snapshot.writer_burst_bytes_max =
+                        snapshot.writer_burst_bytes_max.max(writer.burst_bytes_max);
+                    snapshot.writer_enqueue_to_write_us = snapshot
+                        .writer_enqueue_to_write_us
+                        .saturating_add(writer.enqueue_to_write_us);
+                    snapshot.writer_enqueue_to_write_max_us = snapshot
+                        .writer_enqueue_to_write_max_us
+                        .max(writer.enqueue_to_write_max_us);
+                    snapshot.writer_enqueue_to_write_samples = snapshot
+                        .writer_enqueue_to_write_samples
+                        .saturating_add(writer.enqueue_to_write_samples);
+                    snapshot.writer_write_us =
+                        snapshot.writer_write_us.saturating_add(writer.write_us);
+                    snapshot.writer_write_max_us =
+                        snapshot.writer_write_max_us.max(writer.write_max_us);
+                    snapshot.writer_flush_us =
+                        snapshot.writer_flush_us.saturating_add(writer.flush_us);
+                    snapshot.writer_flush_max_us =
+                        snapshot.writer_flush_max_us.max(writer.flush_max_us);
+
                     if transport.failure_message().await.is_some() {
                         snapshot.lanes_failed = snapshot.lanes_failed.saturating_add(1);
                     } else if quarantine_ms.is_none() {

@@ -8,7 +8,10 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 
-use crate::agent_io::{write_agent_frame_unflushed, AgentFrameBurstWriter, AgentFrameReader};
+use crate::agent_io::{
+    write_agent_frame_unflushed, AgentFrameBurstWriteStats, AgentFrameBurstWriter,
+    AgentFrameReader, AgentFrameWriteItem, AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
+};
 use crate::agent_proto::{
     AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AGENT_MAX_FRAME_PAYLOAD,
     AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT, CAP_TCP_CONNECT_HOST,
@@ -29,12 +32,145 @@ const _: () = assert!(
 type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
 type FailureState = Arc<Mutex<Option<String>>>;
 type HeartbeatState = Arc<Mutex<AgentHeartbeat>>;
+type WriterMetrics = Arc<AgentWriterMetrics>;
+
+#[derive(Clone, Copy)]
+struct AgentFrameSendContext<'a> {
+    outbound: &'a mpsc::Sender<AgentFrameWriteItem>,
+    streams: &'a StreamMap,
+    failure: &'a FailureState,
+    writer_metrics: &'a AgentWriterMetrics,
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AgentStreamSendMetrics {
     pub(crate) credit_wait_us: u128,
     pub(crate) outbound_wait_us: u128,
     pub(crate) frames: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AgentWriterSnapshot {
+    pub(crate) queued_frames: usize,
+    pub(crate) queued_bytes: usize,
+    pub(crate) queued_frames_max: usize,
+    pub(crate) queued_bytes_max: usize,
+    pub(crate) bursts: u64,
+    pub(crate) burst_frames: u64,
+    pub(crate) burst_bytes: u64,
+    pub(crate) burst_frames_max: u64,
+    pub(crate) burst_bytes_max: u64,
+    pub(crate) enqueue_to_write_us: u64,
+    pub(crate) enqueue_to_write_max_us: u64,
+    pub(crate) enqueue_to_write_samples: u64,
+    pub(crate) write_us: u64,
+    pub(crate) write_max_us: u64,
+    pub(crate) flush_us: u64,
+    pub(crate) flush_max_us: u64,
+}
+
+#[derive(Debug, Default)]
+struct AgentWriterMetrics {
+    queued_frames: AtomicU64,
+    queued_bytes: AtomicU64,
+    queued_frames_max: AtomicU64,
+    queued_bytes_max: AtomicU64,
+    bursts: AtomicU64,
+    burst_frames: AtomicU64,
+    burst_bytes: AtomicU64,
+    burst_frames_max: AtomicU64,
+    burst_bytes_max: AtomicU64,
+    enqueue_to_write_us: AtomicU64,
+    enqueue_to_write_max_us: AtomicU64,
+    enqueue_to_write_samples: AtomicU64,
+    write_us: AtomicU64,
+    write_max_us: AtomicU64,
+    flush_us: AtomicU64,
+    flush_max_us: AtomicU64,
+}
+
+impl AgentWriterMetrics {
+    fn record_enqueued(&self, encoded_len: usize) {
+        let frames = self
+            .queued_frames
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let bytes = self
+            .queued_bytes
+            .fetch_add(encoded_len as u64, Ordering::AcqRel)
+            .saturating_add(encoded_len as u64);
+        self.queued_frames_max.fetch_max(frames, Ordering::AcqRel);
+        self.queued_bytes_max.fetch_max(bytes, Ordering::AcqRel);
+    }
+
+    fn record_dequeued(&self, items: &[AgentFrameWriteItem]) {
+        let frames = items.len() as u64;
+        let bytes = items
+            .iter()
+            .map(|item| item.encoded_len() as u64)
+            .sum::<u64>();
+        if frames > 0 {
+            self.queued_frames.fetch_sub(frames, Ordering::AcqRel);
+        }
+        if bytes > 0 {
+            self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    fn record_burst(&self, stats: AgentFrameBurstWriteStats) {
+        let frames = stats.frames as u64;
+        let bytes = stats.bytes as u64;
+        self.bursts.fetch_add(1, Ordering::AcqRel);
+        self.burst_frames.fetch_add(frames, Ordering::AcqRel);
+        self.burst_bytes.fetch_add(bytes, Ordering::AcqRel);
+        self.burst_frames_max.fetch_max(frames, Ordering::AcqRel);
+        self.burst_bytes_max.fetch_max(bytes, Ordering::AcqRel);
+
+        let enqueue_to_write_us = duration_micros_to_u64(stats.enqueue_to_write_us);
+        let enqueue_to_write_max_us = duration_micros_to_u64(stats.enqueue_to_write_max_us);
+        self.enqueue_to_write_us
+            .fetch_add(enqueue_to_write_us, Ordering::AcqRel);
+        self.enqueue_to_write_max_us
+            .fetch_max(enqueue_to_write_max_us, Ordering::AcqRel);
+        self.enqueue_to_write_samples
+            .fetch_add(frames, Ordering::AcqRel);
+
+        let write_us = duration_micros_to_u64(stats.write_us);
+        let flush_us = duration_micros_to_u64(stats.flush_us);
+        self.write_us.fetch_add(write_us, Ordering::AcqRel);
+        self.write_max_us.fetch_max(write_us, Ordering::AcqRel);
+        self.flush_us.fetch_add(flush_us, Ordering::AcqRel);
+        self.flush_max_us.fetch_max(flush_us, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> AgentWriterSnapshot {
+        AgentWriterSnapshot {
+            queued_frames: usize::try_from(self.queued_frames.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX),
+            queued_bytes: usize::try_from(self.queued_bytes.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX),
+            queued_frames_max: usize::try_from(self.queued_frames_max.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX),
+            queued_bytes_max: usize::try_from(self.queued_bytes_max.load(Ordering::Acquire))
+                .unwrap_or(usize::MAX),
+            bursts: self.bursts.load(Ordering::Acquire),
+            burst_frames: self.burst_frames.load(Ordering::Acquire),
+            burst_bytes: self.burst_bytes.load(Ordering::Acquire),
+            burst_frames_max: self.burst_frames_max.load(Ordering::Acquire),
+            burst_bytes_max: self.burst_bytes_max.load(Ordering::Acquire),
+            enqueue_to_write_us: self.enqueue_to_write_us.load(Ordering::Acquire),
+            enqueue_to_write_max_us: self.enqueue_to_write_max_us.load(Ordering::Acquire),
+            enqueue_to_write_samples: self.enqueue_to_write_samples.load(Ordering::Acquire),
+            write_us: self.write_us.load(Ordering::Acquire),
+            write_max_us: self.write_max_us.load(Ordering::Acquire),
+            flush_us: self.flush_us.load(Ordering::Acquire),
+            flush_max_us: self.flush_max_us.load(Ordering::Acquire),
+        }
+    }
+}
+
+fn duration_micros_to_u64(micros: u128) -> u64 {
+    u64::try_from(micros).unwrap_or(u64::MAX)
 }
 
 impl AgentStreamSendMetrics {
@@ -78,9 +214,10 @@ impl AgentHeartbeat {
 
 #[derive(Clone, Debug)]
 pub struct AgentTransport {
-    outbound: mpsc::Sender<AgentFrame>,
+    outbound: mpsc::Sender<AgentFrameWriteItem>,
     streams: StreamMap,
     failure: FailureState,
+    writer_metrics: WriterMetrics,
     peer: AgentHello,
     next_stream_id: Arc<AtomicU64>,
     _heartbeat_guard: Option<Arc<AgentHeartbeatGuard>>,
@@ -137,6 +274,7 @@ impl AgentTransport {
         let (outbound, outbound_rx) = mpsc::channel(AGENT_OUTBOUND_FRAMES);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
         let heartbeat = Arc::new(Mutex::new(AgentHeartbeat::new()));
         let heartbeat_enabled = peer.capabilities & CAP_HEARTBEAT != 0;
         tokio::spawn(write_agent_frames(
@@ -144,6 +282,7 @@ impl AgentTransport {
             outbound_rx,
             Arc::clone(&streams),
             Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
         ));
         tokio::spawn(read_agent_frames(
             reader,
@@ -157,6 +296,7 @@ impl AgentTransport {
                 outbound.clone(),
                 Arc::clone(&streams),
                 Arc::clone(&failure),
+                Arc::clone(&writer_metrics),
                 heartbeat,
             ));
             Some(Arc::new(AgentHeartbeatGuard { task }))
@@ -168,6 +308,7 @@ impl AgentTransport {
             outbound,
             streams,
             failure,
+            writer_metrics,
             peer,
             next_stream_id: Arc::new(AtomicU64::new(1)),
             _heartbeat_guard: heartbeat_guard,
@@ -180,6 +321,10 @@ impl AgentTransport {
 
     pub async fn failure_message(&self) -> Option<String> {
         self.failure.lock().await.clone()
+    }
+
+    pub(crate) fn writer_snapshot(&self) -> AgentWriterSnapshot {
+        self.writer_metrics.snapshot()
     }
 
     pub async fn open_tcp_ipv4(&self, open: AgentOpenIpv4) -> Result<AgentStream> {
@@ -279,7 +424,10 @@ impl AgentTransport {
             return Err(err);
         }
 
-        outbound_permit.send(open_frame);
+        let queued_open = AgentFrameWriteItem::new(open_frame)?;
+        self.writer_metrics
+            .record_enqueued(queued_open.encoded_len());
+        outbound_permit.send(queued_open);
 
         let maybe_frame = match tokio::time::timeout(open_timeout, inbound_rx.recv()).await {
             Ok(frame) => frame,
@@ -306,6 +454,7 @@ impl AgentTransport {
                     inbound: inbound_rx,
                     streams: Arc::clone(&self.streams),
                     failure: Arc::clone(&self.failure),
+                    writer_metrics: Arc::clone(&self.writer_metrics),
                     send_credit,
                     max_frame_payload: (self.peer.max_frame_payload as usize)
                         .min(AGENT_MAX_FRAME_PAYLOAD),
@@ -383,7 +532,10 @@ impl AgentTransport {
             return Err(err);
         }
 
-        outbound_permit.send(open_frame);
+        let queued_open = AgentFrameWriteItem::new(open_frame)?;
+        self.writer_metrics
+            .record_enqueued(queued_open.encoded_len());
+        outbound_permit.send(queued_open);
 
         let mut stream = AgentStream {
             stream_id,
@@ -391,6 +543,7 @@ impl AgentTransport {
             inbound: inbound_rx,
             streams: Arc::clone(&self.streams),
             failure: Arc::clone(&self.failure),
+            writer_metrics: Arc::clone(&self.writer_metrics),
             send_credit,
             max_frame_payload: (self.peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD),
             receive_window: AgentCreditWindow::new(),
@@ -423,10 +576,11 @@ impl AgentTransport {
 #[derive(Debug)]
 pub struct AgentStream {
     stream_id: u64,
-    outbound: mpsc::Sender<AgentFrame>,
+    outbound: mpsc::Sender<AgentFrameWriteItem>,
     inbound: mpsc::Receiver<AgentFrame>,
     streams: StreamMap,
     failure: FailureState,
+    writer_metrics: WriterMetrics,
     send_credit: Arc<Semaphore>,
     max_frame_payload: usize,
     receive_window: AgentCreditWindow,
@@ -440,6 +594,15 @@ impl AgentStream {
 
     pub async fn transport_failure_message(&self) -> Option<String> {
         self.failure.lock().await.clone()
+    }
+
+    fn send_context(&self) -> AgentFrameSendContext<'_> {
+        AgentFrameSendContext {
+            outbound: &self.outbound,
+            streams: &self.streams,
+            failure: &self.failure,
+            writer_metrics: &self.writer_metrics,
+        }
     }
 
     pub async fn send_data(&self, bytes: impl Into<Bytes>) -> Result<()> {
@@ -543,9 +706,7 @@ impl AgentStream {
         let frame = AgentFrame::new(AgentFrameKind::Close, self.stream_id, Bytes::new())?;
         self.close_credit_and_unregister().await;
         send_agent_transport_frame(
-            &self.outbound,
-            &self.streams,
-            &self.failure,
+            self.send_context(),
             frame,
             AGENT_FRAME_SEND_TIMEOUT,
             "agent close frame",
@@ -559,15 +720,7 @@ impl AgentStream {
     }
 
     async fn send_frame_with_timeout(&self, frame: AgentFrame, timeout: Duration) -> Result<()> {
-        send_agent_transport_frame(
-            &self.outbound,
-            &self.streams,
-            &self.failure,
-            frame,
-            timeout,
-            "agent stream frame",
-        )
-        .await
+        send_agent_transport_frame(self.send_context(), frame, timeout, "agent stream frame").await
     }
 
     async fn send_frame_with_metrics(
@@ -576,9 +729,7 @@ impl AgentStream {
         metrics: &mut AgentStreamSendMetrics,
     ) -> Result<()> {
         send_agent_transport_frame_with_metrics(
-            &self.outbound,
-            &self.streams,
-            &self.failure,
+            self.send_context(),
             frame,
             AGENT_FRAME_SEND_TIMEOUT,
             "agent stream frame",
@@ -613,46 +764,36 @@ impl AgentStream {
 }
 
 async fn send_agent_transport_frame(
-    outbound: &mpsc::Sender<AgentFrame>,
-    streams: &StreamMap,
-    failure: &FailureState,
+    send: AgentFrameSendContext<'_>,
     frame: AgentFrame,
     timeout: Duration,
     context: &str,
 ) -> Result<()> {
     let mut metrics = AgentStreamSendMetrics::default();
-    send_agent_transport_frame_with_metrics(
-        outbound,
-        streams,
-        failure,
-        frame,
-        timeout,
-        context,
-        &mut metrics,
-    )
-    .await
+    send_agent_transport_frame_with_metrics(send, frame, timeout, context, &mut metrics).await
 }
 
 async fn send_agent_transport_frame_with_metrics(
-    outbound: &mpsc::Sender<AgentFrame>,
-    streams: &StreamMap,
-    failure: &FailureState,
+    send: AgentFrameSendContext<'_>,
     frame: AgentFrame,
     timeout: Duration,
     context: &str,
     metrics: &mut AgentStreamSendMetrics,
 ) -> Result<()> {
-    ensure_agent_ready(failure).await?;
+    ensure_agent_ready(send.failure).await?;
     let outbound_started_at = Instant::now();
-    match tokio::time::timeout(timeout, outbound.send(frame)).await {
-        Ok(Ok(())) => {
+    match tokio::time::timeout(timeout, send.outbound.clone().reserve_owned()).await {
+        Ok(Ok(permit)) => {
+            let queued = AgentFrameWriteItem::new(frame)?;
+            send.writer_metrics.record_enqueued(queued.encoded_len());
+            permit.send(queued);
             metrics.record_outbound_wait(outbound_started_at);
             Ok(())
         }
         Ok(Err(_)) => {
             metrics.record_outbound_wait(outbound_started_at);
             let message = "agent writer task is closed".to_owned();
-            mark_agent_failed(failure, streams, message.clone()).await;
+            mark_agent_failed(send.failure, send.streams, message.clone()).await;
             Err(anyhow!(message))
         }
         Err(_) => {
@@ -661,7 +802,7 @@ async fn send_agent_transport_frame_with_metrics(
                 "timed out after {}ms enqueueing {context}",
                 timeout.as_millis()
             );
-            mark_agent_failed(failure, streams, message.clone()).await;
+            mark_agent_failed(send.failure, send.streams, message.clone()).await;
             Err(anyhow!(message))
         }
     }
@@ -669,20 +810,40 @@ async fn send_agent_transport_frame_with_metrics(
 
 async fn write_agent_frames<W>(
     mut writer: W,
-    mut outbound_rx: mpsc::Receiver<AgentFrame>,
+    mut outbound_rx: mpsc::Receiver<AgentFrameWriteItem>,
     streams: StreamMap,
     failure: FailureState,
+    writer_metrics: WriterMetrics,
 ) where
     W: AsyncWrite + Unpin,
 {
     let mut burst_writer = AgentFrameBurstWriter::new();
-    while let Some(frame) = outbound_rx.recv().await {
-        if let Err(err) = burst_writer
-            .write_burst(&mut writer, frame, &mut outbound_rx)
-            .await
-        {
-            mark_agent_failed(&failure, &streams, err.to_string()).await;
-            return;
+    let mut burst_items = Vec::with_capacity(AGENT_FRAME_WRITE_BURST);
+    while let Some(first) = outbound_rx.recv().await {
+        burst_items.clear();
+        let mut burst_bytes = first.encoded_len();
+        burst_items.push(first);
+        for _ in 1..AGENT_FRAME_WRITE_BURST {
+            if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
+                break;
+            }
+            match outbound_rx.try_recv() {
+                Ok(item) => {
+                    burst_bytes = burst_bytes.saturating_add(item.encoded_len());
+                    burst_items.push(item);
+                }
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        writer_metrics.record_dequeued(&burst_items);
+        match burst_writer.write_items(&mut writer, &burst_items).await {
+            Ok(stats) => writer_metrics.record_burst(stats),
+            Err(err) => {
+                mark_agent_failed(&failure, &streams, err.to_string()).await;
+                return;
+            }
         }
     }
     let _ = writer.shutdown().await;
@@ -741,9 +902,10 @@ where
 }
 
 async fn run_agent_heartbeat(
-    outbound: mpsc::Sender<AgentFrame>,
+    outbound: mpsc::Sender<AgentFrameWriteItem>,
     streams: StreamMap,
     failure: FailureState,
+    writer_metrics: WriterMetrics,
     heartbeat: HeartbeatState,
 ) {
     let mut tick = tokio::time::interval_at(
@@ -782,9 +944,12 @@ async fn run_agent_heartbeat(
         let frame =
             AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).expect("empty heartbeat frame");
         if send_agent_transport_frame(
-            &outbound,
-            &streams,
-            &failure,
+            AgentFrameSendContext {
+                outbound: &outbound,
+                streams: &streams,
+                failure: &failure,
+                writer_metrics: &writer_metrics,
+            },
             frame,
             AGENT_FRAME_SEND_TIMEOUT,
             "agent heartbeat ping",
@@ -961,7 +1126,7 @@ mod tests {
 
     fn test_agent_stream(
         stream_id: u64,
-        outbound: mpsc::Sender<AgentFrame>,
+        outbound: mpsc::Sender<AgentFrameWriteItem>,
         inbound: mpsc::Receiver<AgentFrame>,
     ) -> AgentStream {
         AgentStream {
@@ -970,11 +1135,32 @@ mod tests {
             inbound,
             streams: Arc::new(Mutex::new(HashMap::new())),
             failure: Arc::new(Mutex::new(None)),
+            writer_metrics: Arc::new(AgentWriterMetrics::default()),
             send_credit: Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
             receive_window: AgentCreditWindow::new(),
             initial_receive_credit_granted: true,
         }
+    }
+
+    fn queued_writer_item(
+        writer_metrics: &AgentWriterMetrics,
+        frame: AgentFrame,
+    ) -> AgentFrameWriteItem {
+        let item = AgentFrameWriteItem::new(frame).expect("queued writer frame");
+        writer_metrics.record_enqueued(item.encoded_len());
+        item
+    }
+
+    async fn queue_writer_frame(
+        outbound: &mpsc::Sender<AgentFrameWriteItem>,
+        writer_metrics: &AgentWriterMetrics,
+        frame: AgentFrame,
+    ) {
+        outbound
+            .send(queued_writer_item(writer_metrics, frame))
+            .await
+            .expect("queue frame");
     }
 
     #[tokio::test]
@@ -986,19 +1172,20 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(8);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for stream_id in 1..=3 {
-            outbound
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id,
-                        Bytes::copy_from_slice(&[stream_id as u8]),
-                    )
-                    .expect("data frame"),
+            queue_writer_frame(
+                &outbound,
+                &writer_metrics,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id,
+                    Bytes::copy_from_slice(&[stream_id as u8]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(outbound);
 
@@ -1007,12 +1194,24 @@ mod tests {
             outbound_rx,
             Arc::clone(&streams),
             Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
         )
         .await;
 
         assert_eq!(writes.load(Ordering::Acquire), 1);
         assert_eq!(flushes.load(Ordering::Acquire), 1);
         assert!(failure.lock().await.is_none());
+        let snapshot = writer_metrics.snapshot();
+        assert_eq!(snapshot.queued_frames, 0);
+        assert_eq!(snapshot.queued_bytes, 0);
+        assert_eq!(snapshot.queued_frames_max, 3);
+        assert!(snapshot.queued_bytes_max > 0);
+        assert_eq!(snapshot.bursts, 1);
+        assert_eq!(snapshot.burst_frames, 3);
+        assert_eq!(snapshot.burst_bytes, snapshot.queued_bytes_max as u64);
+        assert_eq!(snapshot.burst_frames_max, 3);
+        assert_eq!(snapshot.burst_bytes_max, snapshot.queued_bytes_max as u64);
+        assert_eq!(snapshot.enqueue_to_write_samples, 3);
         let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
         let mut decoded = 0;
         while try_decode_frame(&mut encoded)
@@ -1035,19 +1234,20 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(total_frames);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for stream_id in 1..=total_frames {
-            outbound
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id as u64,
-                        Bytes::copy_from_slice(&[stream_id as u8]),
-                    )
-                    .expect("data frame"),
+            queue_writer_frame(
+                &outbound,
+                &writer_metrics,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id as u64,
+                    Bytes::copy_from_slice(&[stream_id as u8]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(outbound);
 
@@ -1056,6 +1256,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&streams),
             Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
         )
         .await;
 
@@ -1090,23 +1291,31 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(total_frames);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for stream_id in 1..=total_frames {
-            outbound
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id as u64,
-                        Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
-                    )
-                    .expect("data frame"),
+            queue_writer_frame(
+                &outbound,
+                &writer_metrics,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id as u64,
+                    Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(outbound);
 
-        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+        write_agent_frames(
+            writer,
+            outbound_rx,
+            streams,
+            Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
+        )
+        .await;
 
         assert_eq!(writes.load(Ordering::Acquire), 2);
         assert_eq!(flushes.load(Ordering::Acquire), 2);
@@ -1120,6 +1329,7 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(8);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one"))
@@ -1133,11 +1343,18 @@ mod tests {
             AgentFrame::new(AgentFrameKind::Opened, 4, Bytes::new()).expect("opened frame"),
             AgentFrame::new(AgentFrameKind::Pong, 0, Bytes::new()).expect("pong frame"),
         ] {
-            outbound.send(frame).await.expect("queue frame");
+            queue_writer_frame(&outbound, &writer_metrics, frame).await;
         }
         drop(outbound);
 
-        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+        write_agent_frames(
+            writer,
+            outbound_rx,
+            streams,
+            Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
+        )
+        .await;
 
         let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
         let mut decoded = Vec::new();
@@ -1165,6 +1382,7 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(8);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one-a"))
@@ -1179,11 +1397,18 @@ mod tests {
                 .expect("data frame"),
             AgentFrame::new(AgentFrameKind::Eof, 1, Bytes::new()).expect("eof frame"),
         ] {
-            outbound.send(frame).await.expect("queue frame");
+            queue_writer_frame(&outbound, &writer_metrics, frame).await;
         }
         drop(outbound);
 
-        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+        write_agent_frames(
+            writer,
+            outbound_rx,
+            streams,
+            Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
+        )
+        .await;
 
         let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
         let mut decoded = Vec::new();
@@ -1211,6 +1436,7 @@ mod tests {
         let (outbound, outbound_rx) = mpsc::channel(8);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"request"))
@@ -1220,11 +1446,18 @@ mod tests {
                 .expect("window frame")
                 .with_credit(32),
         ] {
-            outbound.send(frame).await.expect("queue frame");
+            queue_writer_frame(&outbound, &writer_metrics, frame).await;
         }
         drop(outbound);
 
-        write_agent_frames(writer, outbound_rx, streams, Arc::clone(&failure)).await;
+        write_agent_frames(
+            writer,
+            outbound_rx,
+            streams,
+            Arc::clone(&failure),
+            Arc::clone(&writer_metrics),
+        )
+        .await;
 
         let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
         let mut decoded = Vec::new();
@@ -1466,6 +1699,7 @@ mod tests {
             outbound,
             streams: Arc::new(Mutex::new(HashMap::new())),
             failure: Arc::new(Mutex::new(None)),
+            writer_metrics: Arc::new(AgentWriterMetrics::default()),
             peer,
             next_stream_id: Arc::new(AtomicU64::new(1)),
             _heartbeat_guard: None,
@@ -1874,7 +2108,11 @@ mod tests {
         let frame = stream.recv().await.expect("receive threshold data frame");
         assert_eq!(frame.kind, AgentFrameKind::Data);
 
-        let window = outbound_rx.recv().await.expect("receive batched window");
+        let window = outbound_rx
+            .recv()
+            .await
+            .expect("receive batched window")
+            .frame;
         assert_eq!(window.kind, AgentFrameKind::Window);
         assert_eq!(window.stream_id, 7);
         assert_eq!(
@@ -1913,7 +2151,11 @@ mod tests {
             }
         }
 
-        let window = outbound_rx.recv().await.expect("receive immediate window");
+        let window = outbound_rx
+            .recv()
+            .await
+            .expect("receive immediate window")
+            .frame;
         assert_eq!(window.kind, AgentFrameKind::Window);
         assert_eq!(window.stream_id, 9);
         assert_eq!(
@@ -1949,6 +2191,7 @@ mod tests {
             let frame = stream.recv().await.expect("receive max-frame data");
             assert_eq!(frame.kind, AgentFrameKind::Data);
             while let Ok(window) = outbound_rx.try_recv() {
+                let window = window.frame;
                 assert_eq!(window.kind, AgentFrameKind::Window);
                 assert_eq!(window.stream_id, 11);
                 largest_credit = largest_credit.max(window.credit as usize);
@@ -2242,8 +2485,12 @@ mod tests {
     #[tokio::test]
     async fn open_timeout_when_outbound_queue_is_full() {
         let (outbound, _outbound_rx) = mpsc::channel(1);
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
         outbound
-            .try_send(AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap())
+            .try_send(queued_writer_item(
+                &writer_metrics,
+                AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+            ))
             .expect("prefill outbound queue");
         let streams = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let failure = std::sync::Arc::new(Mutex::new(None));
@@ -2251,6 +2498,7 @@ mod tests {
             outbound,
             streams: std::sync::Arc::clone(&streams),
             failure: std::sync::Arc::clone(&failure),
+            writer_metrics,
             peer: AgentHello::current(1300),
             next_stream_id: std::sync::Arc::new(AtomicU64::new(1)),
             _heartbeat_guard: None,
@@ -2284,8 +2532,12 @@ mod tests {
     #[tokio::test]
     async fn stream_send_timeout_marks_transport_failed_without_blocking_reset() {
         let (outbound, _outbound_rx) = mpsc::channel(1);
+        let writer_metrics = Arc::new(AgentWriterMetrics::default());
         outbound
-            .try_send(AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap())
+            .try_send(queued_writer_item(
+                &writer_metrics,
+                AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+            ))
             .expect("prefill outbound queue");
         let streams = std::sync::Arc::new(Mutex::new(HashMap::new()));
         let failure = std::sync::Arc::new(Mutex::new(None));
@@ -2310,6 +2562,7 @@ mod tests {
             inbound,
             streams: std::sync::Arc::clone(&streams),
             failure: std::sync::Arc::clone(&failure),
+            writer_metrics,
             send_credit: std::sync::Arc::new(Semaphore::new(0)),
             max_frame_payload: AGENT_MAX_FRAME_PAYLOAD,
             receive_window: AgentCreditWindow::new(),

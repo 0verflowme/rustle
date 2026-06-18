@@ -63,6 +63,22 @@ fn data_plane_runtime_snapshot_from_agent(
         active_streams: snapshot.active_streams,
         max_lane_load: snapshot.max_lane_load,
         max_quarantine_ms: snapshot.max_quarantine_ms,
+        writer_queued_frames: snapshot.writer_queued_frames,
+        writer_queued_bytes: snapshot.writer_queued_bytes,
+        writer_queued_frames_max: snapshot.writer_queued_frames_max,
+        writer_queued_bytes_max: snapshot.writer_queued_bytes_max,
+        writer_bursts: snapshot.writer_bursts,
+        writer_burst_frames: snapshot.writer_burst_frames,
+        writer_burst_bytes: snapshot.writer_burst_bytes,
+        writer_burst_frames_max: snapshot.writer_burst_frames_max,
+        writer_burst_bytes_max: snapshot.writer_burst_bytes_max,
+        writer_enqueue_to_write_us: snapshot.writer_enqueue_to_write_us,
+        writer_enqueue_to_write_max_us: snapshot.writer_enqueue_to_write_max_us,
+        writer_enqueue_to_write_samples: snapshot.writer_enqueue_to_write_samples,
+        writer_write_us: snapshot.writer_write_us,
+        writer_write_max_us: snapshot.writer_write_max_us,
+        writer_flush_us: snapshot.writer_flush_us,
+        writer_flush_max_us: snapshot.writer_flush_max_us,
     }
 }
 

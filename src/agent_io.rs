@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use bytes::BytesMut;
@@ -12,6 +13,45 @@ use crate::agent_proto::{
 
 pub(crate) const AGENT_FRAME_WRITE_BURST: usize = 64;
 pub(crate) const AGENT_FRAME_WRITE_BURST_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug)]
+pub(crate) struct AgentFrameWriteItem {
+    pub(crate) frame: AgentFrame,
+    enqueued_at: Instant,
+    encoded_len: usize,
+}
+
+impl AgentFrameWriteItem {
+    pub(crate) fn new(frame: AgentFrame) -> Result<Self> {
+        let encoded_len = encoded_frame_len(&frame)?;
+        Ok(Self {
+            frame,
+            enqueued_at: Instant::now(),
+            encoded_len,
+        })
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
+    fn enqueue_wait_us(&self, write_started_at: Instant) -> u128 {
+        write_started_at
+            .checked_duration_since(self.enqueued_at)
+            .unwrap_or_default()
+            .as_micros()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AgentFrameBurstWriteStats {
+    pub(crate) frames: usize,
+    pub(crate) bytes: usize,
+    pub(crate) enqueue_to_write_us: u128,
+    pub(crate) enqueue_to_write_max_us: u128,
+    pub(crate) write_us: u128,
+    pub(crate) flush_us: u128,
+}
 
 pub(crate) struct AgentFrameReader {
     input: BytesMut,
@@ -114,8 +154,56 @@ impl AgentFrameBurstWriter {
                 }
             }
         }
+        self.write_frames(writer).await.map(|_| ())
+    }
+
+    pub(crate) async fn write_items<W>(
+        &mut self,
+        writer: &mut W,
+        items: &[AgentFrameWriteItem],
+    ) -> Result<AgentFrameBurstWriteStats>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.frames.clear();
+        self.frames
+            .extend(items.iter().map(|item| item.frame.clone()));
+        let mut stats = AgentFrameBurstWriteStats {
+            frames: items.len(),
+            bytes: items.iter().map(AgentFrameWriteItem::encoded_len).sum(),
+            ..AgentFrameBurstWriteStats::default()
+        };
+        let write_started_at = Instant::now();
+        for item in items {
+            let wait_us = item.enqueue_wait_us(write_started_at);
+            stats.enqueue_to_write_us = stats.enqueue_to_write_us.saturating_add(wait_us);
+            stats.enqueue_to_write_max_us = stats.enqueue_to_write_max_us.max(wait_us);
+        }
+        let io_stats = self.write_frames(writer).await?;
+        stats.write_us = io_stats.write_us;
+        stats.flush_us = io_stats.flush_us;
+        Ok(stats)
+    }
+
+    async fn write_frames<W>(&mut self, writer: &mut W) -> Result<AgentFrameBurstWriteStats>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut stats = AgentFrameBurstWriteStats {
+            frames: self.frames.len(),
+            bytes: encoded_frames_len(self.frames.iter())?,
+            ..AgentFrameBurstWriteStats::default()
+        };
+        let write_started_at = Instant::now();
         write_agent_frame_burst_ordered(writer, &self.frames, &mut self.encoded).await?;
-        writer.flush().await.context("failed to flush agent frame")
+        stats.write_us = write_started_at.elapsed().as_micros();
+        let flush_started_at = Instant::now();
+        writer
+            .flush()
+            .await
+            .context("failed to flush agent frame")?;
+        stats.flush_us = flush_started_at.elapsed().as_micros();
+        Ok(stats)
     }
 }
 

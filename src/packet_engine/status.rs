@@ -235,7 +235,7 @@ impl TunnelStats {
             .unwrap_or(0);
 
         format!(
-            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} max:{} raw:{} max_raw:{} bridge_event_queue=remote_bytes:{} max:{} remote_bytes_raw:{} max_raw:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
+            "uptime={} active_flows={} ssh_channels={} backlog_flows={} backlog_bytes={} max:{} raw:{} max_raw:{} bridge_event_queue=remote_bytes:{} max:{} remote_bytes_raw:{} max_raw:{} tun_rx={}/{} tun_tx={}/{} tun_drop={}/{} tun_write=calls:{} total_us:{} max_us:{} tcp_l2r={} tcp_r2l={} dns=fwd:{} ok:{} fail:{} drop:{} inflight:{} udp=fwd:{} ok:{} fail:{} drop:{} active:{} ssh=open:{} fail:{} eof:{} close:{} open_ms=avg:{} max:{} defer=active:{} open:{} agent_reconnect=attempt:{} ok:{} fail:{} agent_lanes=total:{} desired:{} ok:{} fail:{} missing:{} quarantine:{} repairing:{} active:{} max_load:{} max_quarantine_ms:{} agent_writer=queued_frames:{} queued_bytes:{} queued_frames_max:{} queued_bytes_max:{} bursts:{} burst_frames:{} burst_bytes:{} burst_frames_max:{} burst_bytes_max:{} enqueue_wait=samples:{} total_us:{} max_us:{} write_us:{} write_max_us:{} flush_us:{} flush_max_us:{} flow=expired:{} pruned:{} bridge_backpressure:{} bridge_send_fail:{} tcp_recv_queue_wait=count:{} total_us:{} max_us:{} bridge_event_batch=count:{} events:{} max:{} total_us:{} max_us:{} paused:{} backlog_overflow:{} stale_bridge:{}",
             format_duration(self.started_at.elapsed()),
             snapshot.tcp.active_flows,
             snapshot.tcp.ssh_channels,
@@ -290,6 +290,22 @@ impl TunnelStats {
             snapshot.agent.active_streams,
             snapshot.agent.max_lane_load,
             snapshot.agent.max_quarantine_ms,
+            snapshot.agent.writer_queued_frames,
+            snapshot.agent.writer_queued_bytes,
+            snapshot.agent.writer_queued_frames_max,
+            snapshot.agent.writer_queued_bytes_max,
+            snapshot.agent.writer_bursts,
+            snapshot.agent.writer_burst_frames,
+            snapshot.agent.writer_burst_bytes,
+            snapshot.agent.writer_burst_frames_max,
+            snapshot.agent.writer_burst_bytes_max,
+            snapshot.agent.writer_enqueue_to_write_samples,
+            snapshot.agent.writer_enqueue_to_write_us,
+            snapshot.agent.writer_enqueue_to_write_max_us,
+            snapshot.agent.writer_write_us,
+            snapshot.agent.writer_write_max_us,
+            snapshot.agent.writer_flush_us,
+            snapshot.agent.writer_flush_max_us,
             self.expired_flows,
             self.pruned_flows,
             self.bridge_backpressure_events,
@@ -444,6 +460,22 @@ mod tests {
                 active_streams: 7,
                 max_lane_load: 4,
                 max_quarantine_ms: 250,
+                writer_queued_frames: 2,
+                writer_queued_bytes: 300,
+                writer_queued_frames_max: 5,
+                writer_queued_bytes_max: 900,
+                writer_bursts: 11,
+                writer_burst_frames: 33,
+                writer_burst_bytes: 4096,
+                writer_burst_frames_max: 8,
+                writer_burst_bytes_max: 2048,
+                writer_enqueue_to_write_us: 1234,
+                writer_enqueue_to_write_max_us: 99,
+                writer_enqueue_to_write_samples: 33,
+                writer_write_us: 456,
+                writer_write_max_us: 77,
+                writer_flush_us: 222,
+                writer_flush_max_us: 44,
             },
         });
 
@@ -464,6 +496,9 @@ mod tests {
         assert!(line.contains("agent_reconnect=attempt:5 ok:4 fail:1"));
         assert!(line.contains(
             "agent_lanes=total:4 desired:4 ok:1 fail:1 missing:1 quarantine:1 repairing:1 active:7 max_load:4 max_quarantine_ms:250"
+        ));
+        assert!(line.contains(
+            "agent_writer=queued_frames:2 queued_bytes:300 queued_frames_max:5 queued_bytes_max:900 bursts:11 burst_frames:33 burst_bytes:4096 burst_frames_max:8 burst_bytes_max:2048 enqueue_wait=samples:33 total_us:1234 max_us:99 write_us:456 write_max_us:77 flush_us:222 flush_max_us:44"
         ));
         assert!(line.contains("bridge_backpressure:4"));
         assert!(line.contains("tcp_recv_queue_wait=count:2 total_us:11 max_us:7"));
