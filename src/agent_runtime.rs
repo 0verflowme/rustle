@@ -11,7 +11,10 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
 
-use crate::agent_io::{AgentFrameBurstWriter, AgentFrameReader};
+use crate::agent_io::{
+    AgentFrameBurstWriter, AgentFrameReader, AgentFrameWriteItem, AgentFrameWriteQueue,
+    AgentFrameWriteReceiver, AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
+};
 use crate::agent_proto::{
     AgentFrame, AgentFrameKind, AgentHello, AgentOpenHost, AgentOpenIpv4, AgentOpenedTiming,
     AGENT_MAX_FRAME_PAYLOAD, CAP_FLOW_CONTROL,
@@ -144,7 +147,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (out_tx, out_rx) = mpsc::channel(AGENT_OUTBOUND_FRAMES);
+    let (out_tx, out_rx) = AgentFrameWriteQueue::channel(AGENT_OUTBOUND_FRAMES);
     let writer_task = tokio::spawn(write_agent_frames(writer, out_rx));
     let result = read_agent_frames(reader, config, out_tx.clone()).await;
 
@@ -164,15 +167,33 @@ where
     result
 }
 
-async fn write_agent_frames<W>(mut writer: W, mut out_rx: mpsc::Receiver<AgentFrame>) -> Result<()>
+async fn write_agent_frames<W>(mut writer: W, mut out_rx: AgentFrameWriteReceiver) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut burst_writer = AgentFrameBurstWriter::new();
-    while let Some(frame) = out_rx.recv().await {
-        burst_writer
-            .write_burst(&mut writer, frame, &mut out_rx)
-            .await?;
+    let mut burst_items = Vec::with_capacity(AGENT_FRAME_WRITE_BURST);
+    while let Some(first) = out_rx.recv().await {
+        burst_items.clear();
+        let mut burst_bytes = first.encoded_len();
+        burst_items.push(first);
+        for _ in 1..AGENT_FRAME_WRITE_BURST {
+            if let Some(item) = out_rx.try_recv_priority() {
+                burst_bytes = burst_bytes.saturating_add(item.encoded_len());
+                burst_items.push(item);
+                continue;
+            }
+            if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
+                break;
+            }
+            if let Some(item) = out_rx.try_recv_data() {
+                burst_bytes = burst_bytes.saturating_add(item.encoded_len());
+                burst_items.push(item);
+            } else {
+                break;
+            }
+        }
+        burst_writer.write_items(&mut writer, &burst_items).await?;
     }
     writer
         .shutdown()
@@ -183,7 +204,7 @@ where
 async fn read_agent_frames<R>(
     mut reader: R,
     config: AgentRuntimeConfig,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -253,7 +274,7 @@ fn remove_finished_stream_id(streams: &mut HashMap<u64, AgentStreamHandle>, stre
 async fn handle_agent_frame(
     frame: AgentFrame,
     config: AgentRuntimeConfig,
-    out_tx: &mpsc::Sender<AgentFrame>,
+    out_tx: &AgentFrameWriteQueue,
     done_tx: &mpsc::Sender<u64>,
     streams: &mut HashMap<u64, AgentStreamHandle>,
     peer_max_frame_payload: &mut usize,
@@ -502,7 +523,7 @@ async fn run_tcp_stream(
     stream_id: u64,
     open: AgentOpenIpv4,
     from_local: mpsc::Receiver<AgentTcpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     options: AgentTcpStreamOptions,
 ) {
@@ -522,7 +543,7 @@ async fn run_tcp_host_stream(
     stream_id: u64,
     open: AgentOpenHost,
     from_local: mpsc::Receiver<AgentTcpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     options: AgentTcpStreamOptions,
 ) {
@@ -542,7 +563,7 @@ async fn run_tcp_stream_inner(
     stream_id: u64,
     open: AgentOpenIpv4,
     from_local: mpsc::Receiver<AgentTcpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     options: AgentTcpStreamOptions,
 ) {
@@ -567,7 +588,7 @@ async fn run_tcp_host_stream_inner(
     stream_id: u64,
     open: AgentOpenHost,
     from_local: mpsc::Receiver<AgentTcpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     options: AgentTcpStreamOptions,
 ) {
@@ -614,7 +635,7 @@ async fn run_tcp_connected_stream(
     stream: Result<TcpStream, std::io::Error>,
     remote_connect_elapsed: Option<Duration>,
     mut from_local: mpsc::Receiver<AgentTcpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     max_frame_payload: usize,
 ) {
@@ -768,7 +789,7 @@ async fn run_udp_stream(
     stream_id: u64,
     open: AgentOpenIpv4,
     from_local: mpsc::Receiver<AgentUdpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
     done_tx: mpsc::Sender<u64>,
 ) {
@@ -780,7 +801,7 @@ async fn run_udp_stream_inner(
     stream_id: u64,
     open: AgentOpenIpv4,
     mut from_local: mpsc::Receiver<AgentUdpInput>,
-    out_tx: mpsc::Sender<AgentFrame>,
+    out_tx: AgentFrameWriteQueue,
     output_credit: Arc<Semaphore>,
 ) {
     let destination = SocketAddrV4::new(open.destination_ip, open.destination_port);
@@ -897,7 +918,7 @@ async fn yield_after_output_data_frame(budget: &mut OutputProducerYieldBudget) {
 }
 
 async fn record_receive_credit(
-    out_tx: &mpsc::Sender<AgentFrame>,
+    out_tx: &AgentFrameWriteQueue,
     stream_id: u64,
     receive_window: &mut AgentCreditWindow,
     bytes: usize,
@@ -908,7 +929,7 @@ async fn record_receive_credit(
     Ok(())
 }
 
-async fn send_reset(out_tx: &mpsc::Sender<AgentFrame>, stream_id: u64, reason: &str) -> Result<()> {
+async fn send_reset(out_tx: &AgentFrameWriteQueue, stream_id: u64, reason: &str) -> Result<()> {
     let payload = Bytes::copy_from_slice(reason.as_bytes());
     send_agent_frame(
         out_tx,
@@ -917,11 +938,7 @@ async fn send_reset(out_tx: &mpsc::Sender<AgentFrame>, stream_id: u64, reason: &
     .await
 }
 
-async fn send_window(
-    out_tx: &mpsc::Sender<AgentFrame>,
-    stream_id: u64,
-    bytes: usize,
-) -> Result<()> {
+async fn send_window(out_tx: &AgentFrameWriteQueue, stream_id: u64, bytes: usize) -> Result<()> {
     if bytes == 0 {
         return Ok(());
     }
@@ -933,17 +950,21 @@ async fn send_window(
     .await
 }
 
-async fn send_agent_frame(out_tx: &mpsc::Sender<AgentFrame>, frame: AgentFrame) -> Result<()> {
+async fn send_agent_frame(out_tx: &AgentFrameWriteQueue, frame: AgentFrame) -> Result<()> {
     send_agent_frame_with_timeout(out_tx, frame, AGENT_FRAME_SEND_TIMEOUT).await
 }
 
 async fn send_agent_frame_with_timeout(
-    out_tx: &mpsc::Sender<AgentFrame>,
+    out_tx: &AgentFrameWriteQueue,
     frame: AgentFrame,
     timeout: Duration,
 ) -> Result<()> {
-    match tokio::time::timeout(timeout, out_tx.send(frame)).await {
-        Ok(Ok(())) => Ok(()),
+    let item = AgentFrameWriteItem::new(frame)?;
+    match tokio::time::timeout(timeout, out_tx.reserve_owned(&item)).await {
+        Ok(Ok(permit)) => {
+            permit.send(item);
+            Ok(())
+        }
         Ok(Err(_)) => bail!("agent output channel closed"),
         Err(_) => bail!(
             "timed out after {}ms enqueueing agent output frame",
@@ -1043,26 +1064,43 @@ mod tests {
         }
     }
 
+    async fn queue_output_frame(out_tx: &AgentFrameWriteQueue, frame: AgentFrame) {
+        send_agent_frame(out_tx, frame)
+            .await
+            .expect("queue agent output frame");
+    }
+
+    async fn recv_output_frame(out_rx: &mut AgentFrameWriteReceiver) -> AgentFrame {
+        out_rx
+            .recv()
+            .await
+            .expect("receive agent output frame")
+            .frame
+    }
+
+    fn output_queue_is_empty(out_rx: &mut AgentFrameWriteReceiver) -> bool {
+        out_rx.try_recv_priority().is_none() && out_rx.try_recv_data().is_none()
+    }
+
     #[tokio::test]
     async fn agent_writer_flushes_once_per_queued_burst() {
         let writer = CountingWriter::default();
         let flushes = Arc::clone(&writer.flushes);
         let writes = Arc::clone(&writer.writes);
         let bytes = Arc::clone(&writer.bytes);
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(8);
 
         for stream_id in 1..=3 {
-            out_tx
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id,
-                        Bytes::copy_from_slice(&[stream_id as u8]),
-                    )
-                    .expect("data frame"),
+            queue_output_frame(
+                &out_tx,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id,
+                    Bytes::copy_from_slice(&[stream_id as u8]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(out_tx);
 
@@ -1091,20 +1129,19 @@ mod tests {
         let writes = Arc::clone(&writer.writes);
         let bytes = Arc::clone(&writer.bytes);
         let total_frames = AGENT_FRAME_WRITE_BURST + 1;
-        let (out_tx, out_rx) = mpsc::channel(total_frames);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(total_frames);
 
         for stream_id in 1..=total_frames {
-            out_tx
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id as u64,
-                        Bytes::copy_from_slice(&[stream_id as u8]),
-                    )
-                    .expect("data frame"),
+            queue_output_frame(
+                &out_tx,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id as u64,
+                    Bytes::copy_from_slice(&[stream_id as u8]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(out_tx);
 
@@ -1139,20 +1176,19 @@ mod tests {
         assert_eq!(frames_until_byte_cap, 4);
         assert!(frames_until_byte_cap < AGENT_FRAME_WRITE_BURST);
         let total_frames = frames_until_byte_cap + 1;
-        let (out_tx, out_rx) = mpsc::channel(total_frames);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(total_frames);
 
         for stream_id in 1..=total_frames {
-            out_tx
-                .send(
-                    AgentFrame::new(
-                        AgentFrameKind::Data,
-                        stream_id as u64,
-                        Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
-                    )
-                    .expect("data frame"),
+            queue_output_frame(
+                &out_tx,
+                AgentFrame::new(
+                    AgentFrameKind::Data,
+                    stream_id as u64,
+                    Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
                 )
-                .await
-                .expect("queue frame");
+                .expect("data frame"),
+            )
+            .await;
         }
         drop(out_tx);
 
@@ -1191,7 +1227,7 @@ mod tests {
     async fn agent_writer_prioritizes_control_frames_inside_burst() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(8);
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one"))
@@ -1204,7 +1240,7 @@ mod tests {
                 .expect("data frame"),
             AgentFrame::new(AgentFrameKind::Opened, 4, Bytes::new()).expect("opened frame"),
         ] {
-            out_tx.send(frame).await.expect("queue frame");
+            queue_output_frame(&out_tx, frame).await;
         }
         drop(out_tx);
 
@@ -1233,7 +1269,7 @@ mod tests {
     async fn agent_writer_round_robins_non_priority_frames_inside_burst() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(8);
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"one-a"))
@@ -1248,7 +1284,7 @@ mod tests {
                 .expect("data frame"),
             AgentFrame::new(AgentFrameKind::Eof, 1, Bytes::new()).expect("eof frame"),
         ] {
-            out_tx.send(frame).await.expect("queue frame");
+            queue_output_frame(&out_tx, frame).await;
         }
         drop(out_tx);
 
@@ -1278,7 +1314,7 @@ mod tests {
     async fn agent_writer_keeps_eof_after_preceding_data_inside_burst() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(8);
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"response"))
@@ -1288,7 +1324,7 @@ mod tests {
                 .expect("window frame")
                 .with_credit(32),
         ] {
-            out_tx.send(frame).await.expect("queue frame");
+            queue_output_frame(&out_tx, frame).await;
         }
         drop(out_tx);
 
@@ -1315,7 +1351,7 @@ mod tests {
     async fn agent_writer_keeps_hello_before_heartbeat_frames() {
         let writer = CountingWriter::default();
         let bytes = Arc::clone(&writer.bytes);
-        let (out_tx, out_rx) = mpsc::channel(8);
+        let (out_tx, out_rx) = AgentFrameWriteQueue::channel(8);
 
         for frame in [
             AgentFrame::new(AgentFrameKind::Hello, 0, AgentHello::current(1300).encode())
@@ -1324,7 +1360,7 @@ mod tests {
             AgentFrame::new(AgentFrameKind::Data, 1, Bytes::from_static(b"payload"))
                 .expect("data frame"),
         ] {
-            out_tx.send(frame).await.expect("queue frame");
+            queue_output_frame(&out_tx, frame).await;
         }
         drop(out_tx);
 
@@ -1349,7 +1385,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_receive_credit_batches_until_threshold() {
-        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = AgentFrameWriteQueue::channel(8);
         let mut receive_window = AgentCreditWindow::new();
         let chunk = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / 4;
 
@@ -1358,7 +1394,7 @@ mod tests {
                 .await
                 .expect("record receive credit below threshold");
             assert!(
-                out_rx.try_recv().is_err(),
+                output_queue_is_empty(&mut out_rx),
                 "receive credit below threshold should stay batched"
             );
         }
@@ -1367,7 +1403,7 @@ mod tests {
             .await
             .expect("record receive credit at threshold");
 
-        let window = out_rx.recv().await.expect("receive batched window");
+        let window = recv_output_frame(&mut out_rx).await;
         assert_eq!(window.kind, AgentFrameKind::Window);
         assert_eq!(window.stream_id, 7);
         assert_eq!(
@@ -1375,14 +1411,14 @@ mod tests {
             AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
         );
         assert!(
-            out_rx.try_recv().is_err(),
+            output_queue_is_empty(&mut out_rx),
             "batched receive credit should emit exactly one window"
         );
     }
 
     #[tokio::test]
     async fn runtime_receive_credit_grants_max_frame_immediately() {
-        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = AgentFrameWriteQueue::channel(8);
         let mut receive_window = AgentCreditWindow::new();
 
         record_receive_credit(
@@ -1394,7 +1430,7 @@ mod tests {
         .await
         .expect("record max-frame receive credit");
 
-        let window = out_rx.recv().await.expect("receive immediate window");
+        let window = recv_output_frame(&mut out_rx).await;
         assert_eq!(window.kind, AgentFrameKind::Window);
         assert_eq!(window.stream_id, 9);
         assert_eq!(
@@ -1402,21 +1438,21 @@ mod tests {
             AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
         );
         assert!(
-            out_rx.try_recv().is_err(),
+            output_queue_is_empty(&mut out_rx),
             "single max frame should emit exactly one window"
         );
     }
 
     #[tokio::test]
     async fn runtime_receive_credit_grows_after_sustained_window_consumption() {
-        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = AgentFrameWriteQueue::channel(8);
         let mut receive_window = AgentCreditWindow::new();
 
         record_receive_credit(&out_tx, 11, &mut receive_window, AGENT_STREAM_WINDOW_BYTES)
             .await
             .expect("record sustained receive credit");
 
-        let window = out_rx.recv().await.expect("receive growth window");
+        let window = recv_output_frame(&mut out_rx).await;
         assert_eq!(window.kind, AgentFrameKind::Window);
         assert_eq!(window.stream_id, 11);
         assert!(window.credit as usize > AGENT_STREAM_WINDOW_BYTES);
@@ -1465,10 +1501,12 @@ mod tests {
 
     #[tokio::test]
     async fn agent_output_send_times_out_when_queue_is_full() {
-        let (out_tx, _out_rx) = mpsc::channel(1);
-        out_tx
-            .try_send(AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap())
-            .expect("prefill agent output queue");
+        let (out_tx, _out_rx) = AgentFrameWriteQueue::channel(1);
+        queue_output_frame(
+            &out_tx,
+            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+        )
+        .await;
 
         let err = send_agent_frame_with_timeout(
             &out_tx,
@@ -1485,7 +1523,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_resets_tcp_stream_when_input_queue_is_full() {
-        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = AgentFrameWriteQueue::channel(4);
         let (done_tx, _done_rx) = mpsc::channel(4);
         let mut streams = HashMap::new();
         let (to_remote, _from_local) = mpsc::channel(1);
@@ -1518,10 +1556,9 @@ mod tests {
         .expect("full stream input queue should reset stream");
 
         assert!(streams.is_empty());
-        let reset = timeout(Duration::from_secs(1), out_rx.recv())
+        let reset = timeout(Duration::from_secs(1), recv_output_frame(&mut out_rx))
             .await
-            .expect("timed out waiting for reset")
-            .expect("reset frame");
+            .expect("timed out waiting for reset");
         assert_eq!(reset.kind, AgentFrameKind::Reset);
         assert_eq!(reset.stream_id, 7);
         assert!(
@@ -1542,7 +1579,7 @@ mod tests {
 
         let (from_local, remote_rx) = mpsc::channel(1);
         drop(from_local);
-        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (out_tx, _out_rx) = AgentFrameWriteQueue::channel(8);
         let output_credit = Arc::new(Semaphore::new(AGENT_STREAM_WINDOW_BYTES));
         let (done_tx, _done_rx) = mpsc::channel(1);
         done_tx.try_send(999).expect("prefill completion queue");
@@ -1595,7 +1632,7 @@ mod tests {
     #[tokio::test]
     async fn tcp_connect_timeout_is_reported_as_stream_reset() {
         let (_to_remote, from_local) = mpsc::channel(1);
-        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let (out_tx, mut out_rx) = AgentFrameWriteQueue::channel(4);
         run_tcp_connected_stream(
             9,
             Err(std::io::Error::new(
@@ -1610,7 +1647,7 @@ mod tests {
         )
         .await;
 
-        let frame = out_rx.recv().await.expect("reset frame");
+        let frame = recv_output_frame(&mut out_rx).await;
         assert_eq!(frame.kind, AgentFrameKind::Reset);
         assert_eq!(frame.stream_id, 9);
         let reason = String::from_utf8_lossy(&frame.payload);
@@ -1643,10 +1680,12 @@ mod tests {
             .try_send(AgentTcpInput::Eof)
             .expect("queue optimistic EOF");
 
-        let (out_tx, _out_rx) = mpsc::channel(1);
-        out_tx
-            .try_send(AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap())
-            .expect("prefill agent output queue");
+        let (out_tx, _out_rx) = AgentFrameWriteQueue::channel(1);
+        queue_output_frame(
+            &out_tx,
+            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+        )
+        .await;
         let task = tokio::spawn(run_tcp_connected_stream(
             7,
             Ok(client_stream),

@@ -13,7 +13,7 @@ mod stream;
 mod writer_metrics;
 mod writer_task;
 
-use crate::agent_io::AgentFrameWriteItem;
+use crate::agent_io::AgentFrameWriteQueue;
 use crate::agent_proto::{AgentFrame, AgentHello};
 
 use failure::{ensure_agent_ready, mark_agent_failed};
@@ -42,7 +42,7 @@ struct StreamEntry {
 
 #[derive(Clone, Debug)]
 pub struct AgentTransport {
-    outbound: mpsc::Sender<AgentFrameWriteItem>,
+    outbound: AgentFrameWriteQueue,
     streams: StreamMap,
     failure: FailureState,
     writer_metrics: WriterMetrics,

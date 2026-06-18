@@ -1,17 +1,16 @@
 use anyhow::{Context, Result};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
 
 use super::{mark_agent_failed, FailureState, StreamMap, WriterMetrics};
 use crate::agent_io::{
-    write_agent_frame_unflushed, AgentFrameBurstWriter, AgentFrameWriteItem,
+    write_agent_frame_unflushed, AgentFrameBurstWriter, AgentFrameWriteReceiver,
     AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
 };
 use crate::agent_proto::AgentFrame;
 
 pub(super) async fn write_agent_frames<W>(
     mut writer: W,
-    mut outbound_rx: mpsc::Receiver<AgentFrameWriteItem>,
+    mut outbound_rx: AgentFrameWriteReceiver,
     streams: StreamMap,
     failure: FailureState,
     writer_metrics: WriterMetrics,
@@ -25,17 +24,19 @@ pub(super) async fn write_agent_frames<W>(
         let mut burst_bytes = first.encoded_len();
         burst_items.push(first);
         for _ in 1..AGENT_FRAME_WRITE_BURST {
+            if let Some(item) = outbound_rx.try_recv_priority() {
+                burst_bytes = burst_bytes.saturating_add(item.encoded_len());
+                burst_items.push(item);
+                continue;
+            }
             if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
                 break;
             }
-            match outbound_rx.try_recv() {
-                Ok(item) => {
-                    burst_bytes = burst_bytes.saturating_add(item.encoded_len());
-                    burst_items.push(item);
-                }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
+            if let Some(item) = outbound_rx.try_recv_data() {
+                burst_bytes = burst_bytes.saturating_add(item.encoded_len());
+                burst_items.push(item);
+            } else {
+                break;
             }
         }
         writer_metrics.record_dequeued(&burst_items);

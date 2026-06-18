@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::sync::{mpsc, Semaphore};
 
 use super::{ensure_agent_ready, mark_agent_failed, FailureState, StreamMap, WriterMetrics};
-use crate::agent_io::AgentFrameWriteItem;
+use crate::agent_io::{AgentFrameWriteItem, AgentFrameWriteQueue};
 use crate::agent_proto::{AgentFrame, AgentFrameKind};
 use crate::agent_window::AgentCreditWindow;
 
@@ -14,7 +14,7 @@ pub(super) const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy)]
 pub(super) struct AgentFrameSendContext<'a> {
-    pub(super) outbound: &'a mpsc::Sender<AgentFrameWriteItem>,
+    pub(super) outbound: &'a AgentFrameWriteQueue,
     pub(super) streams: &'a StreamMap,
     pub(super) failure: &'a FailureState,
     pub(super) writer_metrics: &'a super::AgentWriterMetrics,
@@ -45,7 +45,7 @@ impl AgentStreamSendMetrics {
 #[derive(Debug)]
 pub struct AgentStream {
     pub(super) stream_id: u64,
-    pub(super) outbound: mpsc::Sender<AgentFrameWriteItem>,
+    pub(super) outbound: AgentFrameWriteQueue,
     pub(super) inbound: mpsc::Receiver<AgentFrame>,
     pub(super) streams: StreamMap,
     pub(super) failure: FailureState,
@@ -255,9 +255,9 @@ async fn send_agent_transport_frame_with_metrics(
 ) -> Result<()> {
     ensure_agent_ready(send.failure).await?;
     let outbound_started_at = Instant::now();
-    match tokio::time::timeout(timeout, send.outbound.clone().reserve_owned()).await {
+    let queued = AgentFrameWriteItem::new(frame)?;
+    match tokio::time::timeout(timeout, send.outbound.reserve_owned(&queued)).await {
         Ok(Ok(permit)) => {
-            let queued = AgentFrameWriteItem::new(frame)?;
             send.writer_metrics.record_enqueued(queued.encoded_len());
             permit.send(queued);
             metrics.record_outbound_wait(outbound_started_at);

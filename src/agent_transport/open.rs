@@ -78,10 +78,10 @@ impl AgentTransport {
     ) -> Result<AgentStream> {
         ensure_agent_ready(&self.failure).await?;
         let stream_id = self.allocate_stream_id()?;
-        let open_frame = AgentFrame::new(kind, stream_id, payload)?;
+        let queued_open = AgentFrameWriteItem::new(AgentFrame::new(kind, stream_id, payload)?)?;
         let outbound_permit = match tokio::time::timeout(
             open_timeout,
-            self.outbound.clone().reserve_owned(),
+            self.outbound.reserve_owned(&queued_open),
         )
         .await
         {
@@ -118,7 +118,6 @@ impl AgentTransport {
             return Err(err);
         }
 
-        let queued_open = AgentFrameWriteItem::new(open_frame)?;
         self.writer_metrics
             .record_enqueued(queued_open.encoded_len());
         outbound_permit.send(queued_open);
@@ -185,18 +184,40 @@ impl AgentTransport {
     ) -> Result<AgentStream> {
         ensure_agent_ready(&self.failure).await?;
         let stream_id = self.allocate_stream_id()?;
-        let open_frame = AgentFrame::new(kind, stream_id, payload)?;
         let initial_receive_credit = AgentCreditWindow::initial_credit();
         let initial_receive_window =
             AgentFrame::new(AgentFrameKind::Window, stream_id, Bytes::new())?
                 .with_credit(u32::try_from(initial_receive_credit)?);
-        let mut outbound_permits = match tokio::time::timeout(
+        let queued_open = AgentFrameWriteItem::new(AgentFrame::new(kind, stream_id, payload)?)?;
+        let queued_initial_receive_window = AgentFrameWriteItem::new(initial_receive_window)?;
+        let outbound_open_permit = match tokio::time::timeout(
             open_timeout,
-            self.outbound.reserve_many(2),
+            self.outbound.reserve_owned(&queued_open),
         )
         .await
         {
-            Ok(Ok(permits)) => permits,
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                let message = "agent writer task is closed".to_owned();
+                mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
+                return Err(anyhow!(message));
+            }
+            Err(_) => {
+                let message = format!(
+                    "timed out after {}ms waiting for agent outbound capacity to open stream {stream_id}",
+                    open_timeout.as_millis()
+                );
+                mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
+                return Err(anyhow!(message));
+            }
+        };
+        let outbound_window_permit = match tokio::time::timeout(
+            open_timeout,
+            self.outbound.reserve_owned(&queued_initial_receive_window),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
             Ok(Err(_)) => {
                 let message = "agent writer task is closed".to_owned();
                 mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
@@ -229,21 +250,12 @@ impl AgentTransport {
             return Err(err);
         }
 
-        let queued_open = AgentFrameWriteItem::new(open_frame)?;
-        let queued_initial_receive_window = AgentFrameWriteItem::new(initial_receive_window)?;
         self.writer_metrics
             .record_enqueued(queued_open.encoded_len());
         self.writer_metrics
             .record_enqueued(queued_initial_receive_window.encoded_len());
-        outbound_permits
-            .next()
-            .expect("open frame capacity was reserved")
-            .send(queued_open);
-        outbound_permits
-            .next()
-            .expect("initial receive window capacity was reserved")
-            .send(queued_initial_receive_window);
-        debug_assert!(outbound_permits.next().is_none());
+        outbound_open_permit.send(queued_open);
+        outbound_window_permit.send(queued_initial_receive_window);
 
         let stream = AgentStream {
             stream_id,

@@ -15,6 +15,19 @@ pub(crate) const AGENT_FRAME_WRITE_BURST: usize = 64;
 pub(crate) const AGENT_FRAME_WRITE_BURST_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
+pub(crate) struct AgentFrameWriteQueue {
+    priority_tx: mpsc::Sender<AgentFrameWriteItem>,
+    data_tx: mpsc::Sender<AgentFrameWriteItem>,
+}
+
+pub(crate) struct AgentFrameWriteReceiver {
+    priority_rx: mpsc::Receiver<AgentFrameWriteItem>,
+    data_rx: mpsc::Receiver<AgentFrameWriteItem>,
+    priority_closed: bool,
+    data_closed: bool,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct AgentFrameWriteItem {
     pub(crate) frame: AgentFrame,
     enqueued_at: Instant,
@@ -40,6 +53,107 @@ impl AgentFrameWriteItem {
             .checked_duration_since(self.enqueued_at)
             .unwrap_or_default()
             .as_micros()
+    }
+}
+
+impl AgentFrameWriteQueue {
+    pub(crate) fn channel(capacity: usize) -> (Self, AgentFrameWriteReceiver) {
+        let (priority_tx, priority_rx) = mpsc::channel(capacity);
+        let (data_tx, data_rx) = mpsc::channel(capacity);
+        (
+            Self {
+                priority_tx,
+                data_tx,
+            },
+            AgentFrameWriteReceiver {
+                priority_rx,
+                data_rx,
+                priority_closed: false,
+                data_closed: false,
+            },
+        )
+    }
+
+    pub(crate) async fn reserve_owned(
+        &self,
+        item: &AgentFrameWriteItem,
+    ) -> Result<mpsc::OwnedPermit<AgentFrameWriteItem>, mpsc::error::SendError<()>> {
+        self.sender_for(&item.frame).clone().reserve_owned().await
+    }
+
+    fn sender_for(&self, frame: &AgentFrame) -> &mpsc::Sender<AgentFrameWriteItem> {
+        if frame.kind.is_priority_control() {
+            &self.priority_tx
+        } else {
+            &self.data_tx
+        }
+    }
+}
+
+impl AgentFrameWriteReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<AgentFrameWriteItem> {
+        loop {
+            if let Some(item) = self.try_recv_priority() {
+                return Some(item);
+            }
+
+            match (self.priority_closed, self.data_closed) {
+                (true, true) => return None,
+                (true, false) => return self.data_rx.recv().await,
+                (false, true) => {
+                    let item = self.priority_rx.recv().await;
+                    if item.is_none() {
+                        self.priority_closed = true;
+                    }
+                    return item;
+                }
+                (false, false) => {}
+            }
+
+            tokio::select! {
+                biased;
+                priority = self.priority_rx.recv() => {
+                    match priority {
+                        Some(item) => return Some(item),
+                        None => self.priority_closed = true,
+                    }
+                }
+                data = self.data_rx.recv() => {
+                    match data {
+                        Some(item) => return Some(item),
+                        None => self.data_closed = true,
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn try_recv_priority(&mut self) -> Option<AgentFrameWriteItem> {
+        if self.priority_closed {
+            return None;
+        }
+        match self.priority_rx.try_recv() {
+            Ok(item) => Some(item),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.priority_closed = true;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn try_recv_data(&mut self) -> Option<AgentFrameWriteItem> {
+        if self.data_closed {
+            return None;
+        }
+        match self.data_rx.try_recv() {
+            Ok(item) => Some(item),
+            Err(mpsc::error::TryRecvError::Empty) => None,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                self.data_closed = true;
+                None
+            }
+        }
     }
 }
 
@@ -125,36 +239,6 @@ impl AgentFrameBurstWriter {
             frames: Vec::with_capacity(AGENT_FRAME_WRITE_BURST),
             encoded: BytesMut::new(),
         }
-    }
-
-    pub(crate) async fn write_burst<W>(
-        &mut self,
-        writer: &mut W,
-        first: AgentFrame,
-        rx: &mut mpsc::Receiver<AgentFrame>,
-    ) -> Result<()>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        self.frames.clear();
-        self.frames.push(first);
-        let mut burst_bytes =
-            encoded_frame_len(self.frames.first().expect("burst has first frame"))?;
-        for _ in 1..AGENT_FRAME_WRITE_BURST {
-            if burst_bytes >= AGENT_FRAME_WRITE_BURST_BYTES {
-                break;
-            }
-            match rx.try_recv() {
-                Ok(frame) => {
-                    burst_bytes = burst_bytes.saturating_add(encoded_frame_len(&frame)?);
-                    self.frames.push(frame);
-                }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-        self.write_frames(writer).await.map(|_| ())
     }
 
     pub(crate) async fn write_items<W>(

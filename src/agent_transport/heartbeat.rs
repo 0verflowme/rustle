@@ -1,13 +1,12 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::mpsc;
 
 use super::{
     ensure_agent_ready, mark_agent_failed, send_agent_transport_frame, AgentFrameSendContext,
     FailureState, HeartbeatState, StreamMap, WriterMetrics, AGENT_FRAME_SEND_TIMEOUT,
 };
-use crate::agent_io::AgentFrameWriteItem;
+use crate::agent_io::AgentFrameWriteQueue;
 use crate::agent_proto::{AgentFrame, AgentFrameKind};
 
 const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -31,7 +30,7 @@ impl AgentHeartbeat {
 }
 
 pub(super) async fn run_agent_heartbeat(
-    outbound: mpsc::Sender<AgentFrameWriteItem>,
+    outbound: AgentFrameWriteQueue,
     streams: StreamMap,
     failure: FailureState,
     writer_metrics: WriterMetrics,

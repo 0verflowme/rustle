@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::Mutex;
 
 use super::{
     read_agent_frames, run_agent_heartbeat, write_agent_frame, write_agent_frames, AgentHeartbeat,
     AgentHeartbeatGuard, AgentTransport,
 };
-use crate::agent_io::AgentFrameReader;
+use crate::agent_io::{AgentFrameReader, AgentFrameWriteQueue};
 use crate::agent_proto::{
     AgentFrame, AgentFrameKind, AgentHello, AGENT_PROTOCOL_VERSION, CAP_FLOW_CONTROL, CAP_HEARTBEAT,
 };
@@ -54,7 +54,7 @@ impl AgentTransport {
             bail!("agent advertised zero max frame payload");
         }
 
-        let (outbound, outbound_rx) = mpsc::channel(AGENT_OUTBOUND_FRAMES);
+        let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(AGENT_OUTBOUND_FRAMES);
         let streams = Arc::new(Mutex::new(HashMap::new()));
         let failure = Arc::new(Mutex::new(None));
         let writer_metrics = Arc::new(super::AgentWriterMetrics::default());

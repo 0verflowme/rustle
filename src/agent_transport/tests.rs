@@ -12,7 +12,10 @@ use tokio::time::timeout;
 
 use super::failure::{truncate_reset_message, AGENT_STREAM_RESET_BYTES};
 use super::*;
-use crate::agent_io::{AgentFrameReader, AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES};
+use crate::agent_io::{
+    AgentFrameReader, AgentFrameWriteItem, AgentFrameWriteQueue, AgentFrameWriteReceiver,
+    AGENT_FRAME_WRITE_BURST, AGENT_FRAME_WRITE_BURST_BYTES,
+};
 use crate::agent_proto::{
     try_decode_frame, AgentFrame, AgentFrameKind, AgentOpenHost, AgentOpenIpv4,
     AGENT_FRAME_HEADER_LEN, AGENT_MAX_FRAME_PAYLOAD, AGENT_PROTOCOL_VERSION, CAP_TCP_CONNECT_HOST,
@@ -72,7 +75,7 @@ impl AsyncWrite for CountingWriter {
 
 fn test_agent_stream(
     stream_id: u64,
-    outbound: mpsc::Sender<AgentFrameWriteItem>,
+    outbound: AgentFrameWriteQueue,
     inbound: mpsc::Receiver<AgentFrame>,
 ) -> AgentStream {
     AgentStream {
@@ -99,14 +102,28 @@ fn queued_writer_item(
 }
 
 async fn queue_writer_frame(
-    outbound: &mpsc::Sender<AgentFrameWriteItem>,
+    outbound: &AgentFrameWriteQueue,
     writer_metrics: &AgentWriterMetrics,
     frame: AgentFrame,
 ) {
-    outbound
-        .send(queued_writer_item(writer_metrics, frame))
+    let item = queued_writer_item(writer_metrics, frame);
+    let permit = outbound
+        .reserve_owned(&item)
         .await
-        .expect("queue frame");
+        .expect("queue frame capacity");
+    permit.send(item);
+}
+
+async fn recv_writer_frame(outbound_rx: &mut AgentFrameWriteReceiver) -> AgentFrame {
+    outbound_rx
+        .recv()
+        .await
+        .expect("receive queued writer frame")
+        .frame
+}
+
+fn writer_queue_is_empty(outbound_rx: &mut AgentFrameWriteReceiver) -> bool {
+    outbound_rx.try_recv_priority().is_none() && outbound_rx.try_recv_data().is_none()
 }
 
 #[tokio::test]
@@ -115,7 +132,7 @@ async fn transport_writer_flushes_once_per_queued_burst() {
     let flushes = Arc::clone(&writer.flushes);
     let writes = Arc::clone(&writer.writes);
     let bytes = Arc::clone(&writer.bytes);
-    let (outbound, outbound_rx) = mpsc::channel(8);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(8);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -177,7 +194,7 @@ async fn transport_writer_clears_reused_buffers_between_bursts() {
     let writes = Arc::clone(&writer.writes);
     let bytes = Arc::clone(&writer.bytes);
     let total_frames = AGENT_FRAME_WRITE_BURST + 1;
-    let (outbound, outbound_rx) = mpsc::channel(total_frames);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(total_frames);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -234,7 +251,7 @@ async fn transport_writer_caps_large_data_burst_by_encoded_bytes() {
     assert_eq!(frames_until_byte_cap, 4);
     assert!(frames_until_byte_cap < AGENT_FRAME_WRITE_BURST);
     let total_frames = frames_until_byte_cap + 1;
-    let (outbound, outbound_rx) = mpsc::channel(total_frames);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(total_frames);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -272,7 +289,7 @@ async fn transport_writer_caps_large_data_burst_by_encoded_bytes() {
 async fn transport_writer_prioritizes_control_frames_inside_burst() {
     let writer = CountingWriter::default();
     let bytes = Arc::clone(&writer.bytes);
-    let (outbound, outbound_rx) = mpsc::channel(8);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(8);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -320,10 +337,60 @@ async fn transport_writer_prioritizes_control_frames_inside_burst() {
 }
 
 #[tokio::test]
+async fn transport_writer_prioritizes_control_frames_across_queued_data_backlog() {
+    let writer = CountingWriter::default();
+    let bytes = Arc::clone(&writer.bytes);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(AGENT_FRAME_WRITE_BURST + 1);
+    let streams = Arc::new(Mutex::new(HashMap::new()));
+    let failure = Arc::new(Mutex::new(None));
+    let writer_metrics = Arc::new(AgentWriterMetrics::default());
+
+    for stream_id in 1..=AGENT_FRAME_WRITE_BURST {
+        queue_writer_frame(
+            &outbound,
+            &writer_metrics,
+            AgentFrame::new(
+                AgentFrameKind::Data,
+                stream_id as u64,
+                Bytes::copy_from_slice(&[stream_id as u8]),
+            )
+            .expect("data frame"),
+        )
+        .await;
+    }
+    queue_writer_frame(
+        &outbound,
+        &writer_metrics,
+        AgentFrame::new(AgentFrameKind::Window, 99, Bytes::new())
+            .expect("window frame")
+            .with_credit(32),
+    )
+    .await;
+    drop(outbound);
+
+    write_agent_frames(
+        writer,
+        outbound_rx,
+        streams,
+        Arc::clone(&failure),
+        Arc::clone(&writer_metrics),
+    )
+    .await;
+
+    let mut encoded = BytesMut::from(bytes.lock().expect("counting writer lock").as_slice());
+    let first = try_decode_frame(&mut encoded)
+        .expect("decode written frame")
+        .expect("first frame");
+    assert_eq!(first.kind, AgentFrameKind::Window);
+    assert_eq!(first.stream_id, 99);
+    assert!(failure.lock().await.is_none());
+}
+
+#[tokio::test]
 async fn transport_writer_round_robins_non_priority_frames_inside_burst() {
     let writer = CountingWriter::default();
     let bytes = Arc::clone(&writer.bytes);
-    let (outbound, outbound_rx) = mpsc::channel(8);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(8);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -375,7 +442,7 @@ async fn transport_writer_round_robins_non_priority_frames_inside_burst() {
 async fn transport_writer_keeps_eof_after_preceding_data_inside_burst() {
     let writer = CountingWriter::default();
     let bytes = Arc::clone(&writer.bytes);
-    let (outbound, outbound_rx) = mpsc::channel(8);
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(8);
     let streams = Arc::new(Mutex::new(HashMap::new()));
     let failure = Arc::new(Mutex::new(None));
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
@@ -633,7 +700,7 @@ async fn transport_opens_tcp_host_stream_and_relays_bytes() {
 
 #[tokio::test]
 async fn transport_rejects_tcp_host_when_peer_lacks_capability() {
-    let (outbound, _outbound_rx) = mpsc::channel(1);
+    let (outbound, _outbound_rx) = AgentFrameWriteQueue::channel(1);
     let mut peer = AgentHello::current(1300);
     peer.capabilities &= !CAP_TCP_CONNECT_HOST;
     let transport = AgentTransport {
@@ -1018,7 +1085,7 @@ async fn optimistic_open_sends_first_data_before_opened() {
 
 #[tokio::test]
 async fn stream_recv_batches_receive_credit_until_threshold() {
-    let (outbound, mut outbound_rx) = mpsc::channel(8);
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
     let (inbound_tx, inbound) = mpsc::channel(8);
     let mut stream = test_agent_stream(7, outbound, inbound);
     let chunk = AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES / 4;
@@ -1034,7 +1101,7 @@ async fn stream_recv_batches_receive_credit_until_threshold() {
         let frame = stream.recv().await.expect("receive data frame");
         assert_eq!(frame.kind, AgentFrameKind::Data);
         assert!(
-            outbound_rx.try_recv().is_err(),
+            writer_queue_is_empty(&mut outbound_rx),
             "receive credit below threshold should stay batched"
         );
     }
@@ -1049,11 +1116,7 @@ async fn stream_recv_batches_receive_credit_until_threshold() {
     let frame = stream.recv().await.expect("receive threshold data frame");
     assert_eq!(frame.kind, AgentFrameKind::Data);
 
-    let window = outbound_rx
-        .recv()
-        .await
-        .expect("receive batched window")
-        .frame;
+    let window = recv_writer_frame(&mut outbound_rx).await;
     assert_eq!(window.kind, AgentFrameKind::Window);
     assert_eq!(window.stream_id, 7);
     assert_eq!(
@@ -1061,14 +1124,14 @@ async fn stream_recv_batches_receive_credit_until_threshold() {
         AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
     );
     assert!(
-        outbound_rx.try_recv().is_err(),
+        writer_queue_is_empty(&mut outbound_rx),
         "batched credit should emit exactly one window"
     );
 }
 
 #[tokio::test]
 async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
-    let (outbound, mut outbound_rx) = mpsc::channel(8);
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
     let (inbound_tx, inbound) = mpsc::channel(8);
     let mut stream = test_agent_stream(9, outbound, inbound);
     let max_frame = AGENT_MAX_FRAME_PAYLOAD;
@@ -1086,17 +1149,13 @@ async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
         assert_eq!(frame.kind, AgentFrameKind::Data);
         if index + 1 < frames_to_threshold {
             assert!(
-                outbound_rx.try_recv().is_err(),
+                writer_queue_is_empty(&mut outbound_rx),
                 "max frames below threshold should stay batched"
             );
         }
     }
 
-    let window = outbound_rx
-        .recv()
-        .await
-        .expect("receive immediate window")
-        .frame;
+    let window = recv_writer_frame(&mut outbound_rx).await;
     assert_eq!(window.kind, AgentFrameKind::Window);
     assert_eq!(window.stream_id, 9);
     assert_eq!(
@@ -1104,14 +1163,14 @@ async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
         AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES
     );
     assert!(
-        outbound_rx.try_recv().is_err(),
+        writer_queue_is_empty(&mut outbound_rx),
         "single max frame should emit exactly one window"
     );
 }
 
 #[tokio::test]
 async fn stream_recv_grows_receive_window_after_sustained_consumption() {
-    let (outbound, mut outbound_rx) = mpsc::channel(8);
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
     let (inbound_tx, inbound) = mpsc::channel(8);
     let mut stream = test_agent_stream(11, outbound, inbound);
     let frames_to_window = AGENT_STREAM_WINDOW_BYTES / AGENT_MAX_FRAME_PAYLOAD;
@@ -1131,7 +1190,7 @@ async fn stream_recv_grows_receive_window_after_sustained_consumption() {
             .expect("queue max-frame data");
         let frame = stream.recv().await.expect("receive max-frame data");
         assert_eq!(frame.kind, AgentFrameKind::Data);
-        while let Ok(window) = outbound_rx.try_recv() {
+        while let Some(window) = outbound_rx.try_recv_priority() {
             let window = window.frame;
             assert_eq!(window.kind, AgentFrameKind::Window);
             assert_eq!(window.stream_id, 11);
@@ -1425,14 +1484,14 @@ async fn open_timeout_unregisters_pending_stream() {
 
 #[tokio::test]
 async fn open_timeout_when_outbound_queue_is_full() {
-    let (outbound, _outbound_rx) = mpsc::channel(1);
+    let (outbound, _outbound_rx) = AgentFrameWriteQueue::channel(1);
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
-    outbound
-        .try_send(queued_writer_item(
-            &writer_metrics,
-            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
-        ))
-        .expect("prefill outbound queue");
+    queue_writer_frame(
+        &outbound,
+        &writer_metrics,
+        AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+    )
+    .await;
     let streams = std::sync::Arc::new(Mutex::new(HashMap::new()));
     let failure = std::sync::Arc::new(Mutex::new(None));
     let transport = AgentTransport {
@@ -1472,14 +1531,14 @@ async fn open_timeout_when_outbound_queue_is_full() {
 
 #[tokio::test]
 async fn stream_send_timeout_marks_transport_failed_without_blocking_reset() {
-    let (outbound, _outbound_rx) = mpsc::channel(1);
+    let (outbound, _outbound_rx) = AgentFrameWriteQueue::channel(1);
     let writer_metrics = Arc::new(AgentWriterMetrics::default());
-    outbound
-        .try_send(queued_writer_item(
-            &writer_metrics,
-            AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
-        ))
-        .expect("prefill outbound queue");
+    queue_writer_frame(
+        &outbound,
+        &writer_metrics,
+        AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap(),
+    )
+    .await;
     let streams = std::sync::Arc::new(Mutex::new(HashMap::new()));
     let failure = std::sync::Arc::new(Mutex::new(None));
     let blocked_credit = std::sync::Arc::new(Semaphore::new(0));
