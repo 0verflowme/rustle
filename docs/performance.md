@@ -581,10 +581,10 @@ helper bootstrap before interpreting any tunnel latency result. If startup is
 `body_drain`, or queue waits, the remaining problem is in the data path rather
 than helper bootstrap.
 
-Use a fixture host address that is distinct from the SSH control host. The live
-fixture wrapper rejects a fixture IP that resolves to the same address as the
-SSH target because Rustle installs a control-route guard for the SSH host, and
-benchmark traffic to that same IP can bypass the tunnel. Set
+Use a fixture host address that is distinct from Rustle's SSH control remote.
+The live fixture wrapper rejects a fixture IP that resolves to the same address
+as the Rustle control target because Rustle installs a control-route guard for
+that SSH host, and benchmark traffic to that same IP can bypass the tunnel. Set
 `RUSTLE_FIXTURE_ALLOW_CONTROL_HOST=1` only for an explicitly non-tunnel control
 experiment.
 

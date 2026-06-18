@@ -131,6 +131,23 @@ if [[ -n "$SSH_PASSWORD_VALUE" ]]; then
 fi
 SSH_CMD+=("$SSH_REMOTE")
 
+ssh_remote_lookup_host() {
+  local remote="$1"
+  remote="${remote#*@}"
+  case "$remote" in
+    \[*\]:*)
+      remote="${remote#\[}"
+      printf '%s\n' "${remote%%\]*}"
+      ;;
+    *:*)
+      printf '%s\n' "${remote%%:*}"
+      ;;
+    *)
+      printf '%s\n' "$remote"
+      ;;
+  esac
+}
+
 ssh_config_hostname() {
   local remote="$1"
   local ssh_g_args=(ssh -G)
@@ -169,9 +186,14 @@ PY
 reject_fixture_control_host() {
   [[ "$ALLOW_CONTROL_HOST" == "0" ]] || return 0
 
+  local rustle_control_info
+  local rustle_control_remote
+  rustle_control_info="$(parse_ssh_remote "$REMOTE")"
+  rustle_control_remote="$(printf '%s\n' "$rustle_control_info" | sed -n '1p')"
+
   local control_host
-  control_host="$(ssh_config_hostname "$SSH_REMOTE")"
-  [[ -n "$control_host" ]] || control_host="$SSH_REMOTE"
+  control_host="$(ssh_config_hostname "$rustle_control_remote")"
+  [[ -n "$control_host" ]] || control_host="$(ssh_remote_lookup_host "$rustle_control_remote")"
 
   local control_ips
   local fixture_ips
