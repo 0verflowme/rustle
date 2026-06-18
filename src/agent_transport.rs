@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 mod failure;
 mod heartbeat;
 mod reader_task;
+mod stream;
 mod writer_metrics;
 mod writer_task;
 
@@ -28,6 +29,9 @@ use heartbeat::{run_agent_heartbeat, AgentHeartbeat};
 #[cfg(test)]
 use reader_task::dispatch_agent_frame;
 use reader_task::read_agent_frames;
+pub use stream::AgentStream;
+pub(crate) use stream::AgentStreamSendMetrics;
+use stream::{send_agent_transport_frame, AgentFrameSendContext, AGENT_FRAME_SEND_TIMEOUT};
 use writer_metrics::AgentWriterMetrics;
 pub(crate) use writer_metrics::AgentWriterSnapshot;
 use writer_task::{write_agent_frame, write_agent_frames};
@@ -35,7 +39,6 @@ use writer_task::{write_agent_frame, write_agent_frames};
 const AGENT_OUTBOUND_FRAMES: usize = 1024;
 const AGENT_INBOUND_FRAMES_PER_STREAM: usize = 128;
 const AGENT_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(15);
-const AGENT_FRAME_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const _: () = assert!(
     AGENT_STREAM_MAX_WINDOW_BYTES <= AGENT_INBOUND_FRAMES_PER_STREAM * AGENT_MAX_FRAME_PAYLOAD
 );
@@ -44,36 +47,6 @@ type StreamMap = Arc<Mutex<HashMap<u64, StreamEntry>>>;
 type FailureState = Arc<Mutex<Option<String>>>;
 type HeartbeatState = Arc<Mutex<AgentHeartbeat>>;
 type WriterMetrics = Arc<AgentWriterMetrics>;
-
-#[derive(Clone, Copy)]
-struct AgentFrameSendContext<'a> {
-    outbound: &'a mpsc::Sender<AgentFrameWriteItem>,
-    streams: &'a StreamMap,
-    failure: &'a FailureState,
-    writer_metrics: &'a AgentWriterMetrics,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentStreamSendMetrics {
-    pub(crate) credit_wait_us: u128,
-    pub(crate) outbound_wait_us: u128,
-    pub(crate) frames: u64,
-}
-
-impl AgentStreamSendMetrics {
-    fn record_credit_wait(&mut self, started_at: Instant) {
-        self.credit_wait_us = self
-            .credit_wait_us
-            .saturating_add(started_at.elapsed().as_micros());
-    }
-
-    fn record_outbound_wait(&mut self, started_at: Instant) {
-        self.outbound_wait_us = self
-            .outbound_wait_us
-            .saturating_add(started_at.elapsed().as_micros());
-        self.frames = self.frames.saturating_add(1);
-    }
-}
 
 #[derive(Clone, Debug)]
 struct StreamEntry {
@@ -443,241 +416,6 @@ impl AgentTransport {
     }
 }
 
-#[derive(Debug)]
-pub struct AgentStream {
-    stream_id: u64,
-    outbound: mpsc::Sender<AgentFrameWriteItem>,
-    inbound: mpsc::Receiver<AgentFrame>,
-    streams: StreamMap,
-    failure: FailureState,
-    writer_metrics: WriterMetrics,
-    send_credit: Arc<Semaphore>,
-    max_frame_payload: usize,
-    receive_window: AgentCreditWindow,
-    initial_receive_credit_granted: bool,
-}
-
-impl AgentStream {
-    pub fn stream_id(&self) -> u64 {
-        self.stream_id
-    }
-
-    pub async fn transport_failure_message(&self) -> Option<String> {
-        self.failure.lock().await.clone()
-    }
-
-    fn send_context(&self) -> AgentFrameSendContext<'_> {
-        AgentFrameSendContext {
-            outbound: &self.outbound,
-            streams: &self.streams,
-            failure: &self.failure,
-            writer_metrics: &self.writer_metrics,
-        }
-    }
-
-    pub async fn send_data(&self, bytes: impl Into<Bytes>) -> Result<()> {
-        self.send_data_with_metrics(bytes).await.map(|_| ())
-    }
-
-    pub(crate) async fn send_data_with_metrics(
-        &self,
-        bytes: impl Into<Bytes>,
-    ) -> Result<AgentStreamSendMetrics> {
-        let mut metrics = AgentStreamSendMetrics::default();
-        let bytes = bytes.into();
-        if bytes.is_empty() {
-            self.send_data_frame(bytes, &mut metrics).await?;
-            return Ok(metrics);
-        }
-
-        let mut offset = 0;
-        while offset < bytes.len() {
-            let end = offset
-                .saturating_add(self.max_frame_payload)
-                .min(bytes.len());
-            self.send_data_frame(bytes.slice(offset..end), &mut metrics)
-                .await?;
-            offset = end;
-        }
-        Ok(metrics)
-    }
-
-    async fn send_data_frame(
-        &self,
-        bytes: Bytes,
-        metrics: &mut AgentStreamSendMetrics,
-    ) -> Result<()> {
-        ensure_agent_ready(&self.failure).await?;
-        let frame = AgentFrame::new(AgentFrameKind::Data, self.stream_id, bytes)?;
-        let credit_started_at = Instant::now();
-        let permits = if frame.payload.is_empty() {
-            None
-        } else {
-            Some(
-                self.send_credit
-                    .clone()
-                    .acquire_many_owned(frame.payload.len() as u32)
-                    .await
-                    .context("agent stream send window is closed")?,
-            )
-        };
-        if permits.is_some() {
-            metrics.record_credit_wait(credit_started_at);
-        }
-        self.send_frame_with_metrics(frame, metrics).await?;
-        if let Some(permits) = permits {
-            permits.forget();
-        }
-        Ok(())
-    }
-
-    pub async fn send_eof(&self) -> Result<()> {
-        self.send_frame(AgentFrame::new(
-            AgentFrameKind::Eof,
-            self.stream_id,
-            Bytes::new(),
-        )?)
-        .await
-    }
-
-    pub async fn recv(&mut self) -> Option<AgentFrame> {
-        let frame = self.inbound.recv().await?;
-        match frame.kind {
-            AgentFrameKind::Opened => {
-                if !self.initial_receive_credit_granted {
-                    if self
-                        .grant_receive_credit(AgentCreditWindow::initial_credit())
-                        .await
-                        .is_err()
-                    {
-                        return None;
-                    }
-                    self.initial_receive_credit_granted = true;
-                }
-            }
-            AgentFrameKind::Data if !frame.payload.is_empty() => {
-                if self
-                    .record_received_data_credit(frame.payload.len())
-                    .await
-                    .is_err()
-                {
-                    return None;
-                }
-            }
-            AgentFrameKind::Close | AgentFrameKind::Reset => {
-                self.close_credit_and_unregister().await;
-            }
-            _ => {}
-        }
-        Some(frame)
-    }
-
-    pub async fn close(self) -> Result<()> {
-        let frame = AgentFrame::new(AgentFrameKind::Close, self.stream_id, Bytes::new())?;
-        self.close_credit_and_unregister().await;
-        send_agent_transport_frame(
-            self.send_context(),
-            frame,
-            AGENT_FRAME_SEND_TIMEOUT,
-            "agent close frame",
-        )
-        .await
-    }
-
-    async fn send_frame(&self, frame: AgentFrame) -> Result<()> {
-        self.send_frame_with_timeout(frame, AGENT_FRAME_SEND_TIMEOUT)
-            .await
-    }
-
-    async fn send_frame_with_timeout(&self, frame: AgentFrame, timeout: Duration) -> Result<()> {
-        send_agent_transport_frame(self.send_context(), frame, timeout, "agent stream frame").await
-    }
-
-    async fn send_frame_with_metrics(
-        &self,
-        frame: AgentFrame,
-        metrics: &mut AgentStreamSendMetrics,
-    ) -> Result<()> {
-        send_agent_transport_frame_with_metrics(
-            self.send_context(),
-            frame,
-            AGENT_FRAME_SEND_TIMEOUT,
-            "agent stream frame",
-            metrics,
-        )
-        .await
-    }
-
-    async fn record_received_data_credit(&mut self, bytes: usize) -> Result<()> {
-        if let Some(credit) = self.receive_window.record_consumed(bytes) {
-            self.grant_receive_credit(credit).await?;
-        }
-        Ok(())
-    }
-
-    async fn grant_receive_credit(&self, bytes: usize) -> Result<()> {
-        if bytes == 0 {
-            return Ok(());
-        }
-        let credit = u32::try_from(bytes).context("agent receive credit exceeds u32")?;
-        self.send_frame(
-            AgentFrame::new(AgentFrameKind::Window, self.stream_id, Bytes::new())?
-                .with_credit(credit),
-        )
-        .await
-    }
-
-    async fn close_credit_and_unregister(&self) {
-        self.send_credit.close();
-        self.streams.lock().await.remove(&self.stream_id);
-    }
-}
-
-async fn send_agent_transport_frame(
-    send: AgentFrameSendContext<'_>,
-    frame: AgentFrame,
-    timeout: Duration,
-    context: &str,
-) -> Result<()> {
-    let mut metrics = AgentStreamSendMetrics::default();
-    send_agent_transport_frame_with_metrics(send, frame, timeout, context, &mut metrics).await
-}
-
-async fn send_agent_transport_frame_with_metrics(
-    send: AgentFrameSendContext<'_>,
-    frame: AgentFrame,
-    timeout: Duration,
-    context: &str,
-    metrics: &mut AgentStreamSendMetrics,
-) -> Result<()> {
-    ensure_agent_ready(send.failure).await?;
-    let outbound_started_at = Instant::now();
-    match tokio::time::timeout(timeout, send.outbound.clone().reserve_owned()).await {
-        Ok(Ok(permit)) => {
-            let queued = AgentFrameWriteItem::new(frame)?;
-            send.writer_metrics.record_enqueued(queued.encoded_len());
-            permit.send(queued);
-            metrics.record_outbound_wait(outbound_started_at);
-            Ok(())
-        }
-        Ok(Err(_)) => {
-            metrics.record_outbound_wait(outbound_started_at);
-            let message = "agent writer task is closed".to_owned();
-            mark_agent_failed(send.failure, send.streams, message.clone()).await;
-            Err(anyhow!(message))
-        }
-        Err(_) => {
-            metrics.record_outbound_wait(outbound_started_at);
-            let message = format!(
-                "timed out after {}ms enqueueing {context}",
-                timeout.as_millis()
-            );
-            mark_agent_failed(send.failure, send.streams, message.clone()).await;
-            Err(anyhow!(message))
-        }
-    }
-}
-
 #[cfg(test)]
 async fn read_agent_frame<R>(reader: &mut R, inbound: &mut bytes::BytesMut) -> Result<AgentFrame>
 where
@@ -701,7 +439,7 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context as TaskContext, Poll};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use bytes::BytesMut;
     use tokio::io::{duplex, split, AsyncReadExt, AsyncWrite, AsyncWriteExt};
