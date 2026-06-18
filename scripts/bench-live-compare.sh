@@ -43,6 +43,7 @@ LIVE_MIN_THROUGHPUT_MIB_S="${RUSTLE_BENCH_LIVE_MIN_THROUGHPUT_MIB_S:-}"
 EXPECT_BYTES="${RUSTLE_BENCH_EXPECT_BYTES:-${RUSTLE_LIVE_EXPECT_BYTES:-}}"
 ALLOW_FAILED_TOOLS="${RUSTLE_BENCH_ALLOW_FAILED_TOOLS:-}"
 ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
+REQUIRE_AUTO_QUIC_FALLBACK="${RUSTLE_BENCH_REQUIRE_AUTO_QUIC_FALLBACK:-0}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$TARGET_CIDR" ]] || smoke_die "set RUSTLE_BENCH_TARGET_CIDR, for example 192.168.0.0/16"
@@ -163,6 +164,23 @@ for transport in $RUSTLE_TRANSPORTS; do
     *) smoke_die "RUSTLE_BENCH_RUSTLE_TRANSPORTS entries must be auto-quic, direct-tcpip, agent, quic-agent, or quic-native" ;;
   esac
 done
+case "$REQUIRE_AUTO_QUIC_FALLBACK" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_BENCH_REQUIRE_AUTO_QUIC_FALLBACK must be 0 or 1" ;;
+esac
+if [[ "$REQUIRE_AUTO_QUIC_FALLBACK" == "1" ]]; then
+  case " $RUSTLE_TRANSPORTS " in
+    *" auto-quic "* ) ;;
+    *) smoke_die "include auto-quic in RUSTLE_BENCH_RUSTLE_TRANSPORTS when requiring auto-quic fallback evidence" ;;
+  esac
+fi
+if [[ -n "${RUSTLE_BENCH_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" ]]; then
+  case " $RUSTLE_TRANSPORTS " in
+    *" auto-quic "*)
+      smoke_die "auto-quic needs distinct quic-bridge-agent and agent helper commands; use RUSTLE_BENCH_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH or sidecar upload instead of RUSTLE_BENCH_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND"
+      ;;
+  esac
+fi
 if [[ -n "$MIN_QUIC_NATIVE_AGENT_RATIO" || -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then
   case " $RUSTLE_TRANSPORTS " in
     *" agent "* ) ;;
@@ -513,6 +531,21 @@ ssh_config_path_for_tool() {
   fi
 }
 
+rustle_ssh_config_path() {
+  ssh_config_path_for_tool
+}
+
+rustle_known_hosts_path() {
+  local explicit="${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}"
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return 0
+  fi
+  if [[ -n "${HOME:-}" && -f "${HOME}/.ssh/known_hosts" ]]; then
+    printf '%s\n' "${HOME}/.ssh/known_hosts"
+  fi
+}
+
 sshuttle_ssh_config_path() {
   local explicit="${RUSTLE_BENCH_SSHUTTLE_SSH_CONFIG:-}"
   if [[ -n "$explicit" ]]; then
@@ -596,6 +629,8 @@ start_rustle() {
   local password_file=""
   local cmd_env=()
   local cmd=("$RUSTLE_BIN_RESOLVED" -r "$REMOTE")
+  local ssh_config_path
+  local known_hosts_path
 
   if [[ -n "${RUSTLE_HOTPATH_TRACE:-}" ]]; then
     cmd_env+=(RUSTLE_HOTPATH_TRACE="$RUSTLE_HOTPATH_TRACE")
@@ -606,11 +641,13 @@ start_rustle() {
   if [[ -n "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}" ]]; then
     cmd+=(-i "${RUSTLE_BENCH_IDENTITY:-${RUSTLE_LIVE_IDENTITY:-}}")
   fi
-  if [[ -n "${RUSTLE_BENCH_SSH_CONFIG:-${RUSTLE_LIVE_SSH_CONFIG:-}}" ]]; then
-    cmd+=(--ssh-config "${RUSTLE_BENCH_SSH_CONFIG:-${RUSTLE_LIVE_SSH_CONFIG:-}}")
+  ssh_config_path="$(rustle_ssh_config_path)"
+  if [[ -n "$ssh_config_path" ]]; then
+    cmd+=(--ssh-config "$ssh_config_path")
   fi
-  if [[ -n "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}" ]]; then
-    cmd+=(--known-hosts "${RUSTLE_BENCH_KNOWN_HOSTS:-${RUSTLE_LIVE_KNOWN_HOSTS:-}}")
+  known_hosts_path="$(rustle_known_hosts_path)"
+  if [[ -n "$known_hosts_path" ]]; then
+    cmd+=(--known-hosts "$known_hosts_path")
   fi
   if [[ "${RUSTLE_BENCH_INSECURE_HOST_KEY:-${RUSTLE_LIVE_INSECURE_HOST_KEY:-0}}" == "1" ]]; then
     cmd+=(--insecure-accept-host-key)
@@ -677,6 +714,18 @@ start_rustle() {
   fi
 
   RUSTLE_LOG="$log"
+}
+
+require_auto_quic_fallback_evidence() {
+  local transport="$1"
+  local log="$2"
+  [[ "$REQUIRE_AUTO_QUIC_FALLBACK" == "1" ]] || return 0
+  [[ "$transport" == "auto-quic" ]] || return 0
+
+  if ! grep -Eq 'auto-quic-decision: .*stage=select .*result=agent-fallback' "$log"; then
+    tail -n 160 "$log" 2>/dev/null | sed 's/^/rustle: /' >&2 || true
+    smoke_die "auto-quic fallback evidence was required, but Rustle did not select the agent fallback"
+  fi
 }
 
 stop_rustle() {
@@ -1096,6 +1145,7 @@ for tool in $TOOLS; do
       if [[ "$tool" == "rustle" ]]; then
         stop_rustle
         CURRENT_STOPPER=""
+        require_auto_quic_fallback_evidence "$transport" "$RUSTLE_LOG"
         extra="$(rustle_extra_stats "$RUSTLE_LOG")"
       else
         stop_sshuttle

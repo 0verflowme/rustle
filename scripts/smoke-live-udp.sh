@@ -69,6 +69,9 @@ esac
 if [[ -n "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" && -n "${RUSTLE_LIVE_UDP_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
   smoke_die "RUSTLE_LIVE_UDP_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH"
 fi
+if [[ "$BRIDGE_TRANSPORT" == "auto-quic" && -n "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" ]]; then
+  smoke_die "auto-quic needs distinct quic-bridge-agent and agent helper commands; use RUSTLE_LIVE_UDP_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH or sidecar upload instead of RUSTLE_LIVE_UDP_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND"
+fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-udp-smoke.XXXXXX")"
 RUSTLE_PID=""

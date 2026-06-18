@@ -22,6 +22,7 @@ FIXTURE_TTL_SECONDS="${RUSTLE_FIXTURE_TTL_SECONDS:-3600}"
 TARGET_CIDR="${RUSTLE_FIXTURE_TARGET_CIDR:-${RUSTLE_BENCH_TARGET_CIDR:-}}"
 ARTIFACT_DIR="${RUSTLE_BENCH_ARTIFACT_DIR:-}"
 ALLOW_CONTROL_HOST="${RUSTLE_FIXTURE_ALLOW_CONTROL_HOST:-0}"
+ALLOW_LOCAL_HOST="${RUSTLE_FIXTURE_ALLOW_LOCAL_HOST:-0}"
 
 [[ -n "$REMOTE" ]] || smoke_die "set RUSTLE_FIXTURE_REMOTE or RUSTLE_BENCH_REMOTE, for example user@ssh.example.com"
 [[ -n "$FIXTURE_HOST" ]] || smoke_die "set RUSTLE_FIXTURE_HOST to the remote IP reachable through Rustle, for example 192.168.190.45"
@@ -46,6 +47,10 @@ fi
 case "$ALLOW_CONTROL_HOST" in
   0 | 1) ;;
   *) smoke_die "RUSTLE_FIXTURE_ALLOW_CONTROL_HOST must be 0 or 1" ;;
+esac
+case "$ALLOW_LOCAL_HOST" in
+  0 | 1) ;;
+  *) smoke_die "RUSTLE_FIXTURE_ALLOW_LOCAL_HOST must be 0 or 1" ;;
 esac
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-live-fixture.XXXXXX")"
@@ -185,6 +190,41 @@ reject_fixture_control_host() {
       fi
     done <<<"$fixture_ips"
   done <<<"$control_ips"
+}
+
+route_lookup_is_local() {
+  local ip="$1"
+  case "$(uname -s)" in
+    Darwin)
+      local route_info
+      route_info="$(route -n get "$ip" 2>/dev/null)" || return 1
+      [[ "$route_info" == *"interface: lo0"* || "$route_info" == *"LOCAL"* ]]
+      ;;
+    Linux)
+      local route_info
+      route_info="$(ip route get "$ip" 2>/dev/null | head -n 1)" || return 1
+      [[ "$route_info" == local\ * || "$route_info" == *" dev lo "* ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+reject_fixture_local_host() {
+  [[ "$ALLOW_LOCAL_HOST" == "0" ]] || return 0
+
+  local fixture_ips
+  fixture_ips="$(resolve_ipv4s "$FIXTURE_HOST")"
+  [[ -n "$fixture_ips" ]] || return 0
+
+  local fixture_ip
+  while IFS= read -r fixture_ip; do
+    [[ -n "$fixture_ip" ]] || continue
+    if route_lookup_is_local "$fixture_ip"; then
+      smoke_die "RUSTLE_FIXTURE_HOST resolves to client-local address ${fixture_ip}; use a remote-only fixture IP or set RUSTLE_FIXTURE_ALLOW_LOCAL_HOST=1 for an intentionally non-tunnel proof"
+    fi
+  done <<<"$fixture_ips"
 }
 
 BENCH_ENV=()
@@ -330,6 +370,7 @@ stop_fixture() {
 }
 
 reject_fixture_control_host
+reject_fixture_local_host
 
 verify_fixture_benchmark_rows() {
   local results_file="$1"

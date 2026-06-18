@@ -723,6 +723,13 @@ the same run. Live smoke runs `agent` first and `direct-tcpip` second by
 default before the benchmark; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` to narrow the
 smoke matrix when debugging one transport. Add `RUSTLE_VERIFY_LIVE_FIXTURE=1`
 to include the controlled large-response fixture in the live verifier run.
+The fixture host must be a remote-only address; the fixture harness rejects
+client-local addresses such as a local Docker bridge IP because those cannot
+prove TUN routing. Set `RUSTLE_FIXTURE_ALLOW_LOCAL_HOST=1` only for an
+intentional non-tunnel diagnostic. Set
+`RUSTLE_BENCH_REQUIRE_AUTO_QUIC_FALLBACK=1` with
+`RUSTLE_BENCH_RUSTLE_TRANSPORTS=auto-quic` when the run is meant to prove that
+the experimental QUIC probe failed cleanly and selected the SSH-agent fallback.
 Set `RUSTLE_VERIFY_LIVE_UDP=1` to include the generic UDP live fixture; it
 starts a remote UDP responder over SSH, sends multiple datagrams through the
 TUN route, waits for idle cleanup, and requires final `udp=... active:0`
@@ -749,7 +756,9 @@ alias and the smoke runs Rustle through `sudo`, set
 `RUSTLE_LIVE_UDP_SSH_CONFIG` so the privileged Rustle process and the fixture
 SSH command resolve the same alias. Use `RUSTLE_LIVE_UDP_AGENT_PATH` when the
 UDP smoke should use a different preinstalled remote helper binary from the main
-live smoke.
+live smoke. The live benchmark harness automatically forwards the caller's
+default `$HOME/.ssh/config` and `$HOME/.ssh/known_hosts` to privileged Rustle
+when explicit benchmark values are not set.
 Set `RUSTLE_VERIFY_DNS_TAKEOVER=1` on privileged verifier runs to include the
 system resolver takeover and exact-restore DNS smoke.
 
