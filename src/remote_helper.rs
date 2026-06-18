@@ -1,5 +1,6 @@
 mod bootstrap;
 mod command;
+mod integrity;
 mod kind;
 mod startup;
 mod upload;
