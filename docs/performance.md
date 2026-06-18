@@ -565,6 +565,16 @@ hotpath trace and summarize Rustle's stderr/log output:
 RUSTLE_HOTPATH_TRACE=1 scripts/bench-live-fixture.sh
 ```
 
+`RUSTLE_HOTPATH_TRACE=1` also enables the agent startup trace. Live benchmark
+artifacts then include `hotpath-summary.tsv` for per-flow timing and
+`startup-summary.tsv` for primary helper startup, extra-lane startup, retry
+counts, degraded starts, and startup failures. If `startup-summary.tsv` reports
+`primary_error`, fix SSH config, identity, known-host, sidecar selection, or
+helper bootstrap before interpreting any tunnel latency result. If startup is
+`ok` and `hotpath-summary.tsv` points at `first_byte_wait`, `body_drain`, or
+queue waits, the remaining problem is in the data path rather than helper
+bootstrap.
+
 Use a fixture host address that is distinct from the SSH control host. The live
 fixture wrapper rejects a fixture IP that resolves to the same address as the
 SSH target because Rustle installs a control-route guard for the SSH host, and
@@ -654,6 +664,26 @@ on that lab route, and that `quic-native` can provide the intended high-throughp
 optional data plane. It also shows the default SSH-agent path does not yet beat
 sshuttle on tiny-response latency on this host, so tiny p50 remains an open
 performance gate rather than a completed claim.
+
+The following traced run was collected on 2026-06-18 from a Linux client against
+the `bugserver` SSH config alias, routing only the remote container fixture
+address `172.17.0.2/32`. The client also has a local Docker `172.17.0.0/16`
+route, so this proof depends on Rustle installing a more-specific `/32` route.
+`bugserver` is Ubuntu 16.04; the run required
+`RUSTLE_AGENT_DIR=target/rustle-agent-dir` so the uploaded helper used the
+portable Linux sidecar instead of the local glibc release binary.
+
+| Fixture | Tool | Runs | Result |
+| --- | --- | ---: | --- |
+| 1 KiB, 8 requests, concurrency 4 | `rustle-agent` | 3 | 24/24 succeeded, avg p50 241.7 ms |
+| 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 253.5 ms |
+
+The trace summaries reported `rustle_agent_startup` success for all three agent
+starts with primary startup p50 10.4 s, and `rustle_hotpath_tcp` identified
+`first_byte_wait` as the dominant per-flow bottleneck with p50 249.5 ms. That
+means this run no longer points at helper startup once the portable sidecar is
+selected; the tiny-response path is dominated by first remote response timing
+after the optimistic open and first local payload have been sent.
 
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:
