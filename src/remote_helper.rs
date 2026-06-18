@@ -4,6 +4,7 @@ mod integrity;
 mod kind;
 mod startup;
 mod upload;
+mod upload_command;
 
 pub(crate) use bootstrap::{
     read_quic_helper_bootstrap, QuicHelperBootstrapRole, QUIC_AGENT_BOOTSTRAP_ROLE,
