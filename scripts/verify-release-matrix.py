@@ -1313,6 +1313,7 @@ REQUIRED_HOTPATH_TRACE_SUMMARY_SNIPPETS = [
     "ready_wait_p50_ms",
     "payload_queue_wait_p50_ms",
     "first_byte_wait_p50_ms",
+    "post_open_first_byte_wait_p50_ms",
     "body_drain_p50_ms",
     "local_send_wait_p50_ms",
     "local_send_wait_max_ms",

@@ -43,6 +43,7 @@ DERIVED_LATENCIES = (
     ("remote_open_wait_us", "stream_ready_us", "opened_us"),
     ("payload_queue_wait_us", "first_local_us", "first_local_sent_us"),
     ("first_byte_wait_us", "first_local_sent_us", "first_remote_us"),
+    ("post_open_first_byte_wait_us", "opened_us", "first_remote_us"),
     ("body_drain_us", "first_remote_us", "duration_us"),
 )
 SUCCESS_OUTCOMES = {
@@ -133,6 +134,34 @@ def flow_throughput_mib_s(row: dict[str, str]) -> float | None:
     return (parse_counter(row["remote_bytes"], "remote_bytes") / (1024 * 1024)) / (
         duration_us / 1_000_000
     )
+
+
+def likely_bottleneck_name(
+    derived_p50: dict[str, int | None],
+    wait_p50: dict[str, int | None],
+) -> str:
+    first_byte = derived_p50.get("first_byte_wait_us")
+    remote_open = derived_p50.get("remote_open_wait_us")
+    post_open = derived_p50.get("post_open_first_byte_wait_us")
+    if (
+        first_byte is not None
+        and remote_open is not None
+        and post_open is not None
+        and first_byte > 0
+        and remote_open >= first_byte * 0.8
+        and post_open <= first_byte * 0.2
+    ):
+        derived_p50 = dict(derived_p50)
+        derived_p50["first_byte_wait_us"] = None
+
+    return max(
+        (
+            (value, name.removesuffix("_us"))
+            for name, value in (derived_p50 | wait_p50).items()
+            if value is not None
+        ),
+        default=(None, "-"),
+    )[1]
 
 
 def parse_trace_line(line: str) -> dict[str, str] | None:
@@ -305,14 +334,7 @@ def summarize(text: str) -> list[dict[str, object]]:
             "agent_send_outbound_wait_us": percentile(agent_send_outbound_wait_values, 50),
             "remote_event_wait_us": percentile(remote_event_wait_values, 50),
         }
-        likely_bottleneck = max(
-            (
-                (value, name.removesuffix("_us"))
-                for name, value in (derived_p50 | wait_p50).items()
-                if value is not None
-            ),
-            default=(None, "-"),
-        )[1]
+        likely_bottleneck = likely_bottleneck_name(derived_p50, wait_p50)
         remote_bytes = sum(int(row["remote_bytes"]) for row in rows)
         local_bytes = sum(int(row["local_bytes"]) for row in rows)
         remote_byte_values = [parse_counter(row["remote_bytes"], "remote_bytes") for row in rows]
@@ -383,6 +405,9 @@ def summarize(text: str) -> list[dict[str, object]]:
                 "ready_wait_total_ms": format_ms(ready_wait_total),
                 "payload_queue_wait_p50_ms": format_ms(derived_p50["payload_queue_wait_us"]),
                 "first_byte_wait_p50_ms": format_ms(derived_p50["first_byte_wait_us"]),
+                "post_open_first_byte_wait_p50_ms": format_ms(
+                    derived_p50["post_open_first_byte_wait_us"]
+                ),
                 "body_drain_p50_ms": format_ms(derived_p50["body_drain_us"]),
                 "local_send_wait_p50_ms": format_ms(wait_p50["local_send_wait_us"]),
                 "local_send_wait_total_ms": format_ms(local_send_wait_total),
@@ -494,6 +519,7 @@ def print_summary(summaries: list[dict[str, object]]) -> None:
         "ready_wait_total_ms",
         "payload_queue_wait_p50_ms",
         "first_byte_wait_p50_ms",
+        "post_open_first_byte_wait_p50_ms",
         "body_drain_p50_ms",
         "local_send_wait_p50_ms",
         "local_send_wait_total_ms",
@@ -583,6 +609,7 @@ def self_test() -> None:
     assert agent["ready_wait_total_ms"] == "7.000"
     assert agent["payload_queue_wait_p50_ms"] == "1.000"
     assert agent["first_byte_wait_p50_ms"] == "6.000"
+    assert agent["post_open_first_byte_wait_p50_ms"] == "8.000"
     assert agent["body_drain_p50_ms"] == "10.000"
     assert agent["local_send_wait_p50_ms"] == "7.000"
     assert agent["local_send_wait_total_ms"] == "18.000"
@@ -627,9 +654,23 @@ def self_test() -> None:
     assert native["failed_flows"] == 1
     assert native["first_remote_p50_ms"] == "-"
     assert native["first_byte_wait_p50_ms"] == "-"
+    assert native["post_open_first_byte_wait_p50_ms"] == "-"
     assert native["local_send_wait_p50_ms"] == "-"
     assert native["likely_bottleneck"] == "remote_open_wait"
     assert native["outcomes"] == "open_timeout:1"
+    assert (
+        likely_bottleneck_name(
+            {
+                "remote_open_wait_us": 249_000,
+                "payload_queue_wait_us": 10,
+                "first_byte_wait_us": 249_500,
+                "post_open_first_byte_wait_us": 500,
+                "body_drain_us": 50,
+            },
+            {},
+        )
+        == "remote_open_wait"
+    )
 
     assert_rejects("", "no rustle_hotpath_tcp")
     assert_rejects(

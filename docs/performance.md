@@ -571,9 +571,9 @@ artifacts then include `hotpath-summary.tsv` for per-flow timing and
 counts, degraded starts, and startup failures. If `startup-summary.tsv` reports
 `primary_error`, fix SSH config, identity, known-host, sidecar selection, or
 helper bootstrap before interpreting any tunnel latency result. If startup is
-`ok` and `hotpath-summary.tsv` points at `first_byte_wait`, `body_drain`, or
-queue waits, the remaining problem is in the data path rather than helper
-bootstrap.
+`ok` and `hotpath-summary.tsv` points at `remote_open_wait`, `first_byte_wait`,
+`body_drain`, or queue waits, the remaining problem is in the data path rather
+than helper bootstrap.
 
 Use a fixture host address that is distinct from the SSH control host. The live
 fixture wrapper rejects a fixture IP that resolves to the same address as the
@@ -586,8 +586,9 @@ The summary groups flows by transport and reports `stream_ready`, `opened`,
 first local payload, first local payload sent, first remote byte, duration,
 bytes, per-flow byte distribution, per-flow throughput distribution, and
 outcomes. It also derives `remote_open_wait`, `ready_wait`,
-`payload_queue_wait`, `first_byte_wait`, `body_drain`, cumulative
-`local_send_wait`, `tcp_recv_queue_wait`, `local_queue_wait`,
+`payload_queue_wait`, `first_byte_wait`, `post_open_first_byte_wait`,
+`body_drain`, cumulative `local_send_wait`, `tcp_recv_queue_wait`,
+`local_queue_wait`,
 `pre_bridge_queue_wait`, framed-agent `agent_send_credit_wait` and
 `agent_send_outbound_wait`, `remote_event_wait`, and a `likely_bottleneck`
 label. `tcp_recv_queue_wait` is the age of payload inside smoltcp before the
@@ -679,11 +680,13 @@ portable Linux sidecar instead of the local glibc release binary.
 | 1 KiB, 8 requests, concurrency 4 | `sshuttle` | 3 | 24/24 succeeded, avg p50 253.5 ms |
 
 The trace summaries reported `rustle_agent_startup` success for all three agent
-starts with primary startup p50 10.4 s, and `rustle_hotpath_tcp` identified
-`first_byte_wait` as the dominant per-flow bottleneck with p50 249.5 ms. That
-means this run no longer points at helper startup once the portable sidecar is
-selected; the tiny-response path is dominated by first remote response timing
-after the optimistic open and first local payload have been sent.
+starts with primary startup p50 10.4 s. The controller hotpath showed
+`first_byte_wait` p50 249.5 ms, but almost all of that overlapped remote open:
+`remote_open_wait` p50 was 249.0 ms and the post-open first-byte delay was
+under 1 ms. That means this run no longer points at helper startup or remote
+HTTP response delay once the portable sidecar is selected; the tiny-response
+path is dominated by remote open timing after the optimistic open and first
+local payload have been sent.
 
 For a local preflight that runs the rootless bridge benchmark, rootless agent
 UDP benchmark, and all locally available correctness smokes, use:
