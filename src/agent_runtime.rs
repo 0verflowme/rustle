@@ -635,18 +635,6 @@ async fn run_tcp_connected_stream(
         }
     };
 
-    if send_agent_frame(
-        &out_tx,
-        AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
-            .expect("empty frame")
-            .with_credit(AgentCreditWindow::initial_credit() as u32),
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-
     let (mut reader, mut writer) = stream.into_split();
     let write_out_tx = out_tx.clone();
     let writer_task = tokio::spawn(async move {
@@ -685,6 +673,19 @@ async fn run_tcp_connected_stream(
             }
         }
     });
+
+    if send_agent_frame(
+        &out_tx,
+        AgentFrame::new(AgentFrameKind::Opened, stream_id, Bytes::new())
+            .expect("empty frame")
+            .with_credit(AgentCreditWindow::initial_credit() as u32),
+    )
+    .await
+    .is_err()
+    {
+        writer_task.abort();
+        return;
+    }
 
     let read_chunk = max_frame_payload.clamp(1, AGENT_TCP_READ_CHUNK);
     let mut read_buf = vec![0_u8; read_chunk];
@@ -1595,6 +1596,51 @@ mod tests {
             reason.contains("timed out after 1ms"),
             "reset should preserve timeout context: {reason}"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_writer_drains_queued_data_before_opened_enqueue_completes() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let destination = listener.local_addr().expect("listener address");
+        let client_stream = TcpStream::connect(destination)
+            .await
+            .expect("connect remote TCP");
+        let (mut server_socket, _) = listener.accept().await.expect("accept remote TCP");
+
+        let (to_remote, from_local) = mpsc::channel(2);
+        to_remote
+            .try_send(AgentTcpInput::Data(Bytes::from_static(b"queued")))
+            .expect("queue optimistic request bytes");
+        to_remote
+            .try_send(AgentTcpInput::Eof)
+            .expect("queue optimistic EOF");
+
+        let (out_tx, _out_rx) = mpsc::channel(1);
+        out_tx
+            .try_send(AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap())
+            .expect("prefill agent output queue");
+        let task = tokio::spawn(run_tcp_connected_stream(
+            7,
+            Ok(client_stream),
+            from_local,
+            out_tx,
+            Arc::new(Semaphore::new(AGENT_STREAM_WINDOW_BYTES)),
+            AGENT_TCP_READ_CHUNK,
+        ));
+
+        let mut received = [0_u8; 6];
+        timeout(
+            Duration::from_secs(1),
+            server_socket.read_exact(&mut received),
+        )
+        .await
+        .expect("queued request bytes should reach remote before opened enqueue completes")
+        .expect("read queued request bytes");
+        assert_eq!(&received, b"queued");
+
+        task.abort();
     }
 
     #[tokio::test]
