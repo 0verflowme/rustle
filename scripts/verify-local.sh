@@ -296,8 +296,8 @@ fi
 if [[ "$RUN_LIVE" == "1" ]]; then
   for transport in $LIVE_TRANSPORTS; do
     case "$transport" in
-      auto | direct-tcpip | agent) ;;
-      *) smoke_die "RUSTLE_VERIFY_LIVE_TRANSPORTS entries must be auto, direct-tcpip, or agent" ;;
+      auto | auto-quic | direct-tcpip | agent) ;;
+      *) smoke_die "RUSTLE_VERIFY_LIVE_TRANSPORTS entries must be auto, auto-quic, direct-tcpip, or agent" ;;
     esac
     verify_run env RUSTLE_LIVE_BRIDGE_TRANSPORT="$transport" "${SCRIPT_DIR}/smoke-live-tunnel.sh"
   done

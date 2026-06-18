@@ -428,6 +428,12 @@ case "$BRIDGE_TRANSPORT" in
       smoke_die "live smoke auto transport did not report its selected transport"
     fi
     ;;
+  auto-quic)
+    if ! grep -Eq 'transport: auto-quic selected quic-native|transport: auto-quic could not start quic-native' "$RUSTLE_LOG"; then
+      tail -n 120 "$RUSTLE_LOG" 2>/dev/null | sed 's/^/rustle: /' >&2 || true
+      smoke_die "live smoke auto-quic transport did not report its selected transport"
+    fi
+    ;;
 esac
 
 ROUTE_AFTER="$(route_snapshot)"

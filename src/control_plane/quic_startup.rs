@@ -22,7 +22,9 @@ use crate::{quic_agent, SshArgs};
 
 use super::connect_agent_bridge_transports_from_connector;
 use super::quic_bootstrap::{drain_quic_helper_ssh_output, start_quic_helper_ssh_bootstrap};
-use super::quic_connect::{connect_quic_data_plane_any, format_socket_addrs};
+use super::quic_connect::{
+    connect_quic_data_plane_any, connect_quic_data_plane_any_with_timeout, format_socket_addrs,
+};
 
 const QUIC_AGENT_PROTOCOL_NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -258,6 +260,15 @@ pub(super) async fn connect_quic_native_bridge_fresh_ssh_command(
     ssh: &SshArgs,
     helper_plan: &HelperCommandPlan,
 ) -> Result<QuicNativeBridge> {
+    connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout(ssh, helper_plan, None)
+        .await
+}
+
+pub(super) async fn connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout(
+    ssh: &SshArgs,
+    helper_plan: &HelperCommandPlan,
+    data_plane_timeout: Option<Duration>,
+) -> Result<QuicNativeBridge> {
     let prepared = prepare_ssh_connection(ssh)?;
     let primary_remote_host = prepared.remote_host().to_owned();
     let uploaded_remote_host = primary_remote_host.clone();
@@ -266,10 +277,22 @@ pub(super) async fn connect_quic_native_bridge_fresh_ssh_command(
         helper_plan,
         HelperKind::QuicBridgeNative,
         move |handle, command| async move {
-            connect_quic_native_bridge_on_handle(handle, &primary_remote_host, &command).await
+            connect_quic_native_bridge_on_handle(
+                handle,
+                &primary_remote_host,
+                &command,
+                data_plane_timeout,
+            )
+            .await
         },
         move |handle, command| async move {
-            connect_quic_native_bridge_on_handle(handle, &uploaded_remote_host, &command).await
+            connect_quic_native_bridge_on_handle(
+                handle,
+                &uploaded_remote_host,
+                &command,
+                data_plane_timeout,
+            )
+            .await
         },
         "native QUIC bridge",
         None,
@@ -281,6 +304,7 @@ async fn connect_quic_native_bridge_on_handle(
     handle: Handle<Client>,
     remote_host: &str,
     agent_command: &str,
+    data_plane_timeout: Option<Duration>,
 ) -> Result<QuicNativeBridge> {
     let started = start_quic_helper_ssh_bootstrap(
         &handle,
@@ -294,13 +318,26 @@ async fn connect_quic_native_bridge_on_handle(
         QUIC_NATIVE_BOOTSTRAP_ROLE.label,
         started.reader,
     ));
-    let client = match connect_quic_data_plane_any(
-        QUIC_NATIVE_BOOTSTRAP_ROLE.label,
-        &started.remote_addrs,
-        |remote_addr| quic_agent::connect_quic_bridge(remote_addr, &started.bootstrap),
-    )
-    .await
-    {
+    let connect = |remote_addr| quic_agent::connect_quic_bridge(remote_addr, &started.bootstrap);
+    let client = match match data_plane_timeout {
+        Some(timeout) => {
+            connect_quic_data_plane_any_with_timeout(
+                QUIC_NATIVE_BOOTSTRAP_ROLE.label,
+                &started.remote_addrs,
+                timeout,
+                connect,
+            )
+            .await
+        }
+        None => {
+            connect_quic_data_plane_any(
+                QUIC_NATIVE_BOOTSTRAP_ROLE.label,
+                &started.remote_addrs,
+                connect,
+            )
+            .await
+        }
+    } {
         Ok(client) => client,
         Err(err) => {
             cleanup_failed_quic_helper_startup(

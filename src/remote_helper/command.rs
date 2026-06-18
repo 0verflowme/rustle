@@ -23,6 +23,15 @@ pub(crate) struct HelperCommandPlan {
     policy: BootstrapPolicy,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum BridgeHelperCommandPlan {
+    Single(HelperCommandPlan),
+    AutoQuic {
+        agent: HelperCommandPlan,
+        quic_native: HelperCommandPlan,
+    },
+}
+
 impl HelperCommandPlan {
     pub(crate) fn from_command_options(
         kind: HelperKind,
@@ -142,6 +151,28 @@ pub(crate) fn bridge_agent_command_plan(
     )
 }
 
+pub(crate) fn bridge_runtime_command_plan(
+    transport: BridgeTransportKind,
+    agent_command: Option<&str>,
+    agent_path: Option<&str>,
+) -> Result<BridgeHelperCommandPlan> {
+    if transport != BridgeTransportKind::AutoQuic {
+        return bridge_agent_command_plan(transport, agent_command, agent_path)
+            .map(BridgeHelperCommandPlan::Single);
+    }
+
+    if agent_command.is_some() {
+        bail!(
+            "--agent-command cannot be used with --bridge-transport auto-quic because the QUIC probe and agent fallback need different helper subcommands; use --agent-path instead"
+        );
+    }
+
+    Ok(BridgeHelperCommandPlan::AutoQuic {
+        agent: remote_helper_command_plan(None, agent_path, HelperKind::StdioAgent)?,
+        quic_native: remote_helper_command_plan(None, agent_path, HelperKind::QuicBridgeNative)?,
+    })
+}
+
 fn remote_helper_command_plan(
     agent_command: Option<&str>,
     agent_path: Option<&str>,
@@ -207,6 +238,33 @@ mod tests {
             .command,
             "/opt/rustle quic-agent",
         );
+    }
+
+    #[test]
+    fn auto_quic_runtime_plan_uses_distinct_helper_subcommands() {
+        let plans =
+            bridge_runtime_command_plan(BridgeTransportKind::AutoQuic, None, Some("/tmp/rustle"))
+                .expect("auto-quic can derive both commands from a helper path");
+        let BridgeHelperCommandPlan::AutoQuic { agent, quic_native } = plans else {
+            panic!("expected auto-quic dual plan");
+        };
+
+        assert_eq!(agent.kind, HelperKind::StdioAgent);
+        assert_eq!(agent.command, "'/tmp/rustle' agent");
+        assert_eq!(quic_native.kind, HelperKind::QuicBridgeNative);
+        assert_eq!(quic_native.command, "'/tmp/rustle' quic-bridge-agent");
+    }
+
+    #[test]
+    fn auto_quic_runtime_plan_rejects_single_explicit_command() {
+        let err = bridge_runtime_command_plan(
+            BridgeTransportKind::AutoQuic,
+            Some("/tmp/rustle quic-bridge-agent"),
+            None,
+        )
+        .expect_err("auto-quic cannot split one explicit command into two helper commands");
+
+        assert!(err.to_string().contains("--agent-path"));
     }
 
     #[test]

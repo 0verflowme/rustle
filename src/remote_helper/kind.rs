@@ -66,6 +66,7 @@ impl HelperKind {
             BridgeTransportKind::QuicAgent => Self::QuicAgent,
             BridgeTransportKind::QuicNative => Self::QuicBridgeNative,
             BridgeTransportKind::Auto
+            | BridgeTransportKind::AutoQuic
             | BridgeTransportKind::DirectTcpip
             | BridgeTransportKind::Agent => Self::StdioAgent,
         }
@@ -164,6 +165,10 @@ mod tests {
         );
         assert_eq!(
             HelperKind::for_bridge_transport(BridgeTransportKind::Auto),
+            HelperKind::StdioAgent
+        );
+        assert_eq!(
+            HelperKind::for_bridge_transport(BridgeTransportKind::AutoQuic),
             HelperKind::StdioAgent
         );
     }

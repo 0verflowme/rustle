@@ -18,6 +18,7 @@ pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
     if matches!(
         args.bridge_transport,
         BridgeTransportKind::Auto
+            | BridgeTransportKind::AutoQuic
             | BridgeTransportKind::DirectTcpip
             | BridgeTransportKind::QuicNative
     ) {
@@ -25,7 +26,10 @@ pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
     }
     if matches!(
         args.bridge_transport,
-        BridgeTransportKind::Auto | BridgeTransportKind::Agent | BridgeTransportKind::QuicAgent
+        BridgeTransportKind::Auto
+            | BridgeTransportKind::AutoQuic
+            | BridgeTransportKind::Agent
+            | BridgeTransportKind::QuicAgent
     ) {
         validate_agent_session_request_count(args.agent_sessions)?;
     }

@@ -890,6 +890,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     ),
     (
         BRIDGE_BENCH,
+        "auto-quic",
+    ),
+    (
+        BRIDGE_BENCH,
         "RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO",
     ),
     (
@@ -935,6 +939,10 @@ REQUIRED_AGENT_PRIMARY_SCRIPT_SNIPPETS = [
     (
         AGENT_DNS_BENCH,
         "quic-native",
+    ),
+    (
+        AGENT_DNS_BENCH,
+        "auto-quic",
     ),
     (
         AGENT_RECONNECT_BENCH,
@@ -1485,7 +1493,7 @@ REQUIRED_LIVE_UDP_SMOKE_SNIPPETS = [
     "cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH",
     "BRIDGE_EVENT_QUEUE_REMOTE_BYTES",
     'smoke_require_stat_zero "bridge event queued remote bytes"',
-    "agent|quic-agent|quic-native",
+    "agent|auto-quic|quic-agent|quic-native",
     "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS",
     "RUSTLE_LIVE_UDP_FIXTURE_START_RETRIES",
     "--udp-idle-timeout-ms",

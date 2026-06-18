@@ -1,5 +1,6 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Result};
 
@@ -7,7 +8,7 @@ use crate::agent_bridge::{AgentBridgeConnector, AgentBridgeTransport, Reconnecti
 use crate::data_plane::{
     DataPlane, DirectTcpipDataPlane, FramedAgentDataPlane, QuicNativeDataPlane,
 };
-use crate::remote_helper::HelperCommandPlan;
+use crate::remote_helper::{BridgeHelperCommandPlan, HelperCommandPlan};
 use crate::ssh_control::connect_ssh_pool;
 use crate::transport_model::{BridgeTransportKind, Destination, TunnelRuntimeOptions};
 use crate::{agent_proto, SshArgs};
@@ -15,11 +16,14 @@ use crate::{agent_proto, SshArgs};
 use super::agent_policy::{resolve_agent_session_count, should_fast_start_agent_lanes};
 use super::agent_startup::connect_auto_agent_bridge_transports_from_connector;
 use super::quic_startup::{
-    connect_quic_native_bridge_fresh_ssh_command, SshQuicAgentBridgeConnector,
+    connect_quic_native_bridge_fresh_ssh_command,
+    connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout,
+    SshQuicAgentBridgeConnector,
 };
 use super::ssh_agent_startup::SshAgentBridgeConnector;
 
 const AGENT_FAST_START_WARMUP_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+const AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
 pub(crate) struct TunnelRuntime {
     data_plane: Arc<dyn DataPlane>,
@@ -43,7 +47,7 @@ impl TunnelRuntime {
 pub(crate) async fn connect_tunnel_runtime(
     ssh: &SshArgs,
     requested: BridgeTransportKind,
-    helper_plan: HelperCommandPlan,
+    helper_plan: BridgeHelperCommandPlan,
     mtu: u16,
     dns_remote: Option<&Destination>,
     options: TunnelRuntimeOptions,
@@ -54,6 +58,7 @@ pub(crate) async fn connect_tunnel_runtime(
             Ok(TunnelRuntime::new(DirectTcpipDataPlane::new(ssh)))
         }
         BridgeTransportKind::Agent => {
+            let helper_plan = single_helper_plan(helper_plan, requested)?;
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> =
                 Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
@@ -72,6 +77,7 @@ pub(crate) async fn connect_tunnel_runtime(
             Ok(TunnelRuntime::new(data_plane))
         }
         BridgeTransportKind::QuicAgent => {
+            let helper_plan = single_helper_plan(helper_plan, requested)?;
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> = Arc::new(
                 SshQuicAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?,
@@ -86,10 +92,12 @@ pub(crate) async fn connect_tunnel_runtime(
             Ok(TunnelRuntime::new(data_plane))
         }
         BridgeTransportKind::QuicNative => {
+            let helper_plan = single_helper_plan(helper_plan, requested)?;
             let bridge = connect_quic_native_bridge_fresh_ssh_command(ssh, &helper_plan).await?;
             Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
         }
         BridgeTransportKind::Auto => {
+            let helper_plan = single_helper_plan(helper_plan, requested)?;
             let desired_agent_sessions = resolve_agent_session_count(options.agent_sessions);
             let connector: Arc<dyn AgentBridgeConnector> =
                 Arc::new(SshAgentBridgeConnector::new(ssh.clone(), helper_plan, mtu)?);
@@ -128,6 +136,61 @@ pub(crate) async fn connect_tunnel_runtime(
                 desired_agent_sessions,
                 fast_start_agent_lanes,
             )))
+        }
+        BridgeTransportKind::AutoQuic => {
+            let BridgeHelperCommandPlan::AutoQuic { agent, quic_native } = helper_plan else {
+                bail!("auto-quic runtime requires distinct QUIC-native and agent helper plans");
+            };
+            eprintln!(
+                "transport: auto-quic probing quic-native with data-plane timeout {}ms",
+                AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT.as_millis()
+            );
+            match connect_quic_native_bridge_fresh_ssh_command_with_data_plane_timeout(
+                ssh,
+                &quic_native,
+                Some(AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT),
+            )
+            .await
+            {
+                Ok(bridge) => {
+                    eprintln!("transport: auto-quic selected quic-native");
+                    Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
+                }
+                Err(err) => {
+                    eprintln!(
+                        "transport: auto-quic could not start quic-native ({err:#}); falling back to agent"
+                    );
+                    let desired_agent_sessions =
+                        resolve_agent_session_count(options.agent_sessions);
+                    let connector: Arc<dyn AgentBridgeConnector> =
+                        Arc::new(SshAgentBridgeConnector::new(ssh.clone(), agent, mtu)?);
+                    let fast_start_agent_lanes = should_fast_start_agent_lanes(
+                        options.fast_start_auto_agent_lanes,
+                        options.agent_sessions,
+                        desired_agent_sessions,
+                    );
+                    let data_plane = connect_framed_agent_data_plane(
+                        connector,
+                        desired_agent_sessions,
+                        fast_start_agent_lanes,
+                        dns_remote,
+                    )
+                    .await?;
+                    Ok(TunnelRuntime::new(data_plane))
+                }
+            }
+        }
+    }
+}
+
+fn single_helper_plan(
+    plan: BridgeHelperCommandPlan,
+    requested: BridgeTransportKind,
+) -> Result<HelperCommandPlan> {
+    match plan {
+        BridgeHelperCommandPlan::Single(plan) => Ok(plan),
+        BridgeHelperCommandPlan::AutoQuic { .. } => {
+            bail!("transport {requested:?} received auto-quic helper plans")
         }
     }
 }

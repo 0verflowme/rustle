@@ -152,6 +152,12 @@ Rustle keeps three transport choices, but only one is the normal path:
   falls back to `direct-tcpip` when agent startup or configured DNS capability is
   unavailable. This mode exists for diagnostics and compatibility, not as the
   architecture Rustle optimizes around.
+- Auto-QUIC experiment: an explicit hidden `--bridge-transport auto-quic` mode
+  that probes the native QUIC data plane with a short UDP connect timeout and
+  falls back to the primary SSH-agent data plane when UDP bootstrap fails. This
+  is the candidate shape for future performance-first selection, but the default
+  remains `agent` until live QUIC reachability, fallback, reconnect, and stress
+  gates are stable.
 
 The agent protocol is binary and length-prefixed. Every frame has a fixed
 24-byte header:

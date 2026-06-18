@@ -24,7 +24,7 @@ where
     .await
 }
 
-async fn connect_quic_data_plane_any_with_timeout<T, F, Connect>(
+pub(super) async fn connect_quic_data_plane_any_with_timeout<T, F, Connect>(
     label: &'static str,
     remote_addrs: &[SocketAddr],
     timeout: Duration,

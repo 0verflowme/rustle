@@ -44,7 +44,7 @@ Tune the matrix with environment variables:
 ```sh
 RUSTLE_BENCH_BODY_BYTES="65536 1048576" \
 RUSTLE_BENCH_CONNECTIONS="1 8 32 64" \
-RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip auto quic-agent quic-native" \
+RUSTLE_BENCH_BRIDGE_TRANSPORTS="agent direct-tcpip auto auto-quic quic-agent quic-native" \
 RUSTLE_BENCH_AGENT_SESSIONS=2 \
 RUSTLE_BENCH_RUNS=5 \
 RUSTLE_BENCH_WARMUP_RUNS=1 \
@@ -68,6 +68,12 @@ association to its own QUIC stream. This is the current v2 native data-plane
 slice for TCP, hostname TCP opens, IPv4 DNS over UDP, hostname DNS over TCP, and
 generic IPv4 UDP; it still needs faster same-host rows before it should be
 promoted over the primary `agent` transport.
+
+The hidden `auto-quic` transport is an explicit experiment, not the default. It
+probes `quic-native` with a short UDP data-plane timeout and falls back to the
+primary SSH-agent path when the remote UDP helper port is blocked or bootstrap
+fails. Use `--agent-path` with `auto-quic` when overriding the helper binary so
+Rustle can derive both `agent` and `quic-bridge-agent` subcommands.
 
 For local regression preflights, the benchmark can also enforce a conservative
 agent/direct sanity ratio for matching body-size and connection-count rows:
@@ -273,7 +279,7 @@ Tune the matrix and hard p50 ceiling with environment variables:
 
 ```sh
 RUSTLE_BENCH_AGENT_DNS_QUERIES="32 128" \
-RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="agent direct-tcpip quic-agent quic-native" \
+RUSTLE_BENCH_AGENT_DNS_TRANSPORTS="agent direct-tcpip auto-quic quic-agent quic-native" \
 RUSTLE_BENCH_AGENT_DNS_REMOTE_HOST=127.0.0.1 \
 RUSTLE_BENCH_AGENT_DNS_MAX_P50_US=500000 \
 RUSTLE_BENCH_RUNS=5 \

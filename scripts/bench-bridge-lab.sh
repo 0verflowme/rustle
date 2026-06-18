@@ -186,8 +186,8 @@ for body_bytes in $BODY_BYTES; do
 
   for transport in $TRANSPORTS; do
     case "$transport" in
-      auto | direct-tcpip | agent | quic-agent | quic-native) ;;
-      *) smoke_die "RUSTLE_BENCH_BRIDGE_TRANSPORTS entries must be auto, direct-tcpip, agent, quic-agent, or quic-native" ;;
+      auto | auto-quic | direct-tcpip | agent | quic-agent | quic-native) ;;
+      *) smoke_die "RUSTLE_BENCH_BRIDGE_TRANSPORTS entries must be auto, auto-quic, direct-tcpip, agent, quic-agent, or quic-native" ;;
     esac
 
     for connections in $CONNECTIONS; do
@@ -216,7 +216,9 @@ for body_bytes in $BODY_BYTES; do
         )
         cmd+=(--bridge-transport "$transport")
         if [[ "$transport" != "direct-tcpip" ]]; then
-          if [[ "$transport" == "quic-agent" ]]; then
+          if [[ "$transport" == "auto-quic" ]]; then
+            cmd+=(--agent-path "${RUSTLE_BENCH_AUTO_QUIC_AGENT_PATH:-${RUSTLE_BENCH_AGENT_PATH:-${RUSTLE_BIN_RESOLVED}}}")
+          elif [[ "$transport" == "quic-agent" ]]; then
             cmd+=(--agent-command "${RUSTLE_BENCH_QUIC_AGENT_COMMAND:-'${RUSTLE_BIN_RESOLVED}' quic-agent}")
           elif [[ "$transport" == "quic-native" ]]; then
             cmd+=(--agent-command "${RUSTLE_BENCH_QUIC_NATIVE_COMMAND:-'${RUSTLE_BIN_RESOLVED}' quic-bridge-agent}")

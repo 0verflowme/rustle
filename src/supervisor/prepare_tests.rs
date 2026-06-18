@@ -74,6 +74,31 @@ fn explicit_auto_tunnel_validates_direct_fallback_session_count() {
 }
 
 #[test]
+fn explicit_auto_quic_tunnel_validates_agent_fallback_session_count() {
+    let cli = Cli::try_parse_from([
+        "rustle",
+        "tunnel",
+        "-r",
+        "alice@example.com",
+        "--target",
+        "10.0.0.0/8",
+        "--bridge-transport",
+        "auto-quic",
+        "--agent-sessions",
+        "9999",
+    ])
+    .expect("tunnel CLI with out-of-range agent sessions");
+
+    let Some(CommandKind::Tunnel(args)) = cli.command else {
+        panic!("expected tunnel subcommand");
+    };
+    assert_eq!(args.bridge_transport, BridgeTransportKind::AutoQuic);
+    let err = validate_tunnel_args(&args)
+        .expect_err("explicit auto-quic fallback needs valid agent sessions");
+    assert!(err.to_string().contains("--agent-sessions"));
+}
+
+#[test]
 fn agent_tunnel_accepts_hostname_dns_remote() {
     let cli = Cli::try_parse_from([
         "rustle",

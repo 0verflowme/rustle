@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::control_plane::connect_tunnel_runtime;
-use crate::remote_helper::bridge_agent_command_plan;
+use crate::remote_helper::bridge_runtime_command_plan;
 use crate::routing::{expand_target_routes, ssh_control_ip_to_protect};
 use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
 use crate::tunnel_lifecycle::{
@@ -20,7 +20,7 @@ pub(super) struct PreparedTunnel {
 
 impl PreparedTunnel {
     pub(super) async fn prepare(args: TunnelArgs, shutdown: ShutdownSignal) -> Result<Self> {
-        let helper_plan = bridge_agent_command_plan(
+        let helper_plan = bridge_runtime_command_plan(
             args.bridge_transport,
             args.agent_command.as_deref(),
             args.agent_path.as_deref(),

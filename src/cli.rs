@@ -739,6 +739,29 @@ mod tests {
     }
 
     #[test]
+    fn compact_cli_accepts_hidden_auto_quic_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "-r",
+            "alice@example.com",
+            "--bridge-transport",
+            "auto-quic",
+            "--agent-path",
+            "/tmp/rustle",
+            "10.0.0.0/8",
+        ])
+        .expect("compact CLI with hidden auto QUIC transport");
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.compact.bridge_transport, BridgeTransportKind::AutoQuic);
+        assert_eq!(cli.compact.agent_path.as_deref(), Some("/tmp/rustle"));
+        assert_eq!(
+            cli.compact.targets,
+            vec!["10.0.0.0/8".parse::<Ipv4Net>().unwrap()]
+        );
+    }
+
+    #[test]
     fn compact_cli_rejects_conflicting_agent_command_modes() {
         let err = Cli::try_parse_from([
             "rustle",
@@ -1040,6 +1063,29 @@ mod tests {
             .expect("bridge-lab native QUIC path becomes effective command"),
             "'/tmp/rustle' quic-bridge-agent"
         );
+    }
+
+    #[test]
+    fn bridge_lab_accepts_hidden_auto_quic_transport_switch() {
+        let cli = Cli::try_parse_from([
+            "rustle",
+            "bridge-lab",
+            "-r",
+            "alice@example.com",
+            "--destination",
+            "127.0.0.1:8080",
+            "--bridge-transport",
+            "auto-quic",
+            "--agent-path",
+            "/tmp/rustle",
+        ])
+        .expect("bridge-lab auto QUIC transport subcommand must parse");
+
+        let Some(CommandKind::BridgeLab(args)) = cli.command else {
+            panic!("expected bridge-lab subcommand");
+        };
+        assert_eq!(args.bridge_transport, BridgeTransportKind::AutoQuic);
+        assert_eq!(args.agent_path.as_deref(), Some("/tmp/rustle"));
     }
 
     #[test]

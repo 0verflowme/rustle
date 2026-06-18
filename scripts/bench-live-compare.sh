@@ -159,8 +159,8 @@ if [[ -z "$RUSTLE_TRANSPORTS" ]]; then
 fi
 for transport in $RUSTLE_TRANSPORTS; do
   case "$transport" in
-    direct-tcpip | agent | quic-agent | quic-native) ;;
-    *) smoke_die "RUSTLE_BENCH_RUSTLE_TRANSPORTS entries must be direct-tcpip, agent, quic-agent, or quic-native" ;;
+    auto-quic | direct-tcpip | agent | quic-agent | quic-native) ;;
+    *) smoke_die "RUSTLE_BENCH_RUSTLE_TRANSPORTS entries must be auto-quic, direct-tcpip, agent, quic-agent, or quic-native" ;;
   esac
 done
 if [[ -n "$MIN_QUIC_NATIVE_AGENT_RATIO" || -n "$MAX_QUIC_NATIVE_AGENT_P50_RATIO" ]]; then

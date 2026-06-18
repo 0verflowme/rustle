@@ -63,8 +63,8 @@ if [[ "$FIXTURE_TTL_SECONDS" -lt 1 ]]; then
   smoke_die "RUSTLE_LIVE_UDP_FIXTURE_TTL_SECONDS must be at least 1"
 fi
 case "$BRIDGE_TRANSPORT" in
-  agent|quic-agent|quic-native) ;;
-  *) smoke_die "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT must be agent, quic-agent, or quic-native" ;;
+  agent|auto-quic|quic-agent|quic-native) ;;
+  *) smoke_die "RUSTLE_LIVE_UDP_BRIDGE_TRANSPORT must be agent, auto-quic, quic-agent, or quic-native" ;;
 esac
 if [[ -n "${RUSTLE_LIVE_UDP_AGENT_COMMAND:-${RUSTLE_LIVE_AGENT_COMMAND:-}}" && -n "${RUSTLE_LIVE_UDP_AGENT_PATH:-${RUSTLE_LIVE_AGENT_PATH:-}}" ]]; then
   smoke_die "RUSTLE_LIVE_UDP_AGENT_COMMAND/RUSTLE_LIVE_AGENT_COMMAND cannot be combined with RUSTLE_LIVE_UDP_AGENT_PATH/RUSTLE_LIVE_AGENT_PATH"

@@ -14,7 +14,7 @@ use crate::lab_support::{
     build_dns_a_query, default_http_request, parse_ipv4_destination, percentile_nearest_rank,
     validate_dns_response,
 };
-use crate::remote_helper::{agent_command_plan, bridge_agent_command_plan};
+use crate::remote_helper::{agent_command_plan, bridge_runtime_command_plan};
 use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
 
 const MAX_AGENT_UDP_LAB_MESSAGES: usize = 1_000_000;
@@ -228,7 +228,7 @@ async fn run_agent_dns_lab_inner(args: AgentDnsLabArgs) -> Result<()> {
 
     let dns_remote = parse_destination(&args.dns_remote)
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
-    let helper_plan = bridge_agent_command_plan(
+    let helper_plan = bridge_runtime_command_plan(
         args.bridge_transport,
         args.agent_command.as_deref(),
         args.agent_path.as_deref(),

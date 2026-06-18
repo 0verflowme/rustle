@@ -10,6 +10,7 @@ use crate::dns;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum BridgeTransportKind {
     Auto,
+    AutoQuic,
     DirectTcpip,
     Agent,
     QuicAgent,
