@@ -186,13 +186,17 @@ impl AgentTransport {
         ensure_agent_ready(&self.failure).await?;
         let stream_id = self.allocate_stream_id()?;
         let open_frame = AgentFrame::new(kind, stream_id, payload)?;
-        let outbound_permit = match tokio::time::timeout(
+        let initial_receive_credit = AgentCreditWindow::initial_credit();
+        let initial_receive_window =
+            AgentFrame::new(AgentFrameKind::Window, stream_id, Bytes::new())?
+                .with_credit(u32::try_from(initial_receive_credit)?);
+        let mut outbound_permits = match tokio::time::timeout(
             open_timeout,
-            self.outbound.clone().reserve_owned(),
+            self.outbound.reserve_many(2),
         )
         .await
         {
-            Ok(Ok(permit)) => permit,
+            Ok(Ok(permits)) => permits,
             Ok(Err(_)) => {
                 let message = "agent writer task is closed".to_owned();
                 mark_agent_failed(&self.failure, &self.streams, message.clone()).await;
@@ -208,8 +212,7 @@ impl AgentTransport {
             }
         };
         let (inbound_tx, inbound_rx) = mpsc::channel(AGENT_INBOUND_FRAMES_PER_STREAM);
-        let optimistic_open_credit = AgentCreditWindow::initial_credit();
-        let send_credit = Arc::new(Semaphore::new(optimistic_open_credit));
+        let send_credit = Arc::new(Semaphore::new(initial_receive_credit));
         {
             let mut streams = self.streams.lock().await;
             streams.insert(
@@ -217,7 +220,7 @@ impl AgentTransport {
                 StreamEntry {
                     inbound: inbound_tx,
                     send_credit: Arc::clone(&send_credit),
-                    optimistic_open_credit,
+                    optimistic_open_credit: initial_receive_credit,
                 },
             );
         }
@@ -227,11 +230,22 @@ impl AgentTransport {
         }
 
         let queued_open = AgentFrameWriteItem::new(open_frame)?;
+        let queued_initial_receive_window = AgentFrameWriteItem::new(initial_receive_window)?;
         self.writer_metrics
             .record_enqueued(queued_open.encoded_len());
-        outbound_permit.send(queued_open);
+        self.writer_metrics
+            .record_enqueued(queued_initial_receive_window.encoded_len());
+        outbound_permits
+            .next()
+            .expect("open frame capacity was reserved")
+            .send(queued_open);
+        outbound_permits
+            .next()
+            .expect("initial receive window capacity was reserved")
+            .send(queued_initial_receive_window);
+        debug_assert!(outbound_permits.next().is_none());
 
-        let mut stream = AgentStream {
+        let stream = AgentStream {
             stream_id,
             outbound: self.outbound.clone(),
             inbound: inbound_rx,
@@ -241,16 +255,8 @@ impl AgentTransport {
             send_credit,
             max_frame_payload: (self.peer.max_frame_payload as usize).min(AGENT_MAX_FRAME_PAYLOAD),
             receive_window: AgentCreditWindow::new(),
-            initial_receive_credit_granted: false,
+            initial_receive_credit_granted: true,
         };
-        if let Err(err) = stream
-            .grant_receive_credit(AgentCreditWindow::initial_credit())
-            .await
-        {
-            stream.close_credit_and_unregister().await;
-            return Err(err);
-        }
-        stream.initial_receive_credit_granted = true;
         Ok(stream)
     }
 
