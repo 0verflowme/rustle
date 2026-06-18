@@ -10,11 +10,11 @@ use crate::packet_engine::{
 };
 use crate::transport_model::{Destination, UdpAssociationEvents};
 use crate::tun_io::TunWriter;
-use crate::tunnel_lifecycle::ShutdownSignal;
 use crate::{ssh_bridge, tcp_core};
 
 mod dns;
 mod events;
+pub(crate) mod lifecycle;
 mod prepare;
 #[cfg(test)]
 mod prepare_tests;
@@ -23,6 +23,8 @@ mod tun;
 mod udp;
 
 pub(crate) use prepare::run_tunnel;
+
+use lifecycle::ShutdownSignal;
 
 const DNS_EVENT_CHANNEL_DEPTH: usize = MAX_IN_FLIGHT_DNS_QUERIES;
 const UDP_RESPONSE_EVENT_CHANNEL_DEPTH: usize = 1024;

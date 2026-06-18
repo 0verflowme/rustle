@@ -39,7 +39,6 @@ mod tcp_core;
 mod transport_model;
 mod tun_capture;
 mod tun_io;
-mod tunnel_lifecycle;
 
 use agent_lab::{run_agent_dns_lab, run_agent_lab, run_agent_udp_lab};
 use bridge_lab::run_bridge_lab;

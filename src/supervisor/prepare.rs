@@ -6,8 +6,9 @@ mod prepared;
 pub(crate) use config::validate_tunnel_args;
 
 use self::prepared::PreparedTunnel;
-use crate::tunnel_lifecycle::{shutdown_signal, ShutdownSignal};
 use crate::TunnelArgs;
+
+use super::lifecycle::{shutdown_signal, ShutdownSignal};
 
 pub(crate) async fn run_tunnel(args: TunnelArgs) -> Result<()> {
     validate_tunnel_args(&args)?;

@@ -1,10 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 
+use super::lifecycle::ShutdownSignal;
 use super::prepare::{await_startup_or_shutdown, validate_tunnel_args};
 use crate::cli::{Cli, CommandKind};
 use crate::transport_model::BridgeTransportKind;
-use crate::tunnel_lifecycle::ShutdownSignal;
 
 #[test]
 fn tunnel_subcommand_rejects_zero_udp_idle_timeout() {

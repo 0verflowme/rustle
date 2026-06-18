@@ -319,7 +319,7 @@ mod tests {
     use super::*;
     use crate::defaults::{DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
     use crate::dns as dns_proto;
-    use crate::tunnel_lifecycle::virtual_dns_ip;
+    use crate::supervisor::lifecycle::virtual_dns_ip;
     use std::net::{Ipv4Addr, SocketAddr};
 
     #[test]

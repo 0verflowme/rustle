@@ -5,8 +5,9 @@ use crate::packet_engine::PACKET_BUF_SIZE;
 use crate::routing::expand_target_routes;
 use crate::ssh_control::validate_ssh_session_count;
 use crate::transport_model::{parse_destination, BridgeTransportKind};
-use crate::tunnel_lifecycle::virtual_dns_ip;
 use crate::{platform, TunnelArgs};
+
+use super::super::lifecycle::virtual_dns_ip;
 
 pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
     let _ = expand_target_routes(&args.targets)?;

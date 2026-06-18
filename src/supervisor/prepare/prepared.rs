@@ -6,11 +6,11 @@ use crate::control_plane::connect_tunnel_runtime;
 use crate::remote_helper::bridge_runtime_command_plan;
 use crate::routing::{expand_target_routes, ssh_control_ip_to_protect};
 use crate::transport_model::{parse_destination, TunnelRuntimeOptions};
-use crate::tunnel_lifecycle::{
-    open_tun, open_tunnel_host, ShutdownSignal, TunConfig, TunnelCleanup, TunnelHostConfig,
-};
 use crate::{tcp_core, TunnelArgs};
 
+use super::super::lifecycle::{
+    open_tun, open_tunnel_host, ShutdownSignal, TunConfig, TunnelCleanup, TunnelHostConfig,
+};
 use super::super::TunnelSupervisor;
 
 pub(super) struct PreparedTunnel {

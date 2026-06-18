@@ -5,8 +5,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::packet_engine::{smol_now, tun_ipv4_packet, PACKET_BUF_SIZE};
 use crate::routing::{add_target_routes, expand_target_routes, target_route_parts};
+use crate::supervisor::lifecycle::{open_tun, shutdown_signal, ShutdownSignal, TunConfig};
 use crate::tun_io::TunWriter;
-use crate::tunnel_lifecycle::{open_tun, shutdown_signal, ShutdownSignal, TunConfig};
 use crate::{platform, tcp_core, TunCaptureArgs};
 
 pub(crate) async fn run_tun_capture(args: TunCaptureArgs) -> Result<()> {
