@@ -12,8 +12,16 @@ warning: production code should not call `.expect(...)`; return or handle the fa
 LL |     value.expect("ready")
    |           ^^^^^^
 
+warning: do not discard a question-mark expression with `let _ =`; call it directly or name the value
+  --> $DIR/main.rs:13:5
+   |
+LL |     let _ = value?;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(question_mark_discard)]` on by default
+
 warning: async function has 127 code lines; split state transitions and I/O actions below 120
-  --> $DIR/main.rs:12:1
+  --> $DIR/main.rs:17:1
    |
 LL | async fn oversized_async_state_machine() {
    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

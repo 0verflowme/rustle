@@ -1,5 +1,5 @@
 // edition:2024
-// normalize-stderr-test: "\nwarning: 3 warnings emitted\n\n\z" -> ""
+// normalize-stderr-test: "\nwarning: 4 warnings emitted\n\n\z" -> ""
 
 fn production_unwrap(value: Option<u8>) -> u8 {
     value.unwrap()
@@ -7,6 +7,11 @@ fn production_unwrap(value: Option<u8>) -> u8 {
 
 fn production_expect(value: Result<u8, &'static str>) -> u8 {
     value.expect("ready")
+}
+
+fn question_mark_discard(value: Result<u8, &'static str>) -> Result<(), &'static str> {
+    let _ = value?;
+    Ok(())
 }
 
 async fn oversized_async_state_machine() {

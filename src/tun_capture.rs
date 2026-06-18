@@ -99,7 +99,7 @@ pub(crate) async fn capture_packets(
                                 &mut outbound_packets,
                             )
                             .context("failed to feed packet into userspace TCP engine")?;
-                        let _ = tun.write_packets(&mut outbound_packets).await?;
+                        tun.write_packets(&mut outbound_packets).await?;
                         for snapshot in flow_manager.snapshots() {
                             eprintln!(
                                 "flow: {:?} state={:?} buffered_rx={}",
@@ -125,8 +125,7 @@ pub(crate) async fn capture_packets(
 }
 
 pub(crate) fn validate_tun_args(args: &TunCaptureArgs) -> Result<()> {
-    let _ = expand_target_routes(&args.targets)?;
-    platform::preflight_route_management().context("route preflight failed")?;
+    expand_target_routes(&args.targets)?;
     if args.tun_prefix > 32 {
         bail!("tun-prefix must be <= 32");
     }
@@ -136,6 +135,7 @@ pub(crate) fn validate_tun_args(args: &TunCaptureArgs) -> Result<()> {
     if args.mtu as usize > PACKET_BUF_SIZE {
         bail!("mtu must not exceed packet buffer size {PACKET_BUF_SIZE}");
     }
+    platform::preflight_route_management().context("route preflight failed")?;
     Ok(())
 }
 
@@ -185,6 +185,17 @@ mod tests {
     use super::*;
     use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_IP, DEFAULT_TUN_PREFIX};
 
+    fn valid_tun_capture_args() -> TunCaptureArgs {
+        TunCaptureArgs {
+            targets: vec!["0.0.0.0/0".parse().unwrap()],
+            tun_ip: DEFAULT_TUN_IP,
+            tun_prefix: DEFAULT_TUN_PREFIX,
+            mtu: DEFAULT_MTU,
+            name: None,
+            exit_after_packets: None,
+        }
+    }
+
     #[test]
     fn parse_ipv4_metadata_accepts_minimal_header() {
         let packet = [
@@ -209,15 +220,41 @@ mod tests {
 
     #[test]
     fn validate_tun_args_accepts_full_tunnel_route() {
-        let args = TunCaptureArgs {
-            targets: vec!["0.0.0.0/0".parse().unwrap()],
-            tun_ip: DEFAULT_TUN_IP,
-            tun_prefix: DEFAULT_TUN_PREFIX,
-            mtu: DEFAULT_MTU,
-            name: None,
-            exit_after_packets: None,
-        };
+        let args = valid_tun_capture_args();
 
         validate_tun_args(&args).expect("full tunnel should expand to split routes");
+    }
+
+    #[test]
+    fn validate_tun_args_rejects_empty_targets() {
+        let mut args = valid_tun_capture_args();
+        args.targets.clear();
+
+        let err = validate_tun_args(&args).expect_err("empty targets should fail validation");
+
+        assert!(err.to_string().contains("at least one target CIDR"));
+    }
+
+    #[test]
+    fn validate_tun_args_rejects_invalid_tun_prefix() {
+        let mut args = valid_tun_capture_args();
+        args.tun_prefix = 33;
+
+        let err = validate_tun_args(&args).expect_err("invalid prefix should fail validation");
+
+        assert!(err.to_string().contains("tun-prefix"));
+    }
+
+    #[test]
+    fn validate_tun_args_rejects_invalid_mtu_bounds() {
+        let mut args = valid_tun_capture_args();
+        args.mtu = 575;
+
+        let err = validate_tun_args(&args).expect_err("undersized MTU should fail validation");
+        assert!(err.to_string().contains("IPv4 minimum"));
+
+        args.mtu = (PACKET_BUF_SIZE + 1) as u16;
+        let err = validate_tun_args(&args).expect_err("oversized MTU should fail validation");
+        assert!(err.to_string().contains("packet buffer size"));
     }
 }

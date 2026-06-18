@@ -783,7 +783,7 @@ async fn settle_bridge_lab_cleanup(
                     .poll(now, &mut client.device, &mut client.sockets);
                 drain_lab_client_to_manager(now, client, &mut state.flow_manager)?
             };
-            let _ = route_lab_packets_to_clients(
+            route_lab_packets_to_clients(
                 now,
                 packets,
                 &mut state.clients,
@@ -791,7 +791,7 @@ async fn settle_bridge_lab_cleanup(
             )?;
         }
 
-        let _ = pump_lab_manager_to_clients(now, &mut state.flow_manager, &mut state.clients)?;
+        pump_lab_manager_to_clients(now, &mut state.flow_manager, &mut state.clients)?;
         let mut processed_bridge_events = 0_usize;
         while processed_bridge_events < BRIDGE_LAB_EVENT_BATCH
             && !state.remote_backlogs.should_pause_bridge_events()
@@ -823,7 +823,7 @@ async fn settle_bridge_lab_cleanup(
         for closed_flow in state.closed_flows.drain(..) {
             state.bridges.remove(&closed_flow);
         }
-        let _ = prune_closed_flows(
+        prune_closed_flows(
             &mut state.flow_manager,
             &mut state.bridges,
             &mut state.remote_backlogs,
@@ -964,7 +964,7 @@ pub(crate) fn route_lab_packets_to_clients(
                 client
                     .iface
                     .poll(now, &mut client.device, &mut client.sockets);
-                let _ = receive_lab_client_response(client)?;
+                receive_lab_client_response(client)?;
 
                 for client_packet in client.device.drain_tx() {
                     client_ack_packets.push_back(Bytes::copy_from_slice(client_packet.as_ref()));
@@ -1152,6 +1152,59 @@ mod tests {
             backlog_bytes: 1,
             ..BridgeLabCleanupStatus::default()
         }));
+    }
+
+    fn empty_bridge_lab_state() -> BridgeLabRunState {
+        let flow_manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(
+                Ipv4Addr::new(192, 168, 1, 0),
+                24,
+            )],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        BridgeLabRunState::new(flow_manager, Vec::new())
+    }
+
+    #[tokio::test]
+    async fn settle_bridge_lab_cleanup_returns_first_iteration_for_settled_state() {
+        let mut state = empty_bridge_lab_state();
+        let (_event_tx, mut event_rx) = mpsc::channel(1);
+
+        let iterations = settle_bridge_lab_cleanup(StdInstant::now(), &mut state, &mut event_rx)
+            .await
+            .expect("settle cleanup");
+
+        assert_eq!(iterations, 1);
+        assert!(bridge_lab_cleanup_settled(state.cleanup_status()));
+    }
+
+    #[tokio::test]
+    async fn settle_bridge_lab_cleanup_reports_iteration_cap_when_bridge_remains_active() {
+        let mut state = empty_bridge_lab_state();
+        let flow = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+        );
+        let id = tcp_core::FlowId::new(flow, 1);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let bridge =
+            flow_bridge::spawn_bridge_task(id, event_tx, |_id, _local_rx, _event_tx| async {
+                std::future::pending::<()>().await;
+            });
+        state.bridges.insert(flow, bridge);
+
+        let iterations = settle_bridge_lab_cleanup(StdInstant::now(), &mut state, &mut event_rx)
+            .await
+            .expect("settle cleanup");
+
+        assert_eq!(iterations, 64);
+        assert_eq!(state.cleanup_status().active_bridges, 1);
+        assert!(!bridge_lab_cleanup_settled(state.cleanup_status()));
     }
 
     #[test]

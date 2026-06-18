@@ -209,27 +209,8 @@ impl AgentIoStream {
                 }
 
                 while let Some(message) = channel.wait().await {
-                    match message {
-                        russh::ChannelMsg::Data { data }
-                        | russh::ChannelMsg::ExtendedData { data, .. } => {
-                            return Ok(agent_proto::AgentFrame::new(
-                                agent_proto::AgentFrameKind::Data,
-                                0,
-                                data,
-                            )
-                            .ok());
-                        }
-                        russh::ChannelMsg::Eof => {
-                            return Ok(Some(
-                                agent_proto::AgentFrame::new(
-                                    agent_proto::AgentFrameKind::Eof,
-                                    0,
-                                    Bytes::new(),
-                                )
-                                .context("failed to synthesize direct-tcpip EOF frame")?,
-                            ));
-                        }
-                        _ => {}
+                    if let Some(frame) = direct_tcpip_frame_from_channel_msg(message)? {
+                        return Ok(Some(frame));
                     }
                 }
                 Ok(None)
@@ -253,21 +234,23 @@ impl AgentIoStream {
                         .context("failed to synthesize native QUIC TCP opened frame")?,
                     ));
                 }
-                let payload = stream
+                let Some(payload) = stream
                     .recv_chunk(agent_proto::AGENT_MAX_FRAME_PAYLOAD)
                     .await
-                    .context("failed to read native QUIC TCP data")?;
-                Ok(payload.and_then(|payload| {
-                    agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload).ok()
-                }))
+                    .context("failed to read native QUIC TCP data")?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(
+                    agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
+                        .context("failed to synthesize native QUIC TCP data frame")?,
+                ))
             }
             Self::QuicNativeUdp(stream) => match stream.recv_datagram().await {
-                Ok(Some(payload)) => {
-                    Ok(
-                        agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
-                            .ok(),
-                    )
-                }
+                Ok(Some(payload)) => Ok(Some(
+                    agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
+                        .context("failed to synthesize native QUIC UDP data frame")?,
+                )),
                 Ok(None) => Ok(None),
                 Err(err) => Err(err).context("failed to read native QUIC UDP datagram"),
             },
@@ -325,6 +308,24 @@ impl AgentIoStream {
     }
 }
 
+fn direct_tcpip_frame_from_channel_msg(
+    message: russh::ChannelMsg,
+) -> Result<Option<agent_proto::AgentFrame>> {
+    match message {
+        russh::ChannelMsg::Data { data } | russh::ChannelMsg::ExtendedData { data, .. } => {
+            Ok(Some(
+                agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, data)
+                    .context("failed to synthesize direct-tcpip data frame")?,
+            ))
+        }
+        russh::ChannelMsg::Eof => Ok(Some(
+            agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Eof, 0, Bytes::new())
+                .context("failed to synthesize direct-tcpip EOF frame")?,
+        )),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -348,6 +349,49 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].kind, agent_proto::AgentFrameKind::Data);
         assert_eq!(&sent[0].payload[..], b"payload");
+    }
+
+    #[test]
+    fn direct_tcpip_channel_data_maps_to_agent_data_frame() {
+        let frame = direct_tcpip_frame_from_channel_msg(russh::ChannelMsg::Data {
+            data: Bytes::from_static(b"direct"),
+        })
+        .expect("data frame conversion")
+        .expect("data frame");
+
+        assert_eq!(frame.kind, agent_proto::AgentFrameKind::Data);
+        assert_eq!(&frame.payload[..], b"direct");
+    }
+
+    #[test]
+    fn direct_tcpip_channel_extended_data_maps_to_agent_data_frame() {
+        let frame = direct_tcpip_frame_from_channel_msg(russh::ChannelMsg::ExtendedData {
+            data: Bytes::from_static(b"stderr"),
+            ext: 1,
+        })
+        .expect("extended data frame conversion")
+        .expect("data frame");
+
+        assert_eq!(frame.kind, agent_proto::AgentFrameKind::Data);
+        assert_eq!(&frame.payload[..], b"stderr");
+    }
+
+    #[test]
+    fn direct_tcpip_channel_eof_maps_to_agent_eof_frame() {
+        let frame = direct_tcpip_frame_from_channel_msg(russh::ChannelMsg::Eof)
+            .expect("EOF frame conversion")
+            .expect("EOF frame");
+
+        assert_eq!(frame.kind, agent_proto::AgentFrameKind::Eof);
+        assert!(frame.payload.is_empty());
+    }
+
+    #[test]
+    fn direct_tcpip_channel_control_messages_are_ignored() {
+        let frame = direct_tcpip_frame_from_channel_msg(russh::ChannelMsg::Close)
+            .expect("ignored control frame conversion");
+
+        assert!(frame.is_none());
     }
 
     #[tokio::test]

@@ -214,7 +214,7 @@ where
 
     match writer_task.await {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {}
+        Ok(Err(err)) => return Err(err.context("agent writer failed after reader completed")),
         Err(err) => return Err(err.into()),
     }
 
@@ -1274,6 +1274,8 @@ mod tests {
         entered_write: Arc<Notify>,
     }
 
+    struct ShutdownFailWriter;
+
     #[derive(Clone, Default)]
     struct CountingWriter {
         writes: Arc<AtomicUsize>,
@@ -1333,6 +1335,33 @@ mod tests {
             _cx: &mut TaskContext<'_>,
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ShutdownFailWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "synthetic shutdown failure",
+            )))
         }
     }
 
@@ -2011,6 +2040,33 @@ mod tests {
             .expect("agent should exit after reader error")
             .expect("agent join");
         assert!(result.is_err(), "invalid frame should fail agent run");
+    }
+
+    #[tokio::test]
+    async fn run_reports_writer_error_after_reader_eof() {
+        let (mut client, agent_reader) = duplex(256 * 1024);
+        let agent = tokio::spawn(run(
+            agent_reader,
+            ShutdownFailWriter,
+            AgentRuntimeConfig::new(1300),
+        ));
+
+        write_test_frame(
+            &mut client,
+            AgentFrame::new(AgentFrameKind::Hello, 0, AgentHello::current(1300).encode()).unwrap(),
+        )
+        .await;
+        drop(client);
+
+        let err = timeout(Duration::from_secs(1), agent)
+            .await
+            .expect("agent should exit after reader EOF")
+            .expect("agent join")
+            .expect_err("writer shutdown failure should fail agent run");
+        assert!(
+            format!("{err:#}").contains("agent writer failed after reader completed"),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[tokio::test]

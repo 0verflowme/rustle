@@ -10,11 +10,11 @@ use crate::{platform, TunnelArgs};
 use super::super::lifecycle::virtual_dns_ip;
 
 pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
-    let _ = expand_target_routes(&args.targets)?;
-    let Some(remote) = args.ssh.ssh_server.as_deref() else {
+    expand_target_routes(&args.targets)?;
+    if args.ssh.ssh_server.is_none() {
         bail!("missing SSH remote; use -r user@host");
-    };
-    let _ = parse_destination(&args.dns_remote)
+    }
+    parse_destination(&args.dns_remote)
         .with_context(|| format!("invalid --dns-remote {}", args.dns_remote))?;
     if matches!(
         args.bridge_transport,
@@ -51,6 +51,5 @@ pub(crate) fn validate_tunnel_args(args: &TunnelArgs) -> Result<()> {
         virtual_dns_ip(args.tun_ip, args.tun_prefix)?;
         platform::preflight_system_dns().context("DNS preflight failed")?;
     }
-    let _ = remote;
     Ok(())
 }

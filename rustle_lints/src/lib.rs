@@ -8,7 +8,7 @@ extern crate rustc_span;
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::source::SpanRangeExt;
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{self as hir, Body, Expr, FnDecl};
+use rustc_hir::{self as hir, Body, Expr, FnDecl, Stmt};
 use rustc_lint::{LateContext, LateLintPass, LintStore};
 use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
@@ -59,16 +59,44 @@ rustc_session::declare_lint! {
     "unwrap/expect can panic in production tunnel paths"
 }
 
+rustc_session::declare_lint! {
+    /// ### What it does
+    ///
+    /// Warns on `let _ = ...?;`.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// The `?` already preserves the failure path, so binding the successful
+    /// value to `_` only obscures intent. Prefer calling the expression directly
+    /// or assigning a named value that documents why the success payload matters.
+    ///
+    /// ### Known problems
+    ///
+    /// This is source-text based, so it intentionally avoids generated code and
+    /// only catches the simple source-written discard pattern.
+    pub QUESTION_MARK_DISCARD,
+    Warn,
+    "discarding a question-mark expression with `let _ =` obscures success-path intent"
+}
+
 struct RustleLints;
 
 rustc_session::impl_lint_pass!(
-    RustleLints => [OVERSIZED_ASYNC_STATE_MACHINE, PRODUCTION_PANIC_METHOD]
+    RustleLints => [
+        OVERSIZED_ASYNC_STATE_MACHINE,
+        PRODUCTION_PANIC_METHOD,
+        QUESTION_MARK_DISCARD
+    ]
 );
 
 #[unsafe(no_mangle)]
 pub fn register_lints(sess: &rustc_session::Session, lint_store: &mut LintStore) {
     dylint_linting::init_config(sess);
-    lint_store.register_lints(&[OVERSIZED_ASYNC_STATE_MACHINE, PRODUCTION_PANIC_METHOD]);
+    lint_store.register_lints(&[
+        OVERSIZED_ASYNC_STATE_MACHINE,
+        PRODUCTION_PANIC_METHOD,
+        QUESTION_MARK_DISCARD,
+    ]);
     lint_store.register_late_pass(|_| Box::new(RustleLints));
 }
 
@@ -141,6 +169,19 @@ impl<'tcx> LateLintPass<'tcx> for RustleLints {
             format!("production code should not call `{call}`; return or handle the failure"),
         );
     }
+
+    fn check_stmt(&mut self, cx: &LateContext<'tcx>, stmt: &'tcx Stmt<'tcx>) {
+        if stmt.span.from_expansion() || !is_question_mark_discard(cx, stmt) {
+            return;
+        }
+
+        span_lint(
+            cx,
+            QUESTION_MARK_DISCARD,
+            stmt.span,
+            "do not discard a question-mark expression with `let _ =`; call it directly or name the value",
+        );
+    }
 }
 
 fn is_panic_method(method_name: &str) -> bool {
@@ -150,6 +191,13 @@ fn is_panic_method(method_name: &str) -> bool {
 fn is_source_written_method_call(cx: &LateContext<'_>, expr: &Expr<'_>, method_name: &str) -> bool {
     let needle = format!(".{method_name}");
     expr.span.check_source_text(cx, |src| src.contains(&needle))
+}
+
+fn is_question_mark_discard(cx: &LateContext<'_>, stmt: &Stmt<'_>) -> bool {
+    stmt.span.check_source_text(cx, |src| {
+        let normalized = src.split_whitespace().collect::<String>();
+        normalized.starts_with("let_=") && normalized.ends_with("?;")
+    })
 }
 
 fn source_body_without_outer_braces(src: &str) -> &str {
@@ -188,6 +236,19 @@ fn recognizes_panic_methods() {
     assert!(is_panic_method("unwrap"));
     assert!(is_panic_method("expect"));
     assert!(!is_panic_method("unwrap_or"));
+}
+
+#[test]
+fn recognizes_question_mark_discards_from_source_text() {
+    fn check(src: &str) -> bool {
+        let normalized = src.split_whitespace().collect::<String>();
+        normalized.starts_with("let_=") && normalized.ends_with("?;")
+    }
+
+    assert!(check("let _ = expand_target_routes(&args.targets)?;"));
+    assert!(check("let _ =\n    write_packets().await?;"));
+    assert!(!check("expand_target_routes(&args.targets)?;"));
+    assert!(!check("let _ = sender.send(value);"));
 }
 
 #[test]

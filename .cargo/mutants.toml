@@ -1,0 +1,3 @@
+# `capture_packets` owns the real async TUN-device loop. It is covered by
+# privileged verifier smoke tests rather than unit tests with a fake device.
+exclude_re = ["src/tun_capture\\.rs:.*capture_packets"]
