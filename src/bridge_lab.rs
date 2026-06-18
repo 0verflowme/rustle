@@ -17,8 +17,9 @@ use crate::data_plane::spawn_tcp_bridge_on_data_plane;
 use crate::defaults::{DEFAULT_MTU, DEFAULT_TUN_PREFIX};
 use crate::lab_support::{default_http_request, parse_ipv4_destination, percentile_nearest_rank};
 use crate::packet_engine::{
-    drain_local_bytes_to_bridges, ensure_bridges, expire_stale_flows, handle_bridge_event_into,
-    prune_closed_flows, smol_now, RemoteBacklogs, REMOTE_BACKLOG_BYTES_PER_FLOW,
+    drain_local_bytes_to_bridges, expire_stale_flows, handle_bridge_event_into, plan_bridge_starts,
+    prune_closed_flows, register_tcp_bridge, smol_now, RemoteBacklogs,
+    REMOTE_BACKLOG_BYTES_PER_FLOW,
 };
 use crate::transport_model::TunnelRuntimeOptions;
 use crate::{flow_bridge, tcp_core};
@@ -228,6 +229,8 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
     let mut pending_bridge_events = VecDeque::<flow_bridge::BridgeEvent>::new();
     let mut remote_backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
     let mut ready_flow_ids = Vec::new();
+    let mut opening_flow_keys = Vec::new();
+    let mut bridge_starts = Vec::new();
     let mut flow_keys = Vec::new();
     let mut backlog_flow_ids = Vec::new();
     let mut closed_flows = Vec::new();
@@ -259,23 +262,25 @@ pub(crate) async fn run_bridge_lab(args: BridgeLabArgs) -> Result<()> {
         }
         made_progress |= pump_lab_manager_to_clients(now, &mut flow_manager, &mut clients)? > 0;
 
-        ensure_bridges(
+        plan_bridge_starts(
             &mut flow_manager,
-            &mut bridges,
+            &bridges,
             data_plane.admission_limits(),
-            |start, event_tx| {
-                spawn_tcp_bridge_on_data_plane(
-                    data_plane.clone(),
-                    start.id,
-                    start.ready_wait_ms,
-                    event_tx,
-                    bridge_event_accounting.clone(),
-                )
-            },
-            event_tx.clone(),
             &mut ready_flow_ids,
+            &mut opening_flow_keys,
             now,
+            &mut bridge_starts,
         )?;
+        for start in bridge_starts.drain(..) {
+            let bridge = spawn_tcp_bridge_on_data_plane(
+                data_plane.clone(),
+                start.id,
+                start.ready_wait_ms,
+                event_tx.clone(),
+                bridge_event_accounting.clone(),
+            );
+            register_tcp_bridge(&mut flow_manager, &mut bridges, start, bridge)?;
+        }
 
         for lab_client in &mut clients {
             let socket = lab_client.sockets.get_mut::<tcp::Socket>(lab_client.handle);

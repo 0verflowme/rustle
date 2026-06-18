@@ -2,7 +2,6 @@ use std::collections::{hash_map::Entry, HashMap};
 
 use anyhow::Result;
 use smoltcp::time::Instant as SmolInstant;
-use tokio::sync::mpsc;
 
 use crate::transport_model::{
     bridge_admission_decision, BridgeAdmissionDecision, BridgeAdmissionLimits,
@@ -48,36 +47,6 @@ pub(crate) struct BridgeEventOutcome {
 pub(crate) struct BridgeEventStats {
     pub(crate) remote_backlog_overflows: u64,
     pub(crate) stale_bridge_events: u64,
-}
-
-pub(crate) fn ensure_bridges<F>(
-    flow_manager: &mut tcp_core::FlowManager,
-    bridges: &mut HashMap<tcp_core::FlowKey, flow_bridge::FlowBridge>,
-    limits: BridgeAdmissionLimits,
-    mut spawn_bridge: F,
-    event_tx: mpsc::Sender<flow_bridge::BridgeEvent>,
-    ready_flow_ids: &mut Vec<tcp_core::FlowId>,
-    now: SmolInstant,
-) -> Result<BridgeAdmissionStats>
-where
-    F: FnMut(TcpBridgeStart, mpsc::Sender<flow_bridge::BridgeEvent>) -> flow_bridge::FlowBridge,
-{
-    let mut starts = Vec::new();
-    let mut opening_flow_keys = Vec::new();
-    let stats = plan_bridge_starts(
-        flow_manager,
-        bridges,
-        limits,
-        ready_flow_ids,
-        &mut opening_flow_keys,
-        now,
-        &mut starts,
-    )?;
-    for start in starts.drain(..) {
-        let bridge = spawn_bridge(start, event_tx.clone());
-        register_tcp_bridge(flow_manager, bridges, start, bridge)?;
-    }
-    Ok(stats)
 }
 
 pub(crate) fn plan_bridge_starts(
