@@ -3,7 +3,8 @@ use std::net::Ipv4Addr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use super::tcp::spawn_agent_tcp_bridge;
+use super::stream::AgentIoStream;
+use super::tcp::{spawn_agent_tcp_bridge, spawn_data_plane_tcp_bridge_with_open};
 use crate::agent_bridge::{
     test_support::{detached_bridge_transport, QueuedAgentConnector},
     ReconnectingAgentBridge,
@@ -51,6 +52,245 @@ fn test_flow_id() -> tcp_core::FlowId {
         ),
         1,
     )
+}
+
+fn scripted_agent_frame(
+    kind: agent_proto::AgentFrameKind,
+    payload: impl Into<Bytes>,
+) -> agent_proto::AgentFrame {
+    agent_proto::AgentFrame::new(kind, 0, payload).expect("scripted TCP bridge frame")
+}
+
+fn spawn_scripted_tcp_bridge(
+    id: tcp_core::FlowId,
+    frames: impl IntoIterator<Item = anyhow::Result<Option<agent_proto::AgentFrame>>>,
+) -> (
+    flow_bridge::FlowBridge,
+    mpsc::Receiver<flow_bridge::BridgeEvent>,
+    std::sync::Arc<std::sync::Mutex<Vec<agent_proto::AgentFrame>>>,
+) {
+    let (stream, sent) = AgentIoStream::scripted_for_test(frames);
+    let (event_tx, event_rx) = mpsc::channel(16);
+    let bridge = spawn_data_plane_tcp_bridge_with_open(
+        id,
+        event_tx,
+        flow_bridge::BridgeEventAccounting::new(),
+        0,
+        "scripted-agent",
+        async move { Ok(stream) },
+    );
+    (bridge, event_rx, sent)
+}
+
+async fn recv_bridge_event(
+    event_rx: &mut mpsc::Receiver<flow_bridge::BridgeEvent>,
+) -> flow_bridge::BridgeEvent {
+    tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+        .await
+        .expect("timed out waiting for bridge event")
+        .expect("bridge event")
+}
+
+#[tokio::test]
+async fn agent_tcp_bridge_reports_remote_eof_and_closes_stream() {
+    let id = test_flow_id();
+    let (_bridge, mut event_rx, sent) = spawn_scripted_tcp_bridge(
+        id,
+        [
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Opened,
+                Bytes::new(),
+            ))),
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Eof,
+                Bytes::new(),
+            ))),
+        ],
+    );
+
+    assert!(matches!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id
+    ));
+    assert_eq!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::RemoteEof { id }
+    );
+    assert_eq!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Closed { id }
+    );
+    assert_eq!(
+        sent.lock()
+            .expect("scripted sent frame lock")
+            .last()
+            .map(|frame| frame.kind),
+        Some(agent_proto::AgentFrameKind::Close)
+    );
+}
+
+#[tokio::test]
+async fn agent_tcp_bridge_reports_pre_open_close_as_open_failure() {
+    let id = test_flow_id();
+    let (_bridge, mut event_rx, sent) = spawn_scripted_tcp_bridge(
+        id,
+        [Ok(Some(scripted_agent_frame(
+            agent_proto::AgentFrameKind::Close,
+            Bytes::new(),
+        )))],
+    );
+
+    match recv_bridge_event(&mut event_rx).await {
+        flow_bridge::BridgeEvent::Failed {
+            id: event_id,
+            phase,
+            message,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(phase, flow_bridge::BridgeFailurePhase::Open);
+            assert!(message.contains("closed before open confirmation"));
+        }
+        other => panic!("expected pre-open close failure, got {other:?}"),
+    }
+    assert_eq!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Closed { id }
+    );
+    assert_eq!(
+        sent.lock()
+            .expect("scripted sent frame lock")
+            .last()
+            .map(|frame| frame.kind),
+        Some(agent_proto::AgentFrameKind::Close)
+    );
+}
+
+#[tokio::test]
+async fn agent_tcp_bridge_reports_post_open_reset_as_write_failure() {
+    let id = test_flow_id();
+    let (_bridge, mut event_rx, sent) = spawn_scripted_tcp_bridge(
+        id,
+        [
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Opened,
+                Bytes::new(),
+            ))),
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Reset,
+                Bytes::from_static(b"reset after open"),
+            ))),
+        ],
+    );
+
+    assert!(matches!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id
+    ));
+    match recv_bridge_event(&mut event_rx).await {
+        flow_bridge::BridgeEvent::Failed {
+            id: event_id,
+            phase,
+            message,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(phase, flow_bridge::BridgeFailurePhase::Write);
+            assert!(message.contains("reset after open"));
+        }
+        other => panic!("expected post-open reset failure, got {other:?}"),
+    }
+    assert_eq!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Closed { id }
+    );
+    assert_eq!(
+        sent.lock()
+            .expect("scripted sent frame lock")
+            .last()
+            .map(|frame| frame.kind),
+        Some(agent_proto::AgentFrameKind::Close)
+    );
+}
+
+#[tokio::test]
+async fn agent_tcp_bridge_coalesces_at_most_eight_remote_data_frames() {
+    let id = test_flow_id();
+    let mut frames = vec![Ok(Some(scripted_agent_frame(
+        agent_proto::AgentFrameKind::Opened,
+        Bytes::new(),
+    )))];
+    for index in 0..9_u8 {
+        frames.push(Ok(Some(scripted_agent_frame(
+            agent_proto::AgentFrameKind::Data,
+            Bytes::copy_from_slice(&[b'0' + index]),
+        ))));
+    }
+    let (_bridge, mut event_rx, _sent) = spawn_scripted_tcp_bridge(id, frames);
+
+    assert!(matches!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id
+    ));
+    match recv_bridge_event(&mut event_rx).await {
+        flow_bridge::BridgeEvent::RemoteData {
+            id: event_id,
+            bytes,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(&bytes[..], b"01234567");
+        }
+        other => panic!("expected first coalesced data event, got {other:?}"),
+    }
+    match recv_bridge_event(&mut event_rx).await {
+        flow_bridge::BridgeEvent::RemoteData {
+            id: event_id,
+            bytes,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(&bytes[..], b"8");
+        }
+        other => panic!("expected second coalesced data event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn agent_tcp_bridge_preserves_control_frame_after_coalesced_data() {
+    let id = test_flow_id();
+    let (_bridge, mut event_rx, _sent) = spawn_scripted_tcp_bridge(
+        id,
+        [
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Opened,
+                Bytes::new(),
+            ))),
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Data,
+                Bytes::from_static(b"payload"),
+            ))),
+            Ok(Some(scripted_agent_frame(
+                agent_proto::AgentFrameKind::Eof,
+                Bytes::new(),
+            ))),
+        ],
+    );
+
+    assert!(matches!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::Opened { id: event_id, .. } if event_id == id
+    ));
+    match recv_bridge_event(&mut event_rx).await {
+        flow_bridge::BridgeEvent::RemoteData {
+            id: event_id,
+            bytes,
+        } => {
+            assert_eq!(event_id, id);
+            assert_eq!(&bytes[..], b"payload");
+        }
+        other => panic!("expected remote data before EOF, got {other:?}"),
+    }
+    assert_eq!(
+        recv_bridge_event(&mut event_rx).await,
+        flow_bridge::BridgeEvent::RemoteEof { id }
+    );
 }
 
 #[tokio::test]

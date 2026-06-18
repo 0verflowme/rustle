@@ -299,6 +299,20 @@ mod tests {
             std::slice::from_ref(&dir),
         )
         .is_empty());
+        assert_eq!(
+            explicit_portable_linux_agent_binary_for_platform(
+                macos_x64,
+                std::slice::from_ref(&dir)
+            ),
+            None
+        );
+        assert_eq!(
+            explicit_portable_linux_agent_binary_for_platform(
+                linux_x64,
+                std::slice::from_ref(&dir)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -336,6 +350,61 @@ mod tests {
             &dir.join("rustle-aarch64-pc-windows-msvc")
                 .join("rustle.exe")
         ));
+        assert!(!windows_candidates.iter().any(|candidate| candidate
+            .display()
+            .to_string()
+            .contains("x86_64-pc-windows-msvc")));
+    }
+
+    #[test]
+    fn remote_platform_target_triples_are_exact_and_arch_specific() {
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "linux",
+                arch: "x86_64",
+            }),
+            &["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+        );
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "linux",
+                arch: "aarch64",
+            }),
+            &["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"]
+        );
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "macos",
+                arch: "x86_64",
+            }),
+            &["x86_64-apple-darwin"]
+        );
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "macos",
+                arch: "aarch64",
+            }),
+            &["aarch64-apple-darwin"]
+        );
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "windows",
+                arch: "x86_64",
+            }),
+            &["x86_64-pc-windows-msvc"]
+        );
+        assert_eq!(
+            remote_platform_target_triples(RemotePlatform {
+                os: "windows",
+                arch: "aarch64",
+            }),
+            &["aarch64-pc-windows-msvc"]
+        );
+        assert!(remote_platform_target_triples(RemotePlatform {
+            os: "linux",
+            arch: "riscv64",
+        })
+        .is_empty());
     }
 
     #[test]
@@ -416,6 +485,48 @@ mod tests {
         assert_eq!(selected, &sidecar);
     }
 
+    #[test]
+    fn sidecar_selection_ignores_stale_sidecars_for_other_target_triples() {
+        struct TempTree {
+            path: PathBuf,
+        }
+
+        impl Drop for TempTree {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        let root = unique_temp_root("rustle-agent-stale-sidecar-test");
+        let temp = TempTree { path: root };
+        let bin_dir = temp.path.join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
+        let current_exe = bin_dir.join("rustle-current");
+        std::fs::write(&current_exe, "local").expect("write fake current binary");
+
+        let stale_dir = bin_dir.join("rustle-x86_64-unknown-linux-musl");
+        std::fs::create_dir(&stale_dir).expect("create stale sidecar dir");
+        std::fs::write(stale_dir.join("rustle"), "stale x86_64").expect("write stale sidecar");
+
+        let target = RemotePlatform {
+            os: "linux",
+            arch: "aarch64",
+        };
+        let selected_dir = bin_dir.join("rustle-aarch64-unknown-linux-musl");
+        std::fs::create_dir(&selected_dir).expect("create matching sidecar dir");
+        let selected = selected_dir.join("rustle");
+        std::fs::write(&selected, "matching aarch64").expect("write matching sidecar");
+
+        let helper = local_helper_binary_for_platform_with_explicit_dirs(
+            &current_exe,
+            target,
+            std::slice::from_ref(&bin_dir),
+        )
+        .expect("matching sidecar should be selected");
+        assert_eq!(helper.path, selected);
+        assert!(helper.is_sidecar());
+    }
+
     fn unique_temp_root(prefix: &str) -> PathBuf {
         static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
         let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
@@ -434,6 +545,30 @@ mod tests {
         assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-aarch64-apple-darwin")));
         assert!(dirs.contains(&PathBuf::from("/opt/rustle")));
         assert!(dirs.contains(&PathBuf::from("/opt/rustle/rustle-agent-dir")));
+    }
+
+    #[test]
+    fn explicit_agent_dirs_are_searched_first_and_deduped() {
+        let explicit = PathBuf::from("/opt/rustle/agents");
+        let current_exe = PathBuf::from("/opt/rustle/bin/rustle");
+        let dirs = local_agent_search_dirs_with_explicit_dirs(
+            &current_exe,
+            &[explicit.clone(), explicit.clone()],
+        );
+
+        assert_eq!(dirs.first(), Some(&explicit));
+        assert_eq!(
+            dirs.iter().filter(|dir| *dir == &explicit).count(),
+            1,
+            "explicit agent dir should not be searched twice"
+        );
+        assert!(
+            dirs.iter().position(|dir| dir == &explicit).unwrap()
+                < dirs
+                    .iter()
+                    .position(|dir| dir == &PathBuf::from("/opt/rustle/bin"))
+                    .unwrap()
+        );
     }
 
     #[test]

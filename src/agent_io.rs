@@ -363,3 +363,82 @@ fn encode_non_priority_frames_fairly(frames: &[AgentFrame], encoded: &mut BytesM
 fn is_priority_control(frame: &AgentFrame) -> bool {
     frame.kind.is_priority_control()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+
+    use bytes::{Bytes, BytesMut};
+    use tokio::io::AsyncWrite;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct VecWriter {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+
+    impl AsyncWrite for VecWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn burst_writer_reports_exact_frame_byte_and_wait_stats() {
+        let frames = [
+            AgentFrame::new(AgentFrameKind::Window, 7, Bytes::new())
+                .unwrap()
+                .with_credit(32),
+            AgentFrame::new(AgentFrameKind::Data, 7, Bytes::from_static(b"abc")).unwrap(),
+        ];
+        let items = frames
+            .iter()
+            .cloned()
+            .map(AgentFrameWriteItem::new)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let mut writer = VecWriter::default();
+        let mut burst = AgentFrameBurstWriter::new();
+        let stats = burst
+            .write_items(&mut writer, &items)
+            .await
+            .expect("write burst");
+
+        assert_eq!(stats.frames, frames.len());
+        assert_eq!(stats.bytes, encoded_frames_len(frames.iter()).unwrap());
+        assert!(stats.enqueue_to_write_us > 1);
+        assert!(stats.enqueue_to_write_max_us > 1);
+        assert_eq!(writer.flushes, 1);
+
+        let mut encoded = BytesMut::from(writer.bytes.as_slice());
+        assert_eq!(try_decode_frame(&mut encoded).unwrap().unwrap(), frames[0]);
+        assert_eq!(try_decode_frame(&mut encoded).unwrap().unwrap(), frames[1]);
+        assert!(encoded.is_empty());
+    }
+}

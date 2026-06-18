@@ -320,6 +320,34 @@ mod tests {
     }
 
     #[test]
+    fn remote_backlog_accepts_push_that_exactly_reaches_flow_and_total_limits() {
+        let flow = tcp_core::FlowKey::tcp(
+            Ipv4Addr::new(10, 255, 255, 2),
+            49152,
+            Ipv4Addr::new(192, 168, 1, 10),
+            443,
+        );
+        let id = tcp_core::FlowId::new(flow, 1);
+        let mut backlogs = RemoteBacklogs::with_limits(8, 8);
+
+        assert_eq!(backlogs.max_bytes_per_flow(), 8);
+        assert_eq!(backlogs.max_total_bytes(), 8);
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"hello")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(
+            backlogs.push(id, Bytes::from_static(b"!!!")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(backlogs.total_bytes(), 8);
+        assert_eq!(
+            backlogs.flows.get(&id).map(|backlog| backlog.bytes),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn remote_backlog_pauses_bridge_events_at_high_watermark() {
         let first = tcp_core::FlowKey::tcp(
             Ipv4Addr::new(10, 255, 255, 2),

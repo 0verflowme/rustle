@@ -126,6 +126,29 @@ fn writer_queue_is_empty(outbound_rx: &mut AgentFrameWriteReceiver) -> bool {
     outbound_rx.try_recv_priority().is_none() && outbound_rx.try_recv_data().is_none()
 }
 
+fn test_transport_with_next_stream_id(
+    next_stream_id: u64,
+    capacity: usize,
+) -> (AgentTransport, AgentFrameWriteReceiver) {
+    let (outbound, outbound_rx) = AgentFrameWriteQueue::channel(capacity);
+    (
+        AgentTransport {
+            outbound,
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            failure: Arc::new(Mutex::new(None)),
+            writer_metrics: Arc::new(AgentWriterMetrics::default()),
+            peer: AgentHello::current(1300),
+            next_stream_id: Arc::new(AtomicU64::new(next_stream_id)),
+            _heartbeat_guard: None,
+        },
+        outbound_rx,
+    )
+}
+
+fn test_transport(capacity: usize) -> (AgentTransport, AgentFrameWriteReceiver) {
+    test_transport_with_next_stream_id(1, capacity)
+}
+
 #[tokio::test]
 async fn transport_writer_flushes_once_per_queued_burst() {
     let writer = CountingWriter::default();
@@ -550,6 +573,186 @@ async fn pong_refreshes_heartbeat_activity_and_count() {
         "pong should count as transport activity"
     );
     assert_eq!(heartbeat.received_pongs, 1);
+}
+
+#[tokio::test]
+async fn dispatch_window_frames_grant_credit_without_inbound_delivery() {
+    let streams = Arc::new(Mutex::new(HashMap::new()));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+    let send_credit = Arc::new(Semaphore::new(0));
+    streams.lock().await.insert(
+        21,
+        StreamEntry {
+            inbound: inbound_tx,
+            send_credit: Arc::clone(&send_credit),
+            optimistic_open_credit: 0,
+        },
+    );
+
+    dispatch_agent_frame(
+        &streams,
+        None,
+        AgentFrame::new(AgentFrameKind::Window, 21, Bytes::new())
+            .expect("window frame")
+            .with_credit(17),
+    )
+    .await;
+
+    assert_eq!(send_credit.available_permits(), 17);
+    assert!(
+        inbound_rx.try_recv().is_err(),
+        "window frames should not be delivered to stream receivers"
+    );
+    assert!(streams.lock().await.contains_key(&21));
+}
+
+#[tokio::test]
+async fn dispatch_opened_for_optimistic_stream_adds_only_additional_credit() {
+    let streams = Arc::new(Mutex::new(HashMap::new()));
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(2);
+    let send_credit = Arc::new(Semaphore::new(0));
+    streams.lock().await.insert(
+        23,
+        StreamEntry {
+            inbound: inbound_tx,
+            send_credit: Arc::clone(&send_credit),
+            optimistic_open_credit: 10,
+        },
+    );
+
+    dispatch_agent_frame(
+        &streams,
+        None,
+        AgentFrame::new(AgentFrameKind::Opened, 23, Bytes::new())
+            .expect("opened frame")
+            .with_credit(15),
+    )
+    .await;
+
+    assert_eq!(send_credit.available_permits(), 5);
+    let opened = inbound_rx.try_recv().expect("opened should be delivered");
+    assert_eq!(opened.kind, AgentFrameKind::Opened);
+
+    dispatch_agent_frame(
+        &streams,
+        None,
+        AgentFrame::new(AgentFrameKind::Opened, 23, Bytes::new())
+            .expect("opened frame")
+            .with_credit(7),
+    )
+    .await;
+    assert_eq!(
+        send_credit.available_permits(),
+        5,
+        "opened credit below the optimistic grant must not add permits"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_close_and_reset_close_send_credit_before_delivery() {
+    for kind in [AgentFrameKind::Close, AgentFrameKind::Reset] {
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        let (inbound_tx, mut inbound_rx) = mpsc::channel(1);
+        let send_credit = Arc::new(Semaphore::new(0));
+        streams.lock().await.insert(
+            25,
+            StreamEntry {
+                inbound: inbound_tx,
+                send_credit: Arc::clone(&send_credit),
+                optimistic_open_credit: 0,
+            },
+        );
+
+        dispatch_agent_frame(
+            &streams,
+            None,
+            AgentFrame::new(kind, 25, Bytes::from_static(b"done")).expect("terminal frame"),
+        )
+        .await;
+
+        assert!(send_credit.is_closed());
+        assert_eq!(
+            inbound_rx
+                .try_recv()
+                .expect("terminal frame delivered")
+                .kind,
+            kind
+        );
+    }
+}
+
+#[tokio::test]
+async fn open_with_payload_applies_opened_credit_and_grants_initial_receive_window() {
+    let (transport, mut outbound_rx) = test_transport(8);
+    let open = AgentOpenIpv4 {
+        destination_ip: Ipv4Addr::new(127, 0, 0, 1),
+        destination_port: 8080,
+        originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+        originator_port: 49152,
+    };
+    let opening_transport = transport.clone();
+    let open_task = tokio::spawn(async move {
+        opening_transport
+            .open_ipv4_with_timeout(AgentFrameKind::OpenTcp, open, Duration::from_secs(1))
+            .await
+    });
+
+    let open_frame = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(open_frame.kind, AgentFrameKind::OpenTcp);
+    assert_eq!(open_frame.stream_id, 1);
+
+    dispatch_agent_frame(
+        &transport.streams,
+        None,
+        AgentFrame::new(AgentFrameKind::Opened, open_frame.stream_id, Bytes::new())
+            .expect("opened frame")
+            .with_credit(5),
+    )
+    .await;
+    let stream = open_task
+        .await
+        .expect("open task join")
+        .expect("stream opens");
+
+    let receive_window = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(receive_window.kind, AgentFrameKind::Window);
+    assert_eq!(receive_window.stream_id, 1);
+    assert_eq!(
+        receive_window.credit as usize,
+        AgentCreditWindow::initial_credit()
+    );
+
+    stream
+        .send_data(Bytes::from_static(b"hello"))
+        .await
+        .expect("opened credit should allow a five-byte send");
+    let data = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(data.kind, AgentFrameKind::Data);
+    assert_eq!(data.stream_id, 1);
+    assert_eq!(&data.payload[..], b"hello");
+}
+
+#[test]
+fn allocate_stream_id_advances_by_odd_ids_and_rejects_exhaustion() {
+    let (transport, _outbound_rx) = test_transport(1);
+
+    assert_eq!(transport.allocate_stream_id_for_test().unwrap(), 1);
+    assert_eq!(transport.allocate_stream_id_for_test().unwrap(), 3);
+    assert_eq!(transport.allocate_stream_id_for_test().unwrap(), 5);
+
+    let (zero, _outbound_rx) = test_transport_with_next_stream_id(0, 1);
+    assert!(zero
+        .allocate_stream_id_for_test()
+        .unwrap_err()
+        .to_string()
+        .contains("exhausted"));
+
+    let (exhausted, _outbound_rx) = test_transport_with_next_stream_id(u64::MAX - 1, 1);
+    assert!(exhausted
+        .allocate_stream_id_for_test()
+        .unwrap_err()
+        .to_string()
+        .contains("exhausted"));
 }
 
 #[tokio::test]
@@ -1169,6 +1372,100 @@ async fn stream_try_recv_updates_receive_credit() {
 }
 
 #[tokio::test]
+async fn stream_recv_opened_grants_initial_receive_credit_once() {
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
+    let (inbound_tx, inbound) = mpsc::channel(8);
+    let mut stream = test_agent_stream(10, outbound, inbound);
+    stream.initial_receive_credit_granted = false;
+
+    inbound_tx
+        .send(AgentFrame::new(AgentFrameKind::Opened, 10, Bytes::new()).expect("opened"))
+        .await
+        .expect("queue opened frame");
+    assert_eq!(
+        stream.recv().await.expect("receive opened").kind,
+        AgentFrameKind::Opened
+    );
+    assert!(stream.initial_receive_credit_granted);
+    let window = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(window.kind, AgentFrameKind::Window);
+    assert_eq!(window.stream_id, 10);
+    assert_eq!(window.credit as usize, AgentCreditWindow::initial_credit());
+
+    inbound_tx
+        .send(AgentFrame::new(AgentFrameKind::Opened, 10, Bytes::new()).expect("opened"))
+        .await
+        .expect("queue second opened frame");
+    assert_eq!(
+        stream.recv().await.expect("receive second opened").kind,
+        AgentFrameKind::Opened
+    );
+    assert!(
+        writer_queue_is_empty(&mut outbound_rx),
+        "opened side effect must not duplicate the initial receive credit"
+    );
+}
+
+#[tokio::test]
+async fn stream_recv_terminal_frames_unregister_and_close_credit() {
+    for kind in [AgentFrameKind::Close, AgentFrameKind::Reset] {
+        let (outbound, _outbound_rx) = AgentFrameWriteQueue::channel(8);
+        let (inbound_tx, inbound) = mpsc::channel(8);
+        let stream_id = if kind == AgentFrameKind::Close {
+            31
+        } else {
+            33
+        };
+        let mut stream = test_agent_stream(stream_id, outbound, inbound);
+        stream.streams.lock().await.insert(
+            stream_id,
+            StreamEntry {
+                inbound: inbound_tx.clone(),
+                send_credit: Arc::clone(&stream.send_credit),
+                optimistic_open_credit: 0,
+            },
+        );
+
+        inbound_tx
+            .send(AgentFrame::new(kind, stream_id, Bytes::from_static(b"terminal")).unwrap())
+            .await
+            .expect("queue terminal frame");
+        let frame = stream.recv().await.expect("receive terminal frame");
+        assert_eq!(frame.kind, kind);
+        assert!(stream.send_credit.is_closed());
+        assert!(
+            stream.streams.lock().await.get(&stream_id).is_none(),
+            "terminal frame should unregister stream {stream_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn grant_receive_credit_zero_is_noop_and_nonzero_sends_window() {
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
+    let (_inbound_tx, inbound) = mpsc::channel(8);
+    let stream = test_agent_stream(35, outbound, inbound);
+
+    stream
+        .grant_receive_credit(0)
+        .await
+        .expect("zero credit grant");
+    assert!(
+        writer_queue_is_empty(&mut outbound_rx),
+        "zero credit grant must not enqueue a window frame"
+    );
+
+    stream
+        .grant_receive_credit(7)
+        .await
+        .expect("positive credit grant");
+    let window = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(window.kind, AgentFrameKind::Window);
+    assert_eq!(window.stream_id, 35);
+    assert_eq!(window.credit, 7);
+}
+
+#[tokio::test]
 async fn stream_recv_batches_max_frame_receive_credit_until_threshold() {
     let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
     let (inbound_tx, inbound) = mpsc::channel(8);
@@ -1239,6 +1536,32 @@ async fn stream_recv_grows_receive_window_after_sustained_consumption() {
 
     assert!(largest_credit > AGENT_STREAM_WINDOW_BYTES);
     assert!(stream.receive_window.current_window() > AGENT_STREAM_WINDOW_BYTES);
+}
+
+#[tokio::test]
+async fn stream_send_exact_multiple_of_frame_limit_has_no_trailing_empty_frame() {
+    let (outbound, mut outbound_rx) = AgentFrameWriteQueue::channel(8);
+    let (_inbound_tx, inbound) = mpsc::channel(8);
+    let stream = test_agent_stream(37, outbound, inbound);
+    let payload = Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD * 2]);
+    stream.send_credit.add_permits(payload.len());
+
+    let metrics = stream
+        .send_data_with_metrics(payload)
+        .await
+        .expect("send exact multiple of frame size");
+
+    assert_eq!(metrics.frames, 2);
+    let first = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(first.kind, AgentFrameKind::Data);
+    assert_eq!(first.payload.len(), AGENT_MAX_FRAME_PAYLOAD);
+    let second = recv_writer_frame(&mut outbound_rx).await;
+    assert_eq!(second.kind, AgentFrameKind::Data);
+    assert_eq!(second.payload.len(), AGENT_MAX_FRAME_PAYLOAD);
+    assert!(
+        writer_queue_is_empty(&mut outbound_rx),
+        "exact frame multiples must not emit a trailing empty data frame"
+    );
 }
 
 #[tokio::test]

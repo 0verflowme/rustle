@@ -785,6 +785,127 @@ mod tests {
     }
 
     #[test]
+    fn expire_stale_flows_counts_each_expired_flow_and_drops_backlogs() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let mut manager = tcp_core::FlowManager::with_policy(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+            tcp_core::FlowPolicy {
+                max_active_flows: 16,
+                opening_timeout: smoltcp::time::Duration::from_millis(5),
+                bridge_open_timeout: smoltcp::time::Duration::from_millis(5),
+                idle_timeout: smoltcp::time::Duration::from_millis(5),
+            },
+        )
+        .expect("flow manager");
+        let first_id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            49152,
+        );
+        let second_id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            49153,
+        );
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+        assert_eq!(
+            backlogs.push(first_id, Bytes::from_static(b"first")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(
+            backlogs.push(second_id, Bytes::from_static(b"second")),
+            RemoteBacklogPush::Accepted
+        );
+        let mut bridges = HashMap::new();
+        let mut expired = Vec::new();
+
+        let count = expire_stale_flows(
+            &mut manager,
+            &mut bridges,
+            &mut backlogs,
+            SmolInstant::from_millis(10_000),
+            &mut expired,
+        );
+
+        assert_eq!(count, 2);
+        assert!(expired.is_empty());
+        assert_eq!(backlogs.active_flow_count(), 0);
+        assert_eq!(backlogs.total_bytes(), 0);
+        assert_eq!(
+            manager.flow_state(first_id.key).expect("first flow state"),
+            tcp_core::FlowState::Reset
+        );
+        assert_eq!(
+            manager
+                .flow_state(second_id.key)
+                .expect("second flow state"),
+            tcp_core::FlowState::Reset
+        );
+    }
+
+    #[test]
+    fn prune_closed_flows_counts_and_removes_each_removable_flow() {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let destination_ip = Ipv4Addr::new(192, 168, 1, 10);
+        let destination_port = 443;
+        let mut manager = tcp_core::FlowManager::new(
+            DEFAULT_TUN_IP,
+            DEFAULT_TUN_PREFIX,
+            &[tcp_core::Ipv4NetParts::new(destination_ip, 32)],
+            usize::from(DEFAULT_MTU),
+        )
+        .expect("flow manager");
+        let first_id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            49152,
+        );
+        let second_id = establish_lab_flow(
+            &mut manager,
+            client_ip,
+            destination_ip,
+            destination_port,
+            49153,
+        );
+        let mut backlogs = RemoteBacklogs::new(REMOTE_BACKLOG_BYTES_PER_FLOW);
+        assert_eq!(
+            backlogs.push(first_id, Bytes::from_static(b"first")),
+            RemoteBacklogPush::Accepted
+        );
+        assert_eq!(
+            backlogs.push(second_id, Bytes::from_static(b"second")),
+            RemoteBacklogPush::Accepted
+        );
+        manager.abort_flow(first_id.key).expect("abort first flow");
+        manager
+            .abort_flow(second_id.key)
+            .expect("abort second flow");
+        manager.poll(SmolInstant::from_millis(10));
+        let mut bridges = HashMap::new();
+        let mut removable = Vec::new();
+
+        let count = prune_closed_flows(&mut manager, &mut bridges, &mut backlogs, &mut removable)
+            .expect("prune closed flows");
+
+        assert_eq!(count, 2);
+        assert!(removable.is_empty());
+        assert_eq!(manager.active_flow_count(), 0);
+        assert_eq!(backlogs.active_flow_count(), 0);
+        assert_eq!(backlogs.total_bytes(), 0);
+    }
+
+    #[test]
     fn stale_remote_data_storm_after_flow_removal_is_bounded() {
         let client_ip = Ipv4Addr::new(10, 255, 255, 2);
         let destination_ip = Ipv4Addr::new(192, 168, 1, 10);

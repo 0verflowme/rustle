@@ -1091,6 +1091,50 @@ mod tests {
     }
 
     #[test]
+    fn tcp_flags_opening_syn_requires_syn_without_ack_or_rst() {
+        for (flags, expected) in [
+            (
+                TcpFlags {
+                    syn: true,
+                    ack: false,
+                    fin: false,
+                    rst: false,
+                },
+                true,
+            ),
+            (
+                TcpFlags {
+                    syn: true,
+                    ack: true,
+                    fin: false,
+                    rst: false,
+                },
+                false,
+            ),
+            (
+                TcpFlags {
+                    syn: true,
+                    ack: false,
+                    fin: false,
+                    rst: true,
+                },
+                false,
+            ),
+            (
+                TcpFlags {
+                    syn: false,
+                    ack: false,
+                    fin: false,
+                    rst: false,
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(flags.is_opening_syn(), expected, "{flags:?}");
+        }
+    }
+
+    #[test]
     fn parse_ipv4_tcp_segment_ignores_non_tcp_ipv4() {
         let mut packet = [0_u8; 28];
         let packet_len = packet.len() as u16;
@@ -1249,6 +1293,77 @@ mod tests {
 
         assert_eq!(ids, vec![id]);
         assert_eq!(ids.capacity(), capacity);
+    }
+
+    #[test]
+    fn flow_manager_ready_flows_include_only_established_flows() {
+        let first = ipv4_tcp_packet(0x02, 0);
+        let first_flow = parse_ipv4_tcp_segment(&first)
+            .expect("valid packet")
+            .expect("TCP segment")
+            .flow;
+        let mut second = ipv4_tcp_packet(0x02, 0);
+        second[20..22].copy_from_slice(&49153_u16.to_be_bytes());
+        let second_flow = parse_ipv4_tcp_segment(&second)
+            .expect("valid packet")
+            .expect("TCP segment")
+            .flow;
+        let missing_flow = FlowKey::tcp(
+            Ipv4Addr::new(192, 0, 2, 1),
+            1,
+            Ipv4Addr::new(192, 0, 2, 2),
+            2,
+        );
+        let mut manager = FlowManager::new(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+        )
+        .expect("flow manager");
+
+        manager
+            .ingest_packet(Instant::from_millis(0), &first)
+            .expect("first SYN");
+        manager
+            .ingest_packet(Instant::from_millis(0), &second)
+            .expect("second SYN");
+        manager
+            .mark_flow_state(first_flow, FlowState::TcpEstablished)
+            .expect("mark first established");
+
+        assert!(manager.contains_flow(first_flow));
+        assert!(manager.contains_flow(second_flow));
+        assert!(!manager.contains_flow(missing_flow));
+        let flow_keys = manager.flow_keys();
+        assert_eq!(flow_keys.len(), 2);
+        assert!(flow_keys.contains(&first_flow));
+        assert!(flow_keys.contains(&second_flow));
+
+        let ready = manager.ready_to_bridge_flows();
+        assert_eq!(ready.len(), 1);
+        assert!(ready.contains(&first_flow));
+        assert!(!ready.contains(&second_flow));
+    }
+
+    #[test]
+    fn flow_manager_returns_configured_policy() {
+        let policy = FlowPolicy {
+            max_active_flows: 3,
+            opening_timeout: Duration::from_millis(7),
+            bridge_open_timeout: Duration::from_millis(11),
+            idle_timeout: Duration::from_millis(13),
+        };
+        let manager = FlowManager::with_policy(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+            policy,
+        )
+        .expect("flow manager");
+
+        assert_eq!(manager.policy(), policy);
     }
 
     #[test]
@@ -1411,6 +1526,34 @@ mod tests {
 
         assert_eq!(removable, vec![flow]);
         assert_eq!(removable.capacity(), removable_capacity);
+    }
+
+    #[test]
+    fn flow_manager_does_not_remove_terminal_state_while_socket_is_open() {
+        let packet = ipv4_tcp_packet(0x02, 0);
+        let flow = parse_ipv4_tcp_segment(&packet)
+            .expect("valid packet")
+            .expect("TCP segment")
+            .flow;
+        let mut manager = FlowManager::new(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+        )
+        .expect("flow manager");
+        manager
+            .ingest_packet(Instant::from_millis(0), &packet)
+            .expect("opening SYN");
+
+        manager
+            .mark_flow_state(flow, FlowState::Reset)
+            .expect("mark terminal without closing socket");
+        assert!(manager.removable_flows().is_empty());
+
+        manager.abort_flow(flow).expect("abort flow socket");
+        manager.poll(Instant::from_millis(1));
+        assert_eq!(manager.removable_flows(), vec![flow]);
     }
 
     #[test]
@@ -1650,6 +1793,111 @@ mod tests {
     }
 
     #[test]
+    fn recv_flow_bytes_preserves_buffer_wait_marker_after_partial_read() {
+        let (
+            mut manager,
+            mut client_iface,
+            mut client_device,
+            mut client_sockets,
+            client_handle,
+            flow,
+            mut now,
+        ) = established_flow_with_client();
+        let request = b"abcdef";
+
+        {
+            let client = client_sockets.get_mut::<tcp::Socket>(client_handle);
+            client.send_slice(request).expect("client send request");
+        }
+        for _ in 0..64 {
+            client_iface.poll(now, &mut client_device, &mut client_sockets);
+            pump_client_to_manager(now, &mut client_device, &mut manager);
+            if manager.recv_queue_len(flow).expect("recv queue") == request.len() {
+                break;
+            }
+            now += Duration::from_millis(1);
+        }
+        assert_eq!(
+            manager.recv_queue_len(flow).expect("recv queue"),
+            request.len()
+        );
+
+        let first = manager
+            .recv_flow_bytes_with_metrics(flow, 2, now + Duration::from_millis(5))
+            .expect("first partial recv");
+        assert_eq!(first.bytes.as_ref(), b"ab");
+        assert_eq!(first.tcp_recv_queue_wait_us, Some(5_000));
+        assert_eq!(manager.recv_queue_len(flow).expect("remaining queue"), 4);
+
+        let second = manager
+            .recv_flow_bytes_with_metrics(flow, 4, now + Duration::from_millis(8))
+            .expect("second partial recv");
+        assert_eq!(second.bytes.as_ref(), b"cdef");
+        assert_eq!(second.tcp_recv_queue_wait_us, Some(8_000));
+        assert_eq!(manager.recv_queue_len(flow).expect("drained queue"), 0);
+    }
+
+    #[test]
+    fn zero_length_remote_send_does_not_update_flow_activity() {
+        let (
+            mut manager,
+            _client_iface,
+            _client_device,
+            _client_sockets,
+            _client_handle,
+            flow,
+            now,
+        ) = established_flow_with_client();
+        let before = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key == flow)
+            .expect("flow snapshot");
+
+        assert_eq!(
+            manager
+                .send_flow_bytes_at(flow, b"", now + Duration::from_millis(10))
+                .expect("empty send"),
+            0
+        );
+        let after_empty_send = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key == flow)
+            .expect("flow snapshot");
+        assert_eq!(after_empty_send.remote_to_local_bytes, 0);
+        assert_eq!(after_empty_send.last_activity, before.last_activity);
+
+        assert_eq!(
+            manager
+                .try_send_flow_bytes(flow, b"ok")
+                .expect("try send bytes"),
+            Some(2)
+        );
+        let after_try_send = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key == flow)
+            .expect("flow snapshot");
+        assert_eq!(after_try_send.remote_to_local_bytes, 2);
+        assert_eq!(after_try_send.last_activity, before.last_activity);
+
+        assert_eq!(
+            manager
+                .try_send_flow_bytes_at(flow, b"", now + Duration::from_millis(12))
+                .expect("empty try send"),
+            Some(0)
+        );
+        let after_empty_try_send = manager
+            .snapshots()
+            .into_iter()
+            .find(|snapshot| snapshot.key == flow)
+            .expect("flow snapshot");
+        assert_eq!(after_empty_try_send.remote_to_local_bytes, 2);
+        assert_eq!(after_empty_try_send.last_activity, before.last_activity);
+    }
+
+    #[test]
     fn flow_manager_advertises_mtu_derived_mss_in_syn_ack() {
         let client_ip = Ipv4Addr::new(10, 255, 255, 2);
         let tun_ip = Ipv4Addr::new(10, 255, 255, 1);
@@ -1841,6 +2089,29 @@ mod tests {
     }
 
     #[test]
+    fn packet_queue_device_receive_without_tx_buffer_preserves_rx_packet() {
+        let mut device = PacketQueueDevice::new(64);
+        device.inject([0xaa]).expect("inject first packet");
+        for index in 1..(PACKET_QUEUE_CAPACITY - PACKET_QUEUE_TX_RESERVE) {
+            device
+                .inject([index as u8])
+                .expect("fill RX while preserving TX reserve");
+        }
+        let held_tx = device
+            .transmit(Instant::from_millis(0))
+            .expect("hold final free buffer");
+
+        assert!(device.receive(Instant::from_millis(0)).is_none());
+        drop(held_tx);
+
+        let (rx, tx) = device
+            .receive(Instant::from_millis(0))
+            .expect("RX packet should still be queued after TX buffer returns");
+        rx.consume(|bytes| assert_eq!(bytes, &[0xaa]));
+        drop(tx);
+    }
+
+    #[test]
     fn packet_queue_device_recycles_drained_tx_packet_buffers() {
         let mut device = PacketQueueDevice::new(64);
         {
@@ -1858,6 +2129,49 @@ mod tests {
         for _ in 0..(PACKET_QUEUE_CAPACITY - PACKET_QUEUE_TX_RESERVE) {
             device.inject([1_u8]).expect("buffer recycled after drain");
         }
+    }
+
+    #[test]
+    fn packet_queue_device_recycles_unconsumed_rx_token_on_drop() {
+        let mut device = PacketQueueDevice::new(64);
+        device.inject([9_u8]).expect("inject packet");
+        let (rx, tx) = device
+            .receive(Instant::from_millis(0))
+            .expect("receive packet");
+
+        drop(rx);
+        drop(tx);
+
+        for _ in 0..(PACKET_QUEUE_CAPACITY - PACKET_QUEUE_TX_RESERVE) {
+            device
+                .inject([1_u8])
+                .expect("dropped RX token should recycle packet buffer");
+        }
+    }
+
+    #[test]
+    fn packet_buf_is_empty_reflects_drained_packet_length() {
+        let mut device = PacketQueueDevice::new(64);
+        {
+            let tx = device
+                .transmit(Instant::from_millis(0))
+                .expect("available TX buffer");
+            tx.consume(0, |_| {});
+        }
+        {
+            let tx = device
+                .transmit(Instant::from_millis(0))
+                .expect("available TX buffer");
+            tx.consume(4, |bytes| bytes.copy_from_slice(b"rust"));
+        }
+
+        let packets = device.drain_tx();
+
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].len(), 0);
+        assert!(packets[0].is_empty());
+        assert_eq!(packets[1].len(), 4);
+        assert!(!packets[1].is_empty());
     }
 
     #[test]
@@ -2097,6 +2411,70 @@ mod tests {
         }
 
         assert!(connected, "two-interface custom device handshake failed");
+    }
+
+    fn established_flow_with_client() -> (
+        FlowManager,
+        Interface,
+        PacketQueueDevice,
+        SocketSet<'static>,
+        smoltcp::iface::SocketHandle,
+        FlowKey,
+        Instant,
+    ) {
+        let client_ip = Ipv4Addr::new(10, 255, 255, 2);
+        let tun_ip = Ipv4Addr::new(10, 255, 255, 1);
+        let destination = IpAddress::v4(172, 16, 0, 9);
+        let destination_port = 443;
+        let client_port = 49152;
+        let flow = FlowKey::tcp(
+            client_ip,
+            client_port,
+            Ipv4Addr::new(172, 16, 0, 9),
+            destination_port,
+        );
+        let mut manager = FlowManager::new(
+            tun_ip,
+            24,
+            &[Ipv4NetParts::new(Ipv4Addr::new(172, 16, 0, 0), 16)],
+            1300,
+        )
+        .expect("flow manager");
+        let (mut client_iface, mut client_device, mut client_sockets, client_handle) =
+            synthetic_client(
+                client_ip,
+                tun_ip,
+                destination,
+                destination_port,
+                client_port,
+            );
+        let mut now = Instant::from_millis(0);
+
+        for _ in 0..256 {
+            client_iface.poll(now, &mut client_device, &mut client_sockets);
+            pump_client_to_manager(now, &mut client_device, &mut manager);
+            pump_manager_to_client(now, &mut manager, &mut client_device);
+
+            if manager
+                .snapshots()
+                .iter()
+                .any(|snapshot| snapshot.key == flow && snapshot.state == FlowState::TcpEstablished)
+            {
+                return (
+                    manager,
+                    client_iface,
+                    client_device,
+                    client_sockets,
+                    client_handle,
+                    flow,
+                    now,
+                );
+            }
+
+            now += Duration::from_millis(1);
+        }
+
+        panic!("synthetic flow did not reach TcpEstablished");
     }
 
     fn synthetic_client(

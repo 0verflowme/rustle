@@ -1256,6 +1256,110 @@ mod tests {
     }
 
     #[test]
+    fn control_route_setup_skips_unspecified_gateway_routes() {
+        #[derive(Clone)]
+        struct UnspecifiedGatewayControlRouteExecutor {
+            calls: Arc<Mutex<Vec<(RouteAction, Ipv4Addr)>>>,
+        }
+
+        impl ControlRouteCommandExecutor for UnspecifiedGatewayControlRouteExecutor {
+            fn lookup_route_to(&self, _target: Ipv4Addr) -> Result<ExistingRoute> {
+                Ok(ExistingRoute {
+                    gateway: Some(Ipv4Addr::UNSPECIFIED),
+                    if_name: Some("en0".to_owned()),
+                    if_index: Some(7),
+                })
+            }
+
+            fn run_control_route_command(
+                &self,
+                action: RouteAction,
+                target: Ipv4Addr,
+                _route: &ExistingRoute,
+            ) -> Result<()> {
+                self.calls.lock().unwrap().push((action, target));
+                Ok(())
+            }
+        }
+
+        let target = Ipv4Addr::new(192, 168, 1, 47);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let guard = add_ssh_control_route_with(
+            target,
+            UnspecifiedGatewayControlRouteExecutor {
+                calls: calls.clone(),
+            },
+        )
+        .expect("unspecified gateway control route lookup should succeed");
+
+        assert!(guard.is_none());
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(!route_requires_control_host_route(&ExistingRoute {
+            gateway: None,
+            if_name: Some("en0".to_owned()),
+            if_index: Some(7),
+        }));
+        assert!(!route_requires_control_host_route(&ExistingRoute {
+            gateway: Some(Ipv4Addr::UNSPECIFIED),
+            if_name: Some("en0".to_owned()),
+            if_index: Some(7),
+        }));
+        assert!(route_requires_control_host_route(&ExistingRoute {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            if_name: Some("en0".to_owned()),
+            if_index: Some(7),
+        }));
+    }
+
+    #[test]
+    fn control_route_setup_propagates_add_failure_without_delete() {
+        #[derive(Clone)]
+        struct FailingAddControlRouteExecutor {
+            calls: Arc<Mutex<Vec<(RouteAction, Ipv4Addr)>>>,
+        }
+
+        impl ControlRouteCommandExecutor for FailingAddControlRouteExecutor {
+            fn lookup_route_to(&self, _target: Ipv4Addr) -> Result<ExistingRoute> {
+                Ok(ExistingRoute {
+                    gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                    if_name: Some("en0".to_owned()),
+                    if_index: Some(7),
+                })
+            }
+
+            fn run_control_route_command(
+                &self,
+                action: RouteAction,
+                target: Ipv4Addr,
+                _route: &ExistingRoute,
+            ) -> Result<()> {
+                self.calls.lock().unwrap().push((action, target));
+                if matches!(action, RouteAction::Add) {
+                    bail!("injected control route add failure");
+                }
+                Ok(())
+            }
+        }
+
+        let target = Ipv4Addr::new(203, 0, 113, 10);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let result = add_ssh_control_route_with(
+            target,
+            FailingAddControlRouteExecutor {
+                calls: calls.clone(),
+            },
+        );
+        let err = match result {
+            Ok(_) => panic!("control route add failure should be reported"),
+            Err(err) => err,
+        };
+        assert!(err
+            .to_string()
+            .contains("failed to add SSH control host route"));
+        assert_eq!(*calls.lock().unwrap(), vec![(RouteAction::Add, target)]);
+    }
+
+    #[test]
     fn target_cidr_parser_accepts_sshuttle_abbreviations() {
         let full = parse_target_cidr("0/0").expect("parse full-tunnel shorthand");
         assert_eq!(full.network(), Ipv4Addr::new(0, 0, 0, 0));
@@ -1366,6 +1470,75 @@ mod tests {
                 if_name: None,
                 if_index: Some(42),
             }
+        );
+    }
+
+    #[test]
+    fn route_get_parsers_reject_missing_required_fields() {
+        assert!(parse_macos_route_get("route to: 1.1.1.1\n").is_err());
+        assert!(parse_linux_route_get("1.1.1.1 via 192.168.1.1 src 192.168.1.10\n").is_err());
+        assert!(parse_windows_find_net_route("").is_err());
+        assert!(parse_windows_find_net_route("not-an-index 192.168.1.1\n").is_err());
+        assert!(parse_windows_find_net_route("42 not-an-ip\n").is_err());
+    }
+
+    #[test]
+    fn control_route_builders_validate_required_route_fields() {
+        let target = Ipv4Addr::new(203, 0, 113, 10);
+
+        let interface_only_route = ExistingRoute {
+            gateway: None,
+            if_name: Some("en0".to_owned()),
+            if_index: Some(42),
+        };
+        assert_eq!(
+            macos_control_route_command(RouteAction::Add, target, &interface_only_route).unwrap(),
+            (
+                "route".to_owned(),
+                vec!["add", "-host", "203.0.113.10", "-interface", "en0"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            )
+        );
+
+        let missing_interface = ExistingRoute {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 254)),
+            if_name: None,
+            if_index: Some(42),
+        };
+        assert!(linux_control_route_command(RouteAction::Add, target, &missing_interface).is_err());
+        assert!(
+            linux_control_route_command(RouteAction::Delete, target, &missing_interface).is_ok()
+        );
+
+        let missing_macos_next_hop = ExistingRoute {
+            gateway: None,
+            if_name: None,
+            if_index: Some(42),
+        };
+        assert!(
+            macos_control_route_command(RouteAction::Add, target, &missing_macos_next_hop).is_err()
+        );
+
+        let missing_windows_index = ExistingRoute {
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 254)),
+            if_name: Some("Ethernet".to_owned()),
+            if_index: None,
+        };
+        assert!(
+            windows_control_route_command(RouteAction::Add, target, &missing_windows_index)
+                .is_err()
+        );
+
+        let missing_windows_gateway = ExistingRoute {
+            gateway: None,
+            if_name: Some("Ethernet".to_owned()),
+            if_index: Some(42),
+        };
+        assert!(
+            windows_control_route_command(RouteAction::Add, target, &missing_windows_gateway)
+                .is_err()
         );
     }
 }

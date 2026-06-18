@@ -125,6 +125,30 @@ mod tests {
     }
 
     #[test]
+    fn auto_agent_session_count_changes_only_after_square_thresholds() {
+        let cases = [
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 2),
+            (5, 3),
+            (8, 3),
+            (9, 3),
+            (10, 4),
+            (16, 4),
+            (17, 4),
+        ];
+
+        for (parallelism, expected) in cases {
+            assert_eq!(
+                recommended_agent_session_count_for_parallelism(parallelism),
+                expected,
+                "parallelism {parallelism}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_established_message_reports_degraded_lane_pool() {
         assert_eq!(
             format_agent_established_message(3, 4),

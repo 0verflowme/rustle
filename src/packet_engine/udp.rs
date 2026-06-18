@@ -269,6 +269,21 @@ mod tests {
         Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
 
     #[test]
+    fn udp_tunnel_parser_admits_generic_udp_but_not_dns() {
+        let dns_packet = ipv4_udp_packet(dns::DNS_PORT, b"dns-query");
+        assert!(parse_udp_request_for_agent_tunnel(&dns_packet).is_none());
+
+        let generic_packet = ipv4_udp_packet(12345, b"generic");
+        let request = parse_udp_request_for_agent_tunnel(&generic_packet).expect("generic UDP");
+
+        assert_eq!(request.src_ip, Ipv4Addr::new(10, 255, 255, 2));
+        assert_eq!(request.dst_ip, Ipv4Addr::new(192, 0, 2, 10));
+        assert_eq!(request.src_port, 49152);
+        assert_eq!(request.dst_port, 12345);
+        assert_eq!(request.payload.as_ref(), b"generic");
+    }
+
+    #[test]
     fn udp_response_backpressure_cannot_block_close_accounting() {
         let key = UdpFlowKey {
             src_ip: Ipv4Addr::new(10, 255, 255, 2),
@@ -669,5 +684,24 @@ mod tests {
         assert_eq!(stats.udp_dropped, 1);
         assert_eq!(stats.udp_ok, 0);
         assert_eq!(stats.udp_failed, 1);
+    }
+
+    fn ipv4_udp_packet(dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp_len = 8 + payload.len();
+        let total_len = 20 + udp_len;
+        let mut packet = vec![0_u8; total_len];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 255, 255, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 10]);
+
+        let udp = &mut packet[20..];
+        udp[0..2].copy_from_slice(&49152_u16.to_be_bytes());
+        udp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+        udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        udp[8..].copy_from_slice(payload);
+        packet
     }
 }

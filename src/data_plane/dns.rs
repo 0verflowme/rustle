@@ -350,6 +350,134 @@ mod tests {
         assert_eq!(response.as_ptr(), ptr);
     }
 
+    fn dns_data_frame(payload: impl Into<Bytes>) -> agent_proto::AgentFrame {
+        agent_proto::AgentFrame::new(agent_proto::AgentFrameKind::Data, 0, payload)
+            .expect("scripted DNS data frame")
+    }
+
+    fn dns_control_frame(
+        kind: agent_proto::AgentFrameKind,
+        payload: impl Into<Bytes>,
+    ) -> agent_proto::AgentFrame {
+        agent_proto::AgentFrame::new(kind, 0, payload).expect("scripted DNS control frame")
+    }
+
+    fn tcp_dns_payload(body: &[u8]) -> Bytes {
+        let mut payload = BytesMut::with_capacity(body.len() + 2);
+        payload.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        payload.extend_from_slice(body);
+        payload.freeze()
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_query_accepts_exact_u16_max_and_rejects_larger() {
+        let (stream, sent) =
+            AgentIoStream::scripted_for_test([Ok(Some(dns_data_frame(tcp_dns_payload(b""))))]);
+        let max_query = vec![0x51; u16::MAX as usize];
+        let response = query_dns_over_agent_tcp_stream(stream, &max_query)
+            .await
+            .expect("max-size TCP DNS query should be accepted");
+        assert!(response.is_empty());
+
+        {
+            let sent = sent.lock().expect("scripted sent frame lock");
+            assert_eq!(sent.len(), 3);
+            assert_eq!(sent[0].kind, agent_proto::AgentFrameKind::Data);
+            assert_eq!(sent[0].payload.len(), u16::MAX as usize + 2);
+            assert_eq!(&sent[0].payload[..2], &u16::MAX.to_be_bytes());
+            assert_eq!(sent[1].kind, agent_proto::AgentFrameKind::Eof);
+            assert_eq!(sent[2].kind, agent_proto::AgentFrameKind::Close);
+        }
+
+        let (stream, sent) = AgentIoStream::scripted_for_test([]);
+        let too_large = vec![0x51; u16::MAX as usize + 1];
+        let err = query_dns_over_agent_tcp_stream(stream, &too_large)
+            .await
+            .expect_err("oversized TCP DNS query should fail before write");
+        assert!(err.to_string().contains("length limit"));
+        assert!(sent.lock().expect("scripted sent frame lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_accepts_exact_max_response_length() {
+        let body = vec![0xa5; u16::MAX as usize];
+        let (stream, _sent) =
+            AgentIoStream::scripted_for_test([Ok(Some(dns_data_frame(tcp_dns_payload(&body))))]);
+
+        let response = query_dns_over_agent_tcp_stream(stream, b"\x12\x34query")
+            .await
+            .expect("max-size TCP DNS response should be accepted");
+
+        assert_eq!(response.len(), u16::MAX as usize);
+        assert!(response.iter().all(|byte| *byte == 0xa5));
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_rejects_incomplete_length_prefixed_response() {
+        let mut partial = BytesMut::new();
+        partial.extend_from_slice(&4_u16.to_be_bytes());
+        partial.extend_from_slice(b"xy");
+        let (stream, _sent) = AgentIoStream::scripted_for_test([
+            Ok(Some(dns_data_frame(partial.freeze()))),
+            Ok(Some(dns_control_frame(
+                agent_proto::AgentFrameKind::Eof,
+                Bytes::new(),
+            ))),
+        ]);
+
+        let err = query_dns_over_agent_tcp_stream(stream, b"\x12\x34query")
+            .await
+            .expect_err("incomplete TCP DNS response should fail");
+
+        assert!(err.to_string().contains("complete TCP DNS response"));
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_and_udp_reset_frames_return_reset_errors() {
+        let (tcp_stream, _sent) = AgentIoStream::scripted_for_test([Ok(Some(dns_control_frame(
+            agent_proto::AgentFrameKind::Reset,
+            Bytes::from_static(b"tcp reset"),
+        )))]);
+        let err = query_dns_over_agent_tcp_stream(tcp_stream, b"\x12\x34query")
+            .await
+            .expect_err("TCP DNS reset should fail");
+        assert!(err.to_string().contains("tcp reset"));
+
+        let (udp_stream, sent) = AgentIoStream::scripted_for_test([Ok(Some(dns_control_frame(
+            agent_proto::AgentFrameKind::Reset,
+            Bytes::from_static(b"udp reset"),
+        )))]);
+        let err = query_dns_over_agent_udp_stream(udp_stream, b"\x12\x34query")
+            .await
+            .expect_err("UDP DNS reset should fail");
+        assert!(err.to_string().contains("udp reset"));
+        let sent = sent.lock().expect("scripted sent frame lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, agent_proto::AgentFrameKind::Data);
+        assert_eq!(&sent[0].payload[..], b"\x12\x34query");
+    }
+
+    #[tokio::test]
+    async fn dns_tcp_and_udp_eof_before_response_is_reported_as_incomplete() {
+        let (tcp_stream, _sent) = AgentIoStream::scripted_for_test([Ok(Some(dns_control_frame(
+            agent_proto::AgentFrameKind::Close,
+            Bytes::new(),
+        )))]);
+        let err = query_dns_over_agent_tcp_stream(tcp_stream, b"\x12\x34query")
+            .await
+            .expect_err("TCP DNS close before response should fail");
+        assert!(err.to_string().contains("complete TCP DNS response"));
+
+        let (udp_stream, _sent) = AgentIoStream::scripted_for_test([Ok(Some(dns_control_frame(
+            agent_proto::AgentFrameKind::Eof,
+            Bytes::new(),
+        )))]);
+        let err = query_dns_over_agent_udp_stream(udp_stream, b"\x12\x34query")
+            .await
+            .expect_err("UDP DNS EOF before response should fail");
+        assert!(err.to_string().contains("UDP DNS response"));
+    }
+
     #[tokio::test]
     async fn dns_over_agent_round_trips_tcp_dns_payload() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

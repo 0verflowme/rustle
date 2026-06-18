@@ -274,6 +274,93 @@ mod tests {
     const UDP_ASSOCIATION_IDLE_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_UDP_ASSOCIATION_IDLE_TIMEOUT_MS);
 
+    fn scripted_udp_frame(
+        kind: agent_proto::AgentFrameKind,
+        payload: impl Into<Bytes>,
+    ) -> agent_proto::AgentFrame {
+        agent_proto::AgentFrame::new(kind, 0, payload).expect("scripted UDP frame")
+    }
+
+    #[tokio::test]
+    async fn udp_association_reset_returns_error_without_response_event() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 0, 2, 10),
+            dst_port: 53,
+        };
+        let (stream, _sent) = AgentIoStream::scripted_for_test([Ok(Some(scripted_udp_frame(
+            agent_proto::AgentFrameKind::Reset,
+            Bytes::from_static(b"udp reset"),
+        )))]);
+        let (_to_remote, mut from_local) = mpsc::channel(1);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+
+        let err = run_udp_association_stream(
+            stream,
+            key,
+            &mut from_local,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect_err("reset frame should fail UDP association");
+
+        assert!(err.to_string().contains("udp reset"));
+        assert!(response_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn udp_association_forwards_response_and_closes_on_remote_close() {
+        let key = UdpFlowKey {
+            src_ip: Ipv4Addr::new(10, 255, 255, 1),
+            src_port: 49152,
+            dst_ip: Ipv4Addr::new(192, 0, 2, 10),
+            dst_port: 53,
+        };
+        let (stream, sent) = AgentIoStream::scripted_for_test([
+            Ok(Some(scripted_udp_frame(
+                agent_proto::AgentFrameKind::Data,
+                Bytes::from_static(b"answer"),
+            ))),
+            Ok(Some(scripted_udp_frame(
+                agent_proto::AgentFrameKind::Close,
+                Bytes::new(),
+            ))),
+        ]);
+        let (_to_remote, mut from_local) = mpsc::channel(1);
+        let (response_tx, mut response_rx) = mpsc::channel(1);
+        let (close_tx, _close_rx) = mpsc::channel(1);
+
+        run_udp_association_stream(
+            stream,
+            key,
+            &mut from_local,
+            UdpAssociationEvents {
+                response_tx,
+                close_tx,
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("remote close after response should end cleanly");
+
+        let response = response_rx.try_recv().expect("UDP response event");
+        assert_eq!(response.key, key);
+        assert_eq!(&response.payload[..], b"answer");
+        assert_eq!(
+            sent.lock()
+                .expect("scripted sent frame lock")
+                .last()
+                .map(|frame| frame.kind),
+            Some(agent_proto::AgentFrameKind::Close)
+        );
+    }
+
     #[tokio::test]
     async fn udp_over_agent_round_trips_datagram() {
         let socket = tokio::net::UdpSocket::bind(("127.0.0.1", 0))

@@ -1,5 +1,9 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 use crate::agent_proto;
 
@@ -39,6 +43,11 @@ pub(crate) enum AgentIoStream {
         opened_reported: bool,
     },
     QuicNativeUdp(QuicNativeBridgeStream),
+    #[cfg(test)]
+    Scripted {
+        inbound: mpsc::Receiver<Result<Option<agent_proto::AgentFrame>>>,
+        sent: Arc<Mutex<Vec<agent_proto::AgentFrame>>>,
+    },
     #[cfg(test)]
     Raw(agent_transport::AgentStream),
 }
@@ -93,6 +102,25 @@ impl AgentIoStream {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn scripted_for_test(
+        frames: impl IntoIterator<Item = Result<Option<agent_proto::AgentFrame>>>,
+    ) -> (Self, Arc<Mutex<Vec<agent_proto::AgentFrame>>>) {
+        let (tx, inbound) = mpsc::channel(64);
+        for frame in frames {
+            tx.try_send(frame).expect("queue scripted agent frame");
+        }
+        drop(tx);
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self::Scripted {
+                inbound,
+                sent: Arc::clone(&sent),
+            },
+            sent,
+        )
+    }
+
     pub(crate) async fn send_data(&mut self, bytes: impl Into<Bytes>) -> Result<()> {
         self.send_data_with_metrics(bytes).await.map(|_| ())
     }
@@ -118,6 +146,20 @@ impl AgentIoStream {
                 Ok(StreamSendMetrics::default())
             }
             #[cfg(test)]
+            Self::Scripted { sent, .. } => {
+                sent.lock()
+                    .expect("scripted sent frame lock")
+                    .push(agent_proto::AgentFrame::new(
+                        agent_proto::AgentFrameKind::Data,
+                        0,
+                        bytes.into(),
+                    )?);
+                Ok(StreamSendMetrics {
+                    agent_outbound_frames: 1,
+                    ..StreamSendMetrics::default()
+                })
+            }
+            #[cfg(test)]
             Self::Raw(stream) => stream.send_data_with_metrics(bytes).await.map(Into::into),
         }
     }
@@ -131,6 +173,17 @@ impl AgentIoStream {
                 .context("failed to send EOF over direct-tcpip channel"),
             Self::QuicNativeTcp { stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(stream) => stream.send_eof().await,
+            #[cfg(test)]
+            Self::Scripted { sent, .. } => {
+                sent.lock()
+                    .expect("scripted sent frame lock")
+                    .push(agent_proto::AgentFrame::new(
+                        agent_proto::AgentFrameKind::Eof,
+                        0,
+                        Bytes::new(),
+                    )?);
+                Ok(())
+            }
             #[cfg(test)]
             Self::Raw(stream) => stream.send_eof().await,
         }
@@ -219,6 +272,11 @@ impl AgentIoStream {
                 Err(err) => Err(err).context("failed to read native QUIC UDP datagram"),
             },
             #[cfg(test)]
+            Self::Scripted { inbound, .. } => match inbound.recv().await {
+                Some(result) => result,
+                None => Ok(None),
+            },
+            #[cfg(test)]
             Self::Raw(stream) => Ok(stream.recv().await),
         }
     }
@@ -226,6 +284,13 @@ impl AgentIoStream {
     pub(crate) async fn try_recv(&mut self) -> Result<Option<agent_proto::AgentFrame>> {
         match self {
             Self::Bridge { stream, .. } => Ok(stream.try_recv().await),
+            #[cfg(test)]
+            Self::Scripted { inbound, .. } => match inbound.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    Ok(None)
+                }
+            },
             #[cfg(test)]
             Self::Raw(stream) => Ok(stream.try_recv().await),
             Self::DirectTcpip { .. } | Self::QuicNativeTcp { .. } | Self::QuicNativeUdp(_) => {
@@ -244,6 +309,17 @@ impl AgentIoStream {
             Self::QuicNativeTcp { mut stream, .. } => stream.send_eof().await,
             Self::QuicNativeUdp(mut stream) => stream.send_eof().await,
             #[cfg(test)]
+            Self::Scripted { sent, .. } => {
+                sent.lock()
+                    .expect("scripted sent frame lock")
+                    .push(agent_proto::AgentFrame::new(
+                        agent_proto::AgentFrameKind::Close,
+                        0,
+                        Bytes::new(),
+                    )?);
+                Ok(())
+            }
+            #[cfg(test)]
             Self::Raw(stream) => stream.close().await,
         }
     }
@@ -255,6 +331,25 @@ mod tests {
 
     use super::super::test_support::test_quic_native_bridge;
     use super::*;
+
+    #[tokio::test]
+    async fn scripted_send_data_with_metrics_reports_outbound_frame_count() {
+        let (mut stream, sent) = AgentIoStream::scripted_for_test([]);
+
+        let metrics = stream
+            .send_data_with_metrics(Bytes::from_static(b"payload"))
+            .await
+            .expect("scripted send data");
+
+        assert_eq!(metrics.agent_outbound_frames, 1);
+        assert_eq!(metrics.agent_credit_wait_us, 0);
+        assert_eq!(metrics.agent_outbound_wait_us, 0);
+        let sent = sent.lock().expect("scripted sent frame lock");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].kind, agent_proto::AgentFrameKind::Data);
+        assert_eq!(&sent[0].payload[..], b"payload");
+    }
+
     #[tokio::test]
     async fn quic_native_tcp_recv_error_propagates() {
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

@@ -32,10 +32,15 @@ mod tests {
     fn dns_admission_caps_queries_and_tracks_releases() {
         let mut inflight = AdmissionCounter::new(2);
 
+        assert_eq!(inflight.max(), 2);
         assert_eq!(inflight.current(), 0);
         assert!(inflight.try_admit());
         assert!(inflight.try_admit());
         assert!(!inflight.try_admit());
+        assert_eq!(
+            inflight.snapshot(),
+            admission::AdmissionSnapshot { current: 2, max: 2 }
+        );
         assert_eq!(inflight.current(), 2);
         assert_eq!(inflight.dropped(), 1);
 

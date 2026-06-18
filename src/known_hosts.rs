@@ -360,6 +360,57 @@ mod tests {
     }
 
     #[test]
+    fn glob_match_handles_backtracking_single_char_and_trailing_stars() {
+        assert!(glob_match(b"api*.example.?om", b"api-1.example.com"));
+        assert!(glob_match(b"*.example.com", b"deep.api.example.com"));
+        assert!(glob_match(b"api.example.com*", b"api.example.com"));
+        assert!(!glob_match(b"api?.example.com", b"api12.example.com"));
+        assert!(!glob_match(b"api*.example.com", b"api.example.net"));
+    }
+
+    #[test]
+    fn host_match_candidates_are_canonicalized_and_deduped() {
+        let default_port = HostKeyVerifier::new(
+            "Example.COM".to_owned(),
+            22,
+            Some(PathBuf::from("known_hosts")),
+            false,
+            false,
+        );
+        assert_eq!(
+            default_port.host_match_candidates(),
+            vec!["Example.COM".to_owned(), "example.com".to_owned()]
+        );
+
+        let non_default_port = HostKeyVerifier::new(
+            "Example.COM".to_owned(),
+            2222,
+            Some(PathBuf::from("known_hosts")),
+            false,
+            false,
+        );
+        assert_eq!(
+            non_default_port.host_match_candidates(),
+            vec![
+                "[Example.COM]:2222".to_owned(),
+                "[example.com]:2222".to_owned(),
+            ]
+        );
+
+        let lowercase_default = HostKeyVerifier::new(
+            "example.com".to_owned(),
+            22,
+            Some(PathBuf::from("known_hosts")),
+            false,
+            false,
+        );
+        assert_eq!(
+            lowercase_default.host_match_candidates(),
+            vec!["example.com".to_owned()]
+        );
+    }
+
+    #[test]
     fn known_hosts_hashed_name_matches_hmac_sha1_candidate() {
         let salt = b"01234567890123456789";
         let key = hmac::Key::new(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
@@ -451,6 +502,27 @@ mod tests {
     }
 
     #[test]
+    fn host_key_verifier_does_not_accept_cert_authority_marker_as_plain_host_key() {
+        let path = write_temp_known_hosts(&format!(
+            "@cert-authority test.example.com {TEST_ED25519_KEY}\n"
+        ));
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            false,
+        );
+        let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        let err = verifier
+            .verify(&key)
+            .expect_err("cert-authority marker must not satisfy host-key verification");
+        assert!(err.to_string().contains("no usable plain host-key entry"));
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn host_key_verifier_accept_new_records_missing_host_key() {
         struct TempTree {
             path: PathBuf,
@@ -527,6 +599,56 @@ mod tests {
         assert_eq!(
             recorded,
             format!("other.example.com {OTHER_ED25519_KEY}\ntest.example.com {TEST_ED25519_KEY}\n")
+        );
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn known_hosts_leading_newline_detection_handles_missing_empty_and_terminated_files() {
+        let missing = unique_temp_path("rustle-known-hosts-missing").with_extension("tmp");
+        assert!(!known_hosts_needs_leading_newline(&missing).unwrap());
+
+        let empty = write_temp_known_hosts("");
+        assert!(!known_hosts_needs_leading_newline(&empty).unwrap());
+
+        let terminated =
+            write_temp_known_hosts(&format!("other.example.com {OTHER_ED25519_KEY}\n"));
+        assert!(!known_hosts_needs_leading_newline(&terminated).unwrap());
+
+        let unterminated =
+            write_temp_known_hosts(&format!("other.example.com {OTHER_ED25519_KEY}"));
+        assert!(known_hosts_needs_leading_newline(&unterminated).unwrap());
+
+        std::fs::remove_file(empty).ok();
+        std::fs::remove_file(terminated).ok();
+        std::fs::remove_file(unterminated).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accept_new_tightens_existing_known_hosts_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = write_temp_known_hosts(&format!("other.example.com {OTHER_ED25519_KEY}\n"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("relax test file permissions");
+        let verifier = HostKeyVerifier::new(
+            "test.example.com".to_owned(),
+            22,
+            Some(path.clone()),
+            false,
+            true,
+        );
+        let key = TEST_ED25519_KEY.parse::<PublicKey>().unwrap();
+
+        assert!(verifier.verify(&key).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("known_hosts metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
         std::fs::remove_file(path).ok();
     }

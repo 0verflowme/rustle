@@ -557,6 +557,55 @@ mod tests {
     }
 
     #[test]
+    fn encoded_frame_lengths_are_exact_and_additive() {
+        let empty = AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap();
+        let one = AgentFrame::new(AgentFrameKind::Data, 7, Bytes::from_static(b"x")).unwrap();
+        let max = AgentFrame::new(
+            AgentFrameKind::Data,
+            9,
+            Bytes::from(vec![0xa5; AGENT_MAX_FRAME_PAYLOAD]),
+        )
+        .unwrap();
+
+        assert_eq!(encoded_frame_len(&empty).unwrap(), AGENT_FRAME_HEADER_LEN);
+        assert_eq!(encoded_frame_len(&one).unwrap(), AGENT_FRAME_HEADER_LEN + 1);
+        assert_eq!(
+            encoded_frame_len(&max).unwrap(),
+            AGENT_FRAME_HEADER_LEN + AGENT_MAX_FRAME_PAYLOAD
+        );
+        assert_eq!(
+            encoded_frames_len([&empty, &one, &max]).unwrap(),
+            AGENT_FRAME_HEADER_LEN * 3 + 1 + AGENT_MAX_FRAME_PAYLOAD
+        );
+        assert_eq!(
+            encode_frame(&max).unwrap().len(),
+            encoded_frame_len(&max).unwrap()
+        );
+    }
+
+    #[test]
+    fn frame_payload_length_limit_accepts_exact_max_and_rejects_overflow() {
+        let max = AgentFrame::new(
+            AgentFrameKind::Data,
+            1,
+            Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD]),
+        )
+        .expect("exact max frame payload should be valid");
+        assert_eq!(
+            encode_frame(&max).unwrap().len(),
+            AGENT_FRAME_HEADER_LEN + AGENT_MAX_FRAME_PAYLOAD
+        );
+
+        let err = AgentFrame::new(
+            AgentFrameKind::Data,
+            1,
+            Bytes::from(vec![0x5a; AGENT_MAX_FRAME_PAYLOAD + 1]),
+        )
+        .expect_err("one byte over max frame payload should fail");
+        assert!(err.to_string().contains("exceeds"));
+    }
+
+    #[test]
     fn decoder_waits_for_complete_payload() {
         let frame = AgentFrame::new(AgentFrameKind::Data, 7, Bytes::from_static(b"hello")).unwrap();
         let encoded = encode_frame(&frame).unwrap();
@@ -567,6 +616,21 @@ mod tests {
         buf.extend_from_slice(&encoded[split..]);
 
         assert_eq!(try_decode_frame(&mut buf).unwrap().unwrap(), frame);
+    }
+
+    #[test]
+    fn decoder_exact_header_boundary_is_observable() {
+        let frame = AgentFrame::new(AgentFrameKind::Ping, 0, Bytes::new()).unwrap();
+        let encoded = encode_frame(&frame).unwrap();
+        assert_eq!(encoded.len(), AGENT_FRAME_HEADER_LEN);
+
+        let mut short = BytesMut::from(&encoded[..AGENT_FRAME_HEADER_LEN - 1]);
+        assert!(try_decode_frame(&mut short).unwrap().is_none());
+        assert_eq!(short.len(), AGENT_FRAME_HEADER_LEN - 1);
+
+        let mut exact = BytesMut::from(&encoded[..]);
+        assert_eq!(try_decode_frame(&mut exact).unwrap().unwrap(), frame);
+        assert!(exact.is_empty());
     }
 
     #[test]
@@ -664,6 +728,29 @@ mod tests {
     }
 
     #[test]
+    fn host_open_payload_accepts_minimum_and_maximum_host_lengths() {
+        let one_byte = AgentOpenHost {
+            destination_host: "a".to_owned(),
+            destination_port: 443,
+            originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+            originator_port: 49152,
+        };
+        let decoded = AgentOpenHost::decode(&one_byte.encode().unwrap()).unwrap();
+        assert_eq!(decoded, one_byte);
+
+        let max_host = "h".repeat(AGENT_MAX_HOST_LEN);
+        let max = AgentOpenHost {
+            destination_host: max_host,
+            destination_port: 443,
+            originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+            originator_port: 49152,
+        };
+        let encoded = max.encode().expect("max length host should encode");
+        assert_eq!(encoded.len(), 8 + AGENT_MAX_HOST_LEN);
+        assert_eq!(AgentOpenHost::decode(&encoded).unwrap(), max);
+    }
+
+    #[test]
     fn host_open_payload_rejects_invalid_hostnames() {
         let mut empty = BytesMut::new();
         empty.put_u16(53);
@@ -681,6 +768,26 @@ mod tests {
         };
         let err = open.encode().unwrap_err().to_string();
         assert!(err.contains("NUL"));
+    }
+
+    #[test]
+    fn host_open_payload_rejects_hosts_over_wire_length_limit() {
+        let open = AgentOpenHost {
+            destination_host: "x".repeat(AGENT_MAX_HOST_LEN + 1),
+            destination_port: 443,
+            originator_ip: Ipv4Addr::new(10, 255, 255, 1),
+            originator_port: 49152,
+        };
+        let err = open.encode().unwrap_err().to_string();
+        assert!(err.contains("exceeds"));
+
+        let mut encoded = BytesMut::new();
+        encoded.put_u16(443);
+        encoded.put_slice(&Ipv4Addr::new(10, 255, 255, 1).octets());
+        encoded.put_u16(49152);
+        encoded.extend_from_slice("x".repeat(AGENT_MAX_HOST_LEN + 1).as_bytes());
+        let err = AgentOpenHost::decode(&encoded).unwrap_err().to_string();
+        assert!(err.contains("exceeds"));
     }
 
     #[test]

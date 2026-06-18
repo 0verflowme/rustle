@@ -231,3 +231,85 @@ pub(crate) struct AgentBridgeSnapshot {
     pub(crate) writer_flush_us: u64,
     pub(crate) writer_flush_max_us: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lane_repair_flag_blocks_duplicates_and_drives_selection_status() {
+        let lane = AgentBridgeLane::new(0, "rustle agent", None);
+
+        assert!(!lane.is_repairing().await);
+        assert!(lane.try_start_background_repair());
+        assert!(lane.is_repairing().await);
+        assert_eq!(
+            lane.selection_status().await,
+            AgentLaneSelectionStatus::Repairing
+        );
+        assert!(
+            !lane.try_start_background_repair(),
+            "duplicate repair should be coalesced while one is in progress"
+        );
+
+        lane.finish_background_repair().await;
+        assert!(!lane.is_repairing().await);
+        assert_eq!(
+            lane.selection_status().await,
+            AgentLaneSelectionStatus::Missing
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_failure_quarantines_lane_until_open_success_clears_health() {
+        let lane = AgentBridgeLane::new(2, "rustle agent", None);
+        let expected = agent_lane_backoff_duration(2, 1);
+
+        assert_eq!(lane.mark_reconnect_failure().await, expected);
+        let remaining = lane
+            .quarantine_remaining()
+            .await
+            .expect("lane should be quarantined");
+        assert!(remaining > Duration::ZERO);
+        assert!(remaining <= expected);
+        assert_eq!(
+            lane.selection_status().await,
+            AgentLaneSelectionStatus::Quarantined
+        );
+        let err = lane.quarantined_error().await.expect("quarantined error");
+        assert!(err.to_string().contains("lane 2"));
+        let (quarantine_ms, repairing) = lane.snapshot_health().await;
+        assert!(quarantine_ms.is_some());
+        assert!(!repairing);
+
+        lane.mark_open_success().await;
+        assert!(lane.quarantine_remaining().await.is_none());
+        assert_eq!(
+            lane.selection_status().await,
+            AgentLaneSelectionStatus::Missing
+        );
+        let (quarantine_ms, repairing) = lane.snapshot_health().await;
+        assert_eq!(quarantine_ms, None);
+        assert!(!repairing);
+    }
+
+    #[tokio::test]
+    async fn open_success_resets_repairing_and_failure_backoff_state() {
+        let lane = AgentBridgeLane::new(1, "rustle agent", None);
+
+        assert!(lane.try_start_background_repair());
+        let first = lane.mark_reconnect_failure().await;
+        lane.finish_background_repair().await;
+        let second = lane.mark_reconnect_failure().await;
+        assert!(second > first);
+
+        {
+            let mut health = lane.health.lock().await;
+            health.background_repair_in_progress = true;
+        }
+        lane.mark_open_success().await;
+        assert!(!lane.is_repairing().await);
+        assert!(lane.quarantine_remaining().await.is_none());
+        assert_eq!(lane.mark_reconnect_failure().await, first);
+    }
+}

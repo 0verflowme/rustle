@@ -131,3 +131,134 @@ pub(crate) fn agent_lane_bit(index: usize) -> u64 {
     );
     1_u64 << index
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_ipv4_open() -> agent_proto::AgentOpenIpv4 {
+        agent_proto::AgentOpenIpv4 {
+            destination_ip: Ipv4Addr::new(192, 0, 2, 10),
+            destination_port: 443,
+            originator_ip: Ipv4Addr::new(10, 255, 255, 2),
+            originator_port: 49152,
+        }
+    }
+
+    #[test]
+    fn lane_candidates_stay_in_range_and_keep_distinct_secondary() {
+        let hashes = [
+            0,
+            1,
+            FNV1A_OFFSET_BASIS,
+            SECONDARY_LANE_HASH_SALT,
+            u64::MAX,
+            agent_ipv4_lane_hash(&sample_ipv4_open(), TCP_PROTOCOL_NUMBER),
+        ];
+
+        for lanes in 1..=16 {
+            for hash in hashes {
+                let (primary, secondary) = agent_lane_candidates(hash, lanes);
+                assert!(primary < lanes);
+                assert!(secondary < lanes);
+                if lanes == 1 {
+                    assert_eq!((primary, secondary), (0, 0));
+                } else {
+                    assert_ne!(primary, secondary);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ipv4_lane_hash_changes_for_each_flow_identity_field_and_protocol() {
+        let open = sample_ipv4_open();
+        let base = agent_ipv4_lane_hash(&open, TCP_PROTOCOL_NUMBER);
+
+        assert_ne!(
+            base,
+            agent_ipv4_lane_hash(
+                &agent_proto::AgentOpenIpv4 {
+                    destination_ip: Ipv4Addr::new(192, 0, 2, 11),
+                    ..open
+                },
+                TCP_PROTOCOL_NUMBER,
+            )
+        );
+        assert_ne!(
+            base,
+            agent_ipv4_lane_hash(
+                &agent_proto::AgentOpenIpv4 {
+                    destination_port: 8443,
+                    ..open
+                },
+                TCP_PROTOCOL_NUMBER,
+            )
+        );
+        assert_ne!(
+            base,
+            agent_ipv4_lane_hash(
+                &agent_proto::AgentOpenIpv4 {
+                    originator_ip: Ipv4Addr::new(10, 255, 255, 3),
+                    ..open
+                },
+                TCP_PROTOCOL_NUMBER,
+            )
+        );
+        assert_ne!(
+            base,
+            agent_ipv4_lane_hash(
+                &agent_proto::AgentOpenIpv4 {
+                    originator_port: 49153,
+                    ..open
+                },
+                TCP_PROTOCOL_NUMBER,
+            )
+        );
+        assert_ne!(base, agent_ipv4_lane_hash(&open, UDP_PROTOCOL_NUMBER));
+    }
+
+    #[test]
+    fn host_lane_hash_is_case_insensitive_but_still_uses_host_and_protocol() {
+        let upper = agent_proto::AgentOpenHost {
+            destination_host: "Resolver.Internal".to_owned(),
+            destination_port: 53,
+            originator_ip: Ipv4Addr::new(10, 255, 255, 2),
+            originator_port: 49152,
+        };
+        let lower = agent_proto::AgentOpenHost {
+            destination_host: "resolver.internal".to_owned(),
+            ..upper.clone()
+        };
+        let other = agent_proto::AgentOpenHost {
+            destination_host: "other.internal".to_owned(),
+            ..upper.clone()
+        };
+
+        let tcp_hash = agent_host_lane_hash(&upper, TCP_PROTOCOL_NUMBER);
+        assert_eq!(tcp_hash, agent_host_lane_hash(&lower, TCP_PROTOCOL_NUMBER));
+        assert_ne!(tcp_hash, agent_host_lane_hash(&other, TCP_PROTOCOL_NUMBER));
+        assert_ne!(tcp_hash, agent_host_lane_hash(&upper, UDP_PROTOCOL_NUMBER));
+    }
+
+    #[test]
+    fn lane_backoff_uses_exponential_base_jitter_and_cap() {
+        assert_eq!(
+            agent_lane_backoff_duration(0, 0),
+            Duration::from_millis(250 + 11)
+        );
+        assert_eq!(
+            agent_lane_backoff_duration(3, 1),
+            Duration::from_millis(250 + ((3 * 37 + 11) % 100))
+        );
+        assert_eq!(
+            agent_lane_backoff_duration(3, 2),
+            Duration::from_millis(500 + ((3 * 37 + 2 * 11) % 100))
+        );
+        assert_eq!(
+            agent_lane_backoff_duration(2, 8),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(agent_lane_backoff_duration(63, 128), AGENT_LANE_BACKOFF_MAX);
+    }
+}

@@ -283,4 +283,9 @@ impl AgentTransport {
         }
         Ok(stream_id)
     }
+
+    #[cfg(test)]
+    pub(super) fn allocate_stream_id_for_test(&self) -> Result<u64> {
+        self.allocate_stream_id()
+    }
 }

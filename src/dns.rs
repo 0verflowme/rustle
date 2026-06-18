@@ -203,6 +203,94 @@ mod tests {
     }
 
     #[test]
+    fn parse_ipv4_udp_packet_accepts_exact_minimum_non_udp_ipv4_header() {
+        let mut packet = vec![0_u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        packet[9] = 1;
+
+        assert_eq!(parse_ipv4_udp_packet(&packet).expect("valid IPv4"), None);
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_rejects_ipv4_total_length_boundaries() {
+        let mut too_short = vec![0_u8; 20];
+        too_short[0] = 0x45;
+        too_short[2..4].copy_from_slice(&19_u16.to_be_bytes());
+        too_short[9] = 1;
+        assert_eq!(
+            parse_ipv4_udp_packet(&too_short),
+            Err(PacketError::MalformedIpv4)
+        );
+
+        let mut truncated = vec![0_u8; 20];
+        truncated[0] = 0x45;
+        truncated[2..4].copy_from_slice(&21_u16.to_be_bytes());
+        truncated[9] = 1;
+        assert_eq!(
+            parse_ipv4_udp_packet(&truncated),
+            Err(PacketError::MalformedIpv4)
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_rejects_invalid_version_and_ihl() {
+        let mut wrong_version = vec![0_u8; 20];
+        wrong_version[0] = 0x65;
+        wrong_version[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        wrong_version[9] = 1;
+        assert_eq!(
+            parse_ipv4_udp_packet(&wrong_version),
+            Err(PacketError::MalformedIpv4)
+        );
+
+        let mut short_header = vec![0_u8; 20];
+        short_header[0] = 0x44;
+        short_header[2..4].copy_from_slice(&20_u16.to_be_bytes());
+        short_header[9] = 1;
+        assert_eq!(
+            parse_ipv4_udp_packet(&short_header),
+            Err(PacketError::MalformedIpv4)
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_accepts_empty_udp_payload_at_exact_header_length() {
+        let packet = udp_packet(
+            Ipv4Addr::new(10, 255, 255, 2),
+            Ipv4Addr::new(10, 255, 255, 1),
+            53000,
+            12345,
+            b"",
+        );
+
+        let request = parse_ipv4_udp_packet(&packet)
+            .expect("valid packet")
+            .expect("UDP packet");
+
+        assert_eq!(request.src_port, 53000);
+        assert_eq!(request.dst_port, 12345);
+        assert!(request.payload.is_empty());
+    }
+
+    #[test]
+    fn parse_ipv4_udp_packet_rejects_udp_length_below_header_size() {
+        let mut packet = udp_packet(
+            Ipv4Addr::new(10, 255, 255, 2),
+            Ipv4Addr::new(10, 255, 255, 1),
+            53000,
+            12345,
+            b"",
+        );
+        packet[24..26].copy_from_slice(&7_u16.to_be_bytes());
+
+        assert_eq!(
+            parse_ipv4_udp_packet(&packet),
+            Err(PacketError::MalformedUdp)
+        );
+    }
+
+    #[test]
     fn parses_and_builds_generic_udp_response() {
         let packet = udp_packet(
             Ipv4Addr::new(10, 255, 255, 2),
@@ -268,6 +356,42 @@ mod tests {
         assert_eq!(&response[4..6], &query[4..6]);
         assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
         assert_eq!(&response[12..], &query[12..]);
+    }
+
+    #[test]
+    fn servfail_response_preserves_length_and_sets_exact_flags() {
+        for (flags, expected) in [(0x0100_u16, 0x8182_u16), (0x80ff_u16, 0x80f2_u16)] {
+            let mut query = [0_u8; 12];
+            query[0..2].copy_from_slice(&0xabcd_u16.to_be_bytes());
+            query[2..4].copy_from_slice(&flags.to_be_bytes());
+            query[4..6].copy_from_slice(&1_u16.to_be_bytes());
+
+            let response = build_dns_servfail_response(&query).expect("SERVFAIL response");
+
+            assert_eq!(response.len(), query.len());
+            assert_eq!(&response[0..2], &query[0..2]);
+            assert_eq!(u16::from_be_bytes([response[2], response[3]]), expected);
+            assert_eq!(&response[4..6], &query[4..6]);
+            assert_eq!(&response[6..12], &[0, 0, 0, 0, 0, 0]);
+        }
+    }
+
+    #[test]
+    fn servfail_response_requires_complete_dns_header() {
+        assert!(build_dns_servfail_response(&[0_u8; 11]).is_none());
+        assert!(build_dns_servfail_response(&[0_u8; 12]).is_some());
+    }
+
+    #[test]
+    fn ipv4_header_checksum_matches_known_vectors() {
+        let header = [
+            0x45, 0x00, 0x00, 0x54, 0xa6, 0xf2, 0x40, 0x00, 0x40, 0x01, 0x00, 0x00, 0xc0, 0xa8,
+            0x01, 0x01, 0xc0, 0xa8, 0x01, 0x02,
+        ];
+
+        assert_eq!(ipv4_header_checksum(&header), 0x1063);
+        assert_eq!(ipv4_header_checksum(&[0x12, 0x34, 0x56]), 0x97cb);
+        assert_eq!(ipv4_header_checksum(&[0xff, 0xff, 0x00, 0x01]), 0xfffe);
     }
 
     #[test]

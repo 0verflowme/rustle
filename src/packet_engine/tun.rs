@@ -6,8 +6,7 @@ pub(crate) fn tun_ipv4_packet(packet: &[u8]) -> Option<&[u8]> {
 
     match packet.first().map(|byte| byte >> 4) {
         Some(4) => Some(packet),
-        Some(6) => None,
-        _ if packet.len() >= LINUX_PI_IPV4.len()
+        _ if packet.len() > LINUX_PI_IPV4.len()
             && packet[..LINUX_PI_IPV4.len()] == LINUX_PI_IPV4
             && packet[LINUX_PI_IPV4.len()] >> 4 == 4 =>
         {
@@ -95,6 +94,63 @@ mod tests {
         assert_eq!(tun_ipv4_packet(&[0x60, 0, 0, 0]), None);
         assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x86, 0xdd, 0x60]), None);
         assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x08, 0x00, 0x60]), None);
+        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x08, 0x00]), None);
+        assert_eq!(tun_ipv4_packet(&[0x00, 0x00, 0x08]), None);
         assert_eq!(tun_ipv4_packet(&[]), None);
+    }
+
+    #[test]
+    fn tun_write_stats_records_and_combines_write_accounting() {
+        let mut stats = TunWriteStats::default();
+        assert!(!stats.delivered_at_least_one_packet_without_drop());
+
+        stats.record_written(64, 7);
+        assert_eq!(
+            stats,
+            TunWriteStats {
+                packets: 1,
+                bytes: 64,
+                dropped_packets: 0,
+                dropped_bytes: 0,
+                write_calls: 1,
+                write_elapsed_us: 7,
+                write_max_us: 7,
+            }
+        );
+        assert!(stats.delivered_at_least_one_packet_without_drop());
+
+        stats.record_dropped(32, 11);
+        assert_eq!(stats.packets, 1);
+        assert_eq!(stats.bytes, 64);
+        assert_eq!(stats.dropped_packets, 1);
+        assert_eq!(stats.dropped_bytes, 32);
+        assert_eq!(stats.write_calls, 2);
+        assert_eq!(stats.write_elapsed_us, 18);
+        assert_eq!(stats.write_max_us, 11);
+        assert!(!stats.delivered_at_least_one_packet_without_drop());
+
+        stats.combine(TunWriteStats {
+            packets: 2,
+            bytes: 128,
+            dropped_packets: 0,
+            dropped_bytes: 0,
+            write_calls: 2,
+            write_elapsed_us: 5,
+            write_max_us: 3,
+        });
+        assert_eq!(stats.packets, 3);
+        assert_eq!(stats.bytes, 192);
+        assert_eq!(stats.dropped_packets, 1);
+        assert_eq!(stats.dropped_bytes, 32);
+        assert_eq!(stats.write_calls, 4);
+        assert_eq!(stats.write_elapsed_us, 23);
+        assert_eq!(stats.write_max_us, 11);
+
+        assert!(!TunWriteStats {
+            packets: 1,
+            dropped_packets: 1,
+            ..TunWriteStats::default()
+        }
+        .delivered_at_least_one_packet_without_drop());
     }
 }

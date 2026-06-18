@@ -140,6 +140,36 @@ mod tests {
     }
 
     #[test]
+    fn credit_window_exact_threshold_flushes_and_resets_pending_credit() {
+        let mut window = AgentCreditWindow::new();
+        let threshold = window.batch_threshold();
+
+        assert_eq!(threshold, AGENT_STREAM_RECEIVE_CREDIT_BATCH_BYTES);
+        assert_eq!(window.record_consumed(threshold - 1), None);
+        assert_eq!(window.pending_credit, threshold - 1);
+        assert_eq!(window.consumed_since_growth, threshold - 1);
+
+        assert_eq!(window.record_consumed(1), Some(threshold));
+        assert_eq!(window.pending_credit, 0);
+        assert_eq!(window.consumed_since_growth, threshold);
+        assert_eq!(window.current_window(), AgentCreditWindow::initial_credit());
+    }
+
+    #[test]
+    fn credit_window_initial_credit_matches_new_window_size() {
+        let window = AgentCreditWindow::new();
+
+        assert_eq!(
+            AgentCreditWindow::initial_credit(),
+            AGENT_STREAM_INITIAL_WINDOW_BYTES
+        );
+        assert_eq!(window.current_window, AgentCreditWindow::initial_credit());
+        assert_eq!(window.max_window, AGENT_STREAM_MAX_WINDOW_BYTES);
+        assert_eq!(window.pending_credit, 0);
+        assert_eq!(window.consumed_since_growth, 0);
+    }
+
+    #[test]
     fn credit_window_grows_after_sustained_full_window_consumption() {
         let mut window = AgentCreditWindow::new();
         let mut current = AGENT_STREAM_INITIAL_WINDOW_BYTES;
@@ -153,6 +183,39 @@ mod tests {
             current = next;
         }
         assert_eq!(window.current_window(), AGENT_STREAM_MAX_WINDOW_BYTES);
+    }
+
+    #[test]
+    fn credit_window_does_not_spend_growth_budget_at_max_window() {
+        let mut window = AgentCreditWindow::new();
+
+        assert_eq!(
+            window.record_consumed(AGENT_STREAM_INITIAL_WINDOW_BYTES),
+            Some(AGENT_STREAM_INITIAL_WINDOW_BYTES * 2)
+        );
+        assert_eq!(
+            window.record_consumed(AGENT_STREAM_INITIAL_WINDOW_BYTES * 2),
+            Some(AGENT_STREAM_INITIAL_WINDOW_BYTES * 4)
+        );
+        assert_eq!(
+            window.record_consumed(AGENT_STREAM_INITIAL_WINDOW_BYTES * 4),
+            Some(AGENT_STREAM_INITIAL_WINDOW_BYTES * 6)
+        );
+        assert_eq!(window.current_window(), AGENT_STREAM_MAX_WINDOW_BYTES);
+        assert_eq!(window.consumed_since_growth, 0);
+
+        assert_eq!(
+            window.record_consumed(AGENT_STREAM_MAX_WINDOW_BYTES),
+            Some(AGENT_STREAM_MAX_WINDOW_BYTES)
+        );
+        assert_eq!(window.current_window(), AGENT_STREAM_MAX_WINDOW_BYTES);
+        assert_eq!(window.consumed_since_growth, AGENT_STREAM_MAX_WINDOW_BYTES);
+
+        assert_eq!(window.record_consumed(1), None);
+        assert_eq!(
+            window.consumed_since_growth,
+            AGENT_STREAM_MAX_WINDOW_BYTES + 1
+        );
     }
 
     #[test]

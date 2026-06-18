@@ -39,13 +39,12 @@ impl RemotePlatform {
 }
 
 pub(crate) async fn probe_remote_platform(handle: &Handle<Client>) -> Result<RemotePlatform> {
-    match run_remote_command_collect(handle, POSIX_REMOTE_PLATFORM_PROBE_COMMAND, None).await {
-        Ok(output) if output.exit_status == Some(0) => {
-            if let Ok(platform) = parse_remote_platform_probe(&output.stdout) {
-                return Ok(platform);
-            }
+    if let Ok(output) =
+        run_remote_command_collect(handle, POSIX_REMOTE_PLATFORM_PROBE_COMMAND, None).await
+    {
+        if let Some(platform) = parse_successful_posix_platform_probe(&output) {
+            return Ok(platform);
         }
-        _ => {}
     }
 
     let output = run_remote_command_collect(handle, WINDOWS_REMOTE_PLATFORM_PROBE_COMMAND, None)
@@ -53,6 +52,16 @@ pub(crate) async fn probe_remote_platform(handle: &Handle<Client>) -> Result<Rem
         .context("failed to probe remote platform")?;
     output.ensure_success("remote platform probe")?;
     parse_remote_platform_probe(&output.stdout)
+}
+
+fn parse_successful_posix_platform_probe(
+    output: &crate::remote_exec::RemoteCommandOutput,
+) -> Option<RemotePlatform> {
+    if output.exit_status == Some(0) {
+        parse_remote_platform_probe(&output.stdout).ok()
+    } else {
+        None
+    }
 }
 
 pub(crate) fn parse_remote_platform_probe(stdout: &[u8]) -> Result<RemotePlatform> {
@@ -127,14 +136,31 @@ mod tests {
         assert_eq!(normalize_remote_os("Darwin"), Some("macos"));
         assert_eq!(normalize_remote_os("Windows"), Some("windows"));
         assert_eq!(normalize_remote_os("MINGW64_NT-10.0"), Some("windows"));
+        assert_eq!(normalize_remote_os("MINGW32_NT-10.0"), Some("windows"));
+        assert_eq!(normalize_remote_os("MSYS_NT-10.0"), Some("windows"));
+        assert_eq!(normalize_remote_os("CYGWIN_NT-10.0"), Some("windows"));
+        assert_eq!(normalize_remote_os(" Linux \r"), Some("linux"));
         assert_eq!(normalize_remote_arch("x86_64"), Some("x86_64"));
         assert_eq!(normalize_remote_arch("amd64"), Some("x86_64"));
         assert_eq!(normalize_remote_arch("AMD64"), Some("x86_64"));
         assert_eq!(normalize_remote_arch("arm64"), Some("aarch64"));
         assert_eq!(normalize_remote_arch("ARM64"), Some("aarch64"));
         assert_eq!(normalize_remote_arch("aarch64"), Some("aarch64"));
+        assert_eq!(normalize_remote_arch(" aarch64 \r"), Some("aarch64"));
         assert_eq!(normalize_remote_os("Plan9"), None);
+        assert_eq!(normalize_remote_os("linux"), None);
         assert_eq!(normalize_remote_arch("riscv64"), None);
+    }
+
+    #[test]
+    fn local_platform_normalizers_accept_only_supported_rust_targets() {
+        assert_eq!(normalize_local_os("linux"), Some("linux"));
+        assert_eq!(normalize_local_os("macos"), Some("macos"));
+        assert_eq!(normalize_local_os("windows"), Some("windows"));
+        assert_eq!(normalize_local_os("darwin"), None);
+        assert_eq!(normalize_local_arch("x86_64"), Some("x86_64"));
+        assert_eq!(normalize_local_arch("aarch64"), Some("aarch64"));
+        assert_eq!(normalize_local_arch("amd64"), None);
     }
 
     #[test]
@@ -171,6 +197,52 @@ mod tests {
                 os: "windows",
                 arch: "x86_64",
             }
+        );
+    }
+
+    #[test]
+    fn posix_probe_result_is_used_only_after_zero_exit_and_valid_output() {
+        let successful_linux = crate::remote_exec::RemoteCommandOutput {
+            stdout: b"Linux\nx86_64\n".to_vec(),
+            stderr: Vec::new(),
+            exit_status: Some(0),
+        };
+        assert_eq!(
+            parse_successful_posix_platform_probe(&successful_linux),
+            Some(RemotePlatform {
+                os: "linux",
+                arch: "x86_64",
+            })
+        );
+
+        let failed_but_parseable = crate::remote_exec::RemoteCommandOutput {
+            stdout: b"Linux\nx86_64\n".to_vec(),
+            stderr: b"uname unavailable\n".to_vec(),
+            exit_status: Some(127),
+        };
+        assert_eq!(
+            parse_successful_posix_platform_probe(&failed_but_parseable),
+            None
+        );
+
+        let missing_exit_status = crate::remote_exec::RemoteCommandOutput {
+            stdout: b"Linux\nx86_64\n".to_vec(),
+            stderr: Vec::new(),
+            exit_status: None,
+        };
+        assert_eq!(
+            parse_successful_posix_platform_probe(&missing_exit_status),
+            None
+        );
+
+        let successful_but_invalid = crate::remote_exec::RemoteCommandOutput {
+            stdout: b"Plan9\nriscv64\n".to_vec(),
+            stderr: Vec::new(),
+            exit_status: Some(0),
+        };
+        assert_eq!(
+            parse_successful_posix_platform_probe(&successful_but_invalid),
+            None
         );
     }
 }

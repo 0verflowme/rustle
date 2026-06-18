@@ -319,6 +319,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn engine_dns_admission_caps_queries_and_releases_slots() {
+        let flow_manager = tcp_core::FlowManager::new(
+            Ipv4Addr::new(10, 255, 255, 1),
+            24,
+            &[tcp_core::Ipv4NetParts::new(
+                Ipv4Addr::new(172, 16, 0, 0),
+                16,
+            )],
+            1300,
+        )
+        .expect("flow manager");
+        let mut engine = TunnelEngine::new(flow_manager);
+
+        assert_eq!(engine.dns_admission_limit(), MAX_IN_FLIGHT_DNS_QUERIES);
+        for _ in 0..MAX_IN_FLIGHT_DNS_QUERIES {
+            assert!(engine.try_admit_dns());
+        }
+        assert!(!engine.try_admit_dns());
+
+        engine.complete_dns();
+        assert!(engine.try_admit_dns());
+    }
+
+    #[tokio::test]
     async fn bridge_event_removes_supervisor_owned_bridge_handle() {
         let packet = ipv4_tcp_packet(0x02, 0);
         let flow = tcp_core::parse_ipv4_tcp_segment(&packet)

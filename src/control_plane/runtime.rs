@@ -303,9 +303,10 @@ fn ensure_agent_dns_capabilities_supported(
     remote: &Destination,
 ) -> Result<()> {
     if remote.host.parse::<Ipv4Addr>().is_ok() {
-        if capabilities
-            .iter()
-            .all(|capabilities| capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0)
+        if !capabilities.is_empty()
+            && capabilities
+                .iter()
+                .all(|capabilities| capabilities & agent_proto::CAP_UDP_ASSOCIATE != 0)
         {
             return Ok(());
         }
@@ -314,9 +315,10 @@ fn ensure_agent_dns_capabilities_supported(
             remote.host
         );
     }
-    if capabilities
-        .iter()
-        .all(|capabilities| capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0)
+    if !capabilities.is_empty()
+        && capabilities
+            .iter()
+            .all(|capabilities| capabilities & agent_proto::CAP_TCP_CONNECT_HOST != 0)
     {
         return Ok(());
     }
@@ -384,6 +386,23 @@ mod tests {
             &remote,
         )
         .expect_err("one lane lacks hostname TCP DNS support");
+        assert!(err.to_string().contains(
+            "agent DNS transport to hostname dns.example.test requires hostname TCP connect support"
+        ));
+    }
+
+    #[test]
+    fn dns_remote_capability_check_rejects_empty_agent_lane_sets() {
+        let ipv4 = remote("1.1.1.1");
+        let err = ensure_agent_dns_capabilities_supported(&[], &ipv4)
+            .expect_err("IPv4 DNS should require at least one UDP-capable lane");
+        assert!(err.to_string().contains(
+            "agent DNS transport to IPv4 resolver 1.1.1.1 requires UDP associate support"
+        ));
+
+        let hostname = remote("dns.example.test");
+        let err = ensure_agent_dns_capabilities_supported(&[], &hostname)
+            .expect_err("hostname DNS should require at least one hostname-capable lane");
         assert!(err.to_string().contains(
             "agent DNS transport to hostname dns.example.test requires hostname TCP connect support"
         ));

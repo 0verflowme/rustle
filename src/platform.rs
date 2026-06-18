@@ -801,6 +801,45 @@ mod tests {
     }
 
     #[test]
+    fn pe_machine_helpers_name_expected_and_unknown_architectures() {
+        assert_eq!(
+            expected_windows_pe_machine("x86_64"),
+            Some(PE_MACHINE_AMD64)
+        );
+        assert_eq!(
+            expected_windows_pe_machine("aarch64"),
+            Some(PE_MACHINE_ARM64)
+        );
+        assert_eq!(expected_windows_pe_machine("arm"), None);
+        assert_eq!(pe_machine_name(PE_MACHINE_AMD64), "x86_64");
+        assert_eq!(pe_machine_name(PE_MACHINE_ARM64), "aarch64");
+        assert_eq!(pe_machine_name(0x014c), "unknown PE machine 0x014c");
+    }
+
+    #[test]
+    fn pe_machine_parser_rejects_malformed_headers() {
+        let err =
+            pe_machine_from_bytes(&[0_u8; 0x3f]).expect_err("short DOS header should be rejected");
+        assert!(err.to_string().contains("too small for a DOS header"));
+
+        let mut missing_mz = fake_pe_dll(PE_MACHINE_AMD64);
+        missing_mz[0] = b'N';
+        let err = pe_machine_from_bytes(&missing_mz).expect_err("missing MZ should be rejected");
+        assert!(err.to_string().contains("missing MZ DOS signature"));
+
+        let mut short_pe = fake_pe_dll(PE_MACHINE_AMD64);
+        short_pe[0x3c..0x40].copy_from_slice(&0x7f_u32.to_le_bytes());
+        short_pe.truncate(0x80);
+        let err = pe_machine_from_bytes(&short_pe).expect_err("short PE should be rejected");
+        assert!(err.to_string().contains("too small for a PE header"));
+
+        let mut missing_pe = fake_pe_dll(PE_MACHINE_AMD64);
+        missing_pe[0x40..0x44].copy_from_slice(b"PX\0\0");
+        let err = pe_machine_from_bytes(&missing_pe).expect_err("missing PE should be rejected");
+        assert!(err.to_string().contains("missing PE signature"));
+    }
+
+    #[test]
     fn wintun_arch_validation_rejects_mismatched_dll() {
         let err =
             validate_wintun_arch_bytes(&fake_pe_dll(PE_MACHINE_ARM64), "x86_64", "test Wintun DLL")
@@ -867,6 +906,50 @@ mod tests {
 
         std::fs::remove_file(command).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn command_path_lookup_rejects_missing_path_and_respects_explicit_paths() {
+        let dir = env::temp_dir().join(format!(
+            "rustle-command-path-{}-explicit",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = dir.join("ip");
+        std::fs::write(&command, "").unwrap();
+
+        assert!(!command_exists_in_path("ip", None, false));
+        assert!(command_exists_in_path(
+            command.to_str().expect("test path UTF-8"),
+            None,
+            false
+        ));
+        assert!(!command_exists_in_path(
+            dir.join("missing").to_str().expect("test path UTF-8"),
+            None,
+            false
+        ));
+
+        std::fs::remove_file(command).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn lower_hex_encodes_high_and_low_nibbles() {
+        assert_eq!(lower_hex(&[0x00, 0x0f, 0x10, 0xab, 0xff]), "000f10abff");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn same_path_is_case_sensitive_on_non_windows() {
+        assert!(same_path(
+            Path::new("/tmp/rustle"),
+            Path::new("/tmp/rustle")
+        ));
+        assert!(!same_path(
+            Path::new("/tmp/Rustle"),
+            Path::new("/tmp/rustle")
+        ));
     }
 
     #[test]
