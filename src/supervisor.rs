@@ -174,7 +174,7 @@ impl TunnelSupervisor {
                 }
                 event = event_rx.recv(), if !engine.should_pause_bridge_events() => {
                     let Some(event) = event else {
-                        bail!("SSH bridge event channel closed");
+                        bail!("bridge event channel closed");
                     };
                     events::handle_bridge_event_batch(
                         engine,

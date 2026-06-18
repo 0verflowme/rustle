@@ -183,7 +183,7 @@ pub(crate) fn drain_local_bytes_to_bridges(
                 continue;
             }
             eprintln!(
-                "ssh: missing bridge while draining local bytes for {flow:?}; resetting flow"
+                "bridge: missing bridge while draining local bytes for {flow:?}; resetting flow"
             );
             flow_manager.abort_flow(flow)?;
             stats.bridge_send_failures = stats.bridge_send_failures.saturating_add(1);
@@ -220,14 +220,14 @@ pub(crate) fn drain_local_bytes_to_bridges(
             }
             Ok(false) => {
                 eprintln!(
-                    "ssh: bridge queue filled while draining local bytes for {flow:?}; resetting flow"
+                    "bridge: queue filled while draining local bytes for {flow:?}; resetting flow"
                 );
                 bridges.remove(&flow);
                 flow_manager.abort_flow(flow)?;
                 stats.bridge_send_failures = stats.bridge_send_failures.saturating_add(1);
             }
             Err(err) => {
-                eprintln!("ssh: bridge task closed while sending local bytes for {flow:?}: {err}");
+                eprintln!("bridge: task closed while sending local bytes for {flow:?}: {err}");
                 bridges.remove(&flow);
                 flow_manager.abort_flow(flow)?;
                 stats.bridge_send_failures = stats.bridge_send_failures.saturating_add(1);
@@ -271,7 +271,7 @@ pub(crate) fn handle_bridge_event_into(
     if !flow_manager.contains_flow(flow) {
         if should_log_stale_bridge_event(&event) {
             eprintln!(
-                "ssh: ignoring stale {} event for removed {flow:?}",
+                "bridge: ignoring stale {} event for removed {flow:?}",
                 bridge_event_name(&event)
             );
         }
@@ -284,7 +284,7 @@ pub(crate) fn handle_bridge_event_into(
     if !flow_manager.contains_flow_id(id) {
         if should_log_stale_bridge_event(&event) {
             eprintln!(
-                "ssh: ignoring stale {} event for reused {flow:?} generation={}",
+                "bridge: ignoring stale {} event for reused {flow:?} generation={}",
                 bridge_event_name(&event),
                 id.generation
             );
