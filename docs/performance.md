@@ -736,6 +736,9 @@ with stage, result, elapsed time, local UDP bind, certificate fingerprint, and
 auth-token SHA-256 prefix. QUIC-agent live runs also emit
 `quic-agent-protocol:` lines after UDP/QUIC auth succeeds, so a hang in framed
 agent Hello negotiation is separated from UDP reachability and auth failures.
+The hidden `auto-quic` experiment also emits `auto-quic-decision:` lines that
+record the QUIC probe budget and whether the runtime selected native QUIC or
+the SSH-agent fallback.
 Summarize them with
 `scripts/summarize-quic-diagnostics.py` to distinguish UDP reachability,
 certificate/bootstrap, auth-stream, and framed-agent protocol failures without

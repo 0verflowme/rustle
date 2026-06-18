@@ -370,7 +370,7 @@ summarize_quic_diagnostic_logs() {
   done < <(find "$TMPDIR" -name rustle.log -print0)
 
   [[ "${#logs[@]}" -gt 0 ]] || return 0
-  grep -E -q 'UDP data plane|QUIC agent.*stage=|native QUIC bridge.*stage=|server auth' \
+  grep -E -q 'auto-quic-decision:|UDP data plane|QUIC agent.*stage=|native QUIC bridge.*stage=|server auth' \
     "${logs[@]}" 2>/dev/null || return 0
 
   local summary="${TMPDIR}/quic-diagnostics.tsv"

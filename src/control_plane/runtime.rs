@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 
@@ -141,6 +141,13 @@ pub(crate) async fn connect_tunnel_runtime(
             let BridgeHelperCommandPlan::AutoQuic { agent, quic_native } = helper_plan else {
                 bail!("auto-quic runtime requires distinct QUIC-native and agent helper plans");
             };
+            let probe_started_at = Instant::now();
+            log_auto_quic_decision(
+                "probe",
+                "start",
+                probe_started_at,
+                AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
+            );
             eprintln!(
                 "transport: auto-quic probing quic-native with data-plane timeout {}ms",
                 AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT.as_millis()
@@ -153,10 +160,22 @@ pub(crate) async fn connect_tunnel_runtime(
             .await
             {
                 Ok(bridge) => {
+                    log_auto_quic_decision(
+                        "select",
+                        "quic-native",
+                        probe_started_at,
+                        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
+                    );
                     eprintln!("transport: auto-quic selected quic-native");
                     Ok(TunnelRuntime::new(QuicNativeDataPlane::new(bridge)))
                 }
                 Err(err) => {
+                    log_auto_quic_decision(
+                        "select",
+                        "agent-fallback",
+                        probe_started_at,
+                        AUTO_QUIC_DATA_PLANE_PROBE_TIMEOUT,
+                    );
                     eprintln!(
                         "transport: auto-quic could not start quic-native ({err:#}); falling back to agent"
                     );
@@ -181,6 +200,19 @@ pub(crate) async fn connect_tunnel_runtime(
             }
         }
     }
+}
+
+fn log_auto_quic_decision(
+    stage: &'static str,
+    result: &'static str,
+    started_at: Instant,
+    timeout: Duration,
+) {
+    eprintln!(
+        "auto-quic-decision: transport=auto-quic stage={stage} result={result} elapsed_ms={} timeout_ms={} fallback=agent",
+        started_at.elapsed().as_millis(),
+        timeout.as_millis()
+    );
 }
 
 fn single_helper_plan(

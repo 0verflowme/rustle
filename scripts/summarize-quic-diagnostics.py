@@ -43,7 +43,14 @@ PROTOCOL_RE = re.compile(
     r"result=(?P<result>[a-z_]+) elapsed_ms=(?P<elapsed>\d+) "
     r"timeout_ms=(?P<timeout>\d+) mtu=(?P<mtu>\d+)"
 )
+AUTO_QUIC_DECISION_RE = re.compile(
+    r"auto-quic-decision: transport=(?P<transport>auto-quic) "
+    r"stage=(?P<stage>[a-z_]+) result=(?P<result>[a-z_-]+) "
+    r"elapsed_ms=(?P<elapsed>\d+) timeout_ms=(?P<timeout>\d+) "
+    r"fallback=(?P<fallback>[a-z_-]+)"
+)
 QUIC_DIAGNOSTIC_HINTS = (
+    "auto-quic-decision:",
     "quic-auth:",
     "quic-connect:",
     "quic-agent-protocol:",
@@ -170,6 +177,19 @@ def parse_line(line: str, path: str) -> list[dict[str, object]]:
             }
         )
 
+    auto_quic_decision = AUTO_QUIC_DECISION_RE.search(line)
+    if auto_quic_decision:
+        events.append(
+            {
+                "category": f"{auto_quic_decision.group('transport')}/decision",
+                "status": result_status(auto_quic_decision.group("result")),
+                "elapsed_ms": int(auto_quic_decision.group("elapsed")),
+                "stage": auto_quic_decision.group("stage"),
+                "remote": "-",
+                "path": path,
+            }
+        )
+
     auth = AUTH_RE.search(line)
     if auth:
         events.append(
@@ -249,6 +269,8 @@ def self_test() -> None:
             "quic-auth: transport=quic-native side=server remote=198.51.100.8:5354 stage=finish_send result=timeout elapsed_ms=5001 timeout_ms=5000 auth_token_sha256_prefix=abcdef123456",
             "quic-agent-protocol: transport=quic-agent remote=203.0.113.9:4433 stage=agent_hello result=start elapsed_ms=0 timeout_ms=15000 mtu=1500",
             "quic-agent-protocol: transport=quic-agent remote=203.0.113.9:4433 stage=agent_hello result=timeout elapsed_ms=15000 timeout_ms=15000 mtu=1500",
+            "auto-quic-decision: transport=auto-quic stage=probe result=start elapsed_ms=0 timeout_ms=1500 fallback=agent",
+            "auto-quic-decision: transport=auto-quic stage=select result=agent-fallback elapsed_ms=1501 timeout_ms=1500 fallback=agent",
         ]
     )
     tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False)
@@ -277,6 +299,10 @@ def self_test() -> None:
     assert summaries["quic-agent/protocol"]["failures"] == 1
     assert summaries["quic-agent/protocol"]["max_elapsed_ms"] == 15000
     assert summaries["quic-agent/protocol"]["stages"] == "agent_hello"
+    assert summaries["auto-quic/decision"]["events"] == 2
+    assert summaries["auto-quic/decision"]["failures"] == 0
+    assert summaries["auto-quic/decision"]["max_elapsed_ms"] == 1501
+    assert summaries["auto-quic/decision"]["stages"] == "probe,select"
     assert_rejects("ordinary rustle log line without QUIC diagnostics\n")
 
 
