@@ -636,21 +636,29 @@ remote_bytes_raw:<n> max_raw:<n>` reports remote `RemoteData` bytes already
 queued by bridge tasks but not yet dequeued by the packet engine.
 `bridge_event_batch=count:<n> ... total_us:<n> max_us:<n> paused:<n>` reports
 supervisor bridge-event batch pressure and backlog pauses.
+`agent_writer=...` reports framed-agent writer pressure: current/max queued
+frames and bytes, burst counts and byte totals, enqueue-to-write delay, and
+writer/flush timings. Live artifacts summarize those fields into
+`agent-writer-summary.tsv`; high queued bytes or enqueue wait means the local
+framed-agent writer is the bottleneck, while high write or flush time points at
+SSH channel or carrier backpressure underneath the writer.
 Use those fields with hotpath `pre_bridge_queue_wait`, `remote_event_wait`, and
 `body_drain` when deciding whether a WAN throughput failure is in the data
-plane, packet engine, smoltcp drain, or TUN device writes.
+plane, framed-agent writer, packet engine, smoltcp drain, or TUN device writes.
 `scripts/verify-release-candidate.sh` enables `RUSTLE_HOTPATH_TRACE=1` by
 default and writes compact live benchmark artifacts under
 `target/live-evidence/release-candidate-<timestamp>` unless
 `RUSTLE_BENCH_ARTIFACT_DIR` is set. The direct live comparison uses a
 `live-compare` subdirectory, and controlled fixture runs use one
 `fixture-<bytes>-bytes` subdirectory per body size. `bench-live-compare.sh` also
-writes `live-diagnosis.tsv` through `scripts/summarize-live-evidence.py` when
-live results exist. That file is a first-look triage row, not a gate: it maps
+writes `agent-writer-summary.tsv` from status lines and writes
+`live-diagnosis.tsv` through `scripts/summarize-live-evidence.py` when live
+results exist. That file is a first-look triage row, not a gate: it maps
 nonzero final counters to `diagnostic_failure:*`, max packet-engine backlog to
 `packet_engine_backlog_pressure`, max supervisor bridge queue pressure to
-`supervisor_event_queue_pressure`, hotpath labels to `hotpath:*`, and QUIC
-diagnostic failures to `quic_startup_or_auth_failure`.
+`supervisor_event_queue_pressure`, framed-agent writer queue/write/flush
+pressure to `agent_writer_*_pressure`, hotpath labels to `hotpath:*`, and
+QUIC diagnostic failures to `quic_startup_or_auth_failure`.
 Validate a collected artifact tree with:
 
 ```sh

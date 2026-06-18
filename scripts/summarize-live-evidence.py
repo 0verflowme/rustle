@@ -60,11 +60,16 @@ OUTPUT_COLUMNS = [
     "agent_throughput_mib_s",
     "max_remote_backlog_bytes",
     "max_bridge_event_queue_remote_bytes",
+    "max_agent_writer_queued_bytes",
+    "agent_writer_enqueue_wait_max_us",
+    "agent_writer_write_max_us",
+    "agent_writer_flush_max_us",
     "hotpath_bottleneck",
     "quic_failures",
     "diagnosis",
 ]
 PRESSURE_BYTES = 1024 * 1024
+WRITER_PRESSURE_US = 50_000
 
 
 def parse_float(value: str, field: str) -> float:
@@ -206,10 +211,58 @@ def read_quic_failures(directory: pathlib.Path) -> int:
     return failures
 
 
+def read_agent_writer_pressure(directory: pathlib.Path) -> dict[str, int]:
+    pressure = {
+        "max_agent_writer_queued_bytes": 0,
+        "agent_writer_enqueue_wait_max_us": 0,
+        "agent_writer_write_max_us": 0,
+        "agent_writer_flush_max_us": 0,
+    }
+    path = directory / "agent-writer-summary.tsv"
+    if not path.is_file():
+        return pressure
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    if len(lines) < 2:
+        return pressure
+    header = lines[0].split("\t")
+    required = {
+        "queued_bytes_max",
+        "enqueue_wait_max_us",
+        "write_max_us",
+        "flush_max_us",
+    }
+    missing = sorted(required.difference(header))
+    if missing:
+        raise SystemExit(f"agent writer summary {path} missing columns {missing!r}")
+    indexes = {field: header.index(field) for field in required}
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) != len(header):
+            raise SystemExit(f"invalid agent writer row in {path}: {line!r}")
+        pressure["max_agent_writer_queued_bytes"] = max(
+            pressure["max_agent_writer_queued_bytes"],
+            parse_int(parts[indexes["queued_bytes_max"]], "queued_bytes_max"),
+        )
+        pressure["agent_writer_enqueue_wait_max_us"] = max(
+            pressure["agent_writer_enqueue_wait_max_us"],
+            parse_int(parts[indexes["enqueue_wait_max_us"]], "enqueue_wait_max_us"),
+        )
+        pressure["agent_writer_write_max_us"] = max(
+            pressure["agent_writer_write_max_us"],
+            parse_int(parts[indexes["write_max_us"]], "write_max_us"),
+        )
+        pressure["agent_writer_flush_max_us"] = max(
+            pressure["agent_writer_flush_max_us"],
+            parse_int(parts[indexes["flush_max_us"]], "flush_max_us"),
+        )
+    return pressure
+
+
 def diagnose(
     rows: list[dict[str, str]],
     remote_backlog_max: int,
     bridge_event_queue_max: int,
+    agent_writer_pressure: dict[str, int],
     hotpath_bottleneck: str,
     quic_failures: int,
     agent_p50: float | None,
@@ -234,6 +287,14 @@ def diagnose(
         return "supervisor_event_queue_pressure"
     if remote_backlog_max >= PRESSURE_BYTES:
         return "packet_engine_backlog_pressure"
+    if agent_writer_pressure["max_agent_writer_queued_bytes"] >= PRESSURE_BYTES:
+        return "agent_writer_queue_pressure"
+    if agent_writer_pressure["agent_writer_enqueue_wait_max_us"] >= WRITER_PRESSURE_US:
+        return "agent_writer_queue_pressure"
+    if agent_writer_pressure["agent_writer_write_max_us"] >= WRITER_PRESSURE_US:
+        return "agent_writer_write_pressure"
+    if agent_writer_pressure["agent_writer_flush_max_us"] >= WRITER_PRESSURE_US:
+        return "agent_writer_flush_pressure"
     if hotpath_bottleneck != "-":
         return f"hotpath:{hotpath_bottleneck}"
     if quic_failures > 0:
@@ -265,10 +326,12 @@ def summarize_dir(directory: pathlib.Path, root: pathlib.Path) -> dict[str, str]
     )
     hotpath_bottleneck = read_hotpath_bottleneck(directory)
     quic_failures = read_quic_failures(directory)
+    agent_writer_pressure = read_agent_writer_pressure(directory)
     diagnosis = diagnose(
         rows,
         remote_backlog_max,
         bridge_event_queue_max,
+        agent_writer_pressure,
         hotpath_bottleneck,
         quic_failures,
         agent_p50,
@@ -285,6 +348,18 @@ def summarize_dir(directory: pathlib.Path, root: pathlib.Path) -> dict[str, str]
         "agent_throughput_mib_s": format_float(agent_throughput),
         "max_remote_backlog_bytes": str(remote_backlog_max),
         "max_bridge_event_queue_remote_bytes": str(bridge_event_queue_max),
+        "max_agent_writer_queued_bytes": str(
+            agent_writer_pressure["max_agent_writer_queued_bytes"]
+        ),
+        "agent_writer_enqueue_wait_max_us": str(
+            agent_writer_pressure["agent_writer_enqueue_wait_max_us"]
+        ),
+        "agent_writer_write_max_us": str(
+            agent_writer_pressure["agent_writer_write_max_us"]
+        ),
+        "agent_writer_flush_max_us": str(
+            agent_writer_pressure["agent_writer_flush_max_us"]
+        ),
         "hotpath_bottleneck": hotpath_bottleneck,
         "quic_failures": str(quic_failures),
         "diagnosis": diagnosis,
@@ -327,6 +402,15 @@ def self_test() -> None:
             "quic-native/client-auth\t1\t0\t10\tread_ack\t203.0.113.10:4433\tlog\n",
             encoding="utf-8",
         )
+        (live_compare / "agent-writer-summary.tsv").write_text(
+            "tool\tstatus_lines\tqueued_frames_max\tqueued_bytes_max\tbursts\t"
+            "burst_frames\tburst_bytes\tburst_frames_max\tburst_bytes_max\t"
+            "enqueue_wait_samples\tenqueue_wait_total_us\tenqueue_wait_max_us\t"
+            "write_total_us\twrite_max_us\tflush_total_us\tflush_max_us\tpaths\n"
+            "rustle-agent\t1\t2\t2097152\t8\t16\t4096\t4\t2048\t16\t"
+            "120000\t90000\t40000\t30000\t20000\t10000\tlog\n",
+            encoding="utf-8",
+        )
         rows = summarize(root)
         assert len(rows) == 1
         row = rows[0]
@@ -334,6 +418,8 @@ def self_test() -> None:
         assert row["rustle_success_rows"] == "1"
         assert row["agent_sshuttle_p50_ratio"] == "1.20"
         assert row["max_remote_backlog_bytes"] == "2097152"
+        assert row["max_agent_writer_queued_bytes"] == "2097152"
+        assert row["agent_writer_enqueue_wait_max_us"] == "90000"
         assert row["diagnosis"] == "packet_engine_backlog_pressure"
 
         (live_compare / "live-results.tsv").write_text(
@@ -345,6 +431,18 @@ def self_test() -> None:
 
         (live_compare / "live-results.tsv").write_text(
             "rustle-agent\t1\t4\t2\t4\t0\t100\t8.0\t20.0\t4096\t25.00\t40.00\t1.0\t2.0\t4\t0\t0\t0\t0\t0\t0\t1024\t0\t2048\n",
+            encoding="utf-8",
+        )
+        rows = summarize(root)
+        assert rows[0]["diagnosis"] == "agent_writer_queue_pressure"
+
+        (live_compare / "agent-writer-summary.tsv").write_text(
+            "tool\tstatus_lines\tqueued_frames_max\tqueued_bytes_max\tbursts\t"
+            "burst_frames\tburst_bytes\tburst_frames_max\tburst_bytes_max\t"
+            "enqueue_wait_samples\tenqueue_wait_total_us\tenqueue_wait_max_us\t"
+            "write_total_us\twrite_max_us\tflush_total_us\tflush_max_us\tpaths\n"
+            "rustle-agent\t1\t1\t1024\t8\t16\t4096\t4\t2048\t16\t"
+            "1200\t900\t400\t300\t200\t100\tlog\n",
             encoding="utf-8",
         )
         rows = summarize(root)

@@ -399,6 +399,26 @@ summarize_quic_diagnostic_logs() {
   fi
 }
 
+summarize_agent_writer_status_logs() {
+  [[ -x "${SCRIPT_DIR}/summarize-agent-writer-status.py" ]] || return 0
+
+  local logs=()
+  local log
+  while IFS= read -r -d '' log; do
+    logs+=("$log")
+  done < <(find "$TMPDIR" -name rustle.log -print0)
+
+  [[ "${#logs[@]}" -gt 0 ]] || return 0
+  grep -q 'agent_writer=' "${logs[@]}" 2>/dev/null || return 0
+
+  local summary="${TMPDIR}/agent-writer-summary.tsv"
+  smoke_info "agent writer status summary for live benchmark logs"
+  if "${SCRIPT_DIR}/summarize-agent-writer-status.py" "${logs[@]}" >"$summary"; then
+    cat "$summary" >&2
+    publish_live_artifact "$summary" "agent-writer-summary.tsv"
+  fi
+}
+
 summarize_live_evidence_artifacts() {
   [[ -x "${SCRIPT_DIR}/summarize-live-evidence.py" ]] || return 0
   [[ -s "$RESULTS_TSV" ]] || return 0
@@ -427,6 +447,7 @@ cleanup() {
   summarize_hotpath_trace_logs
   summarize_agent_startup_trace_logs
   summarize_quic_diagnostic_logs
+  summarize_agent_writer_status_logs
   summarize_live_evidence_artifacts
   publish_live_artifact "$RESULTS_TSV" "live-results.tsv"
   if [[ "$status" -ne 0 || "$KEEP_LOGS" == "1" ]]; then

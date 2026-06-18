@@ -55,6 +55,18 @@ AGENT_STARTUP_COLUMNS = {
     "duration_p50_ms",
     "outcomes",
 }
+AGENT_WRITER_COLUMNS = {
+    "tool",
+    "status_lines",
+    "queued_bytes_max",
+    "bursts",
+    "burst_frames",
+    "burst_bytes",
+    "enqueue_wait_samples",
+    "enqueue_wait_max_us",
+    "write_max_us",
+    "flush_max_us",
+}
 LIVE_DIAGNOSIS_COLUMNS = {
     "path",
     "rows",
@@ -62,6 +74,10 @@ LIVE_DIAGNOSIS_COLUMNS = {
     "rustle_failed_rows",
     "max_remote_backlog_bytes",
     "max_bridge_event_queue_remote_bytes",
+    "max_agent_writer_queued_bytes",
+    "agent_writer_enqueue_wait_max_us",
+    "agent_writer_write_max_us",
+    "agent_writer_flush_max_us",
     "hotpath_bottleneck",
     "quic_failures",
     "diagnosis",
@@ -181,6 +197,46 @@ def verify_optional_agent_startup_summary(directory: pathlib.Path) -> None:
         verify_agent_startup_summary(startup)
 
 
+def verify_agent_writer_summary(path: pathlib.Path) -> None:
+    header, rows = read_tsv(require_file(path))
+    missing = sorted(AGENT_WRITER_COLUMNS.difference(header))
+    if missing:
+        raise SystemExit(f"agent writer summary {path} missing columns {missing!r}")
+    status_lines_index = header.index("status_lines")
+    queued_bytes_max_index = header.index("queued_bytes_max")
+    bursts_index = header.index("bursts")
+    burst_frames_index = header.index("burst_frames")
+    burst_bytes_index = header.index("burst_bytes")
+    enqueue_wait_samples_index = header.index("enqueue_wait_samples")
+    enqueue_wait_max_index = header.index("enqueue_wait_max_us")
+    write_max_index = header.index("write_max_us")
+    flush_max_index = header.index("flush_max_us")
+    for row in rows:
+        status_lines = int(row[status_lines_index])
+        queued_bytes_max = int(row[queued_bytes_max_index])
+        bursts = int(row[bursts_index])
+        burst_frames = int(row[burst_frames_index])
+        burst_bytes = int(row[burst_bytes_index])
+        enqueue_wait_samples = int(row[enqueue_wait_samples_index])
+        enqueue_wait_max = int(row[enqueue_wait_max_index])
+        write_max = int(row[write_max_index])
+        flush_max = int(row[flush_max_index])
+        if status_lines < 1:
+            raise SystemExit(f"agent writer summary {path} has non-positive status count")
+        if bursts < 0 or burst_frames < 0 or burst_bytes < 0:
+            raise SystemExit(f"agent writer summary {path} has negative burst counters")
+        if queued_bytes_max < 0 or enqueue_wait_samples < 0:
+            raise SystemExit(f"agent writer summary {path} has negative queue counters")
+        if enqueue_wait_max < 0 or write_max < 0 or flush_max < 0:
+            raise SystemExit(f"agent writer summary {path} has negative writer timings")
+
+
+def verify_optional_agent_writer_summary(directory: pathlib.Path) -> None:
+    writer = directory / "agent-writer-summary.tsv"
+    if writer.exists():
+        verify_agent_writer_summary(writer)
+
+
 def verify_live_diagnosis(path: pathlib.Path) -> None:
     header, rows = read_tsv(require_file(path))
     missing = sorted(LIVE_DIAGNOSIS_COLUMNS.difference(header))
@@ -191,6 +247,10 @@ def verify_live_diagnosis(path: pathlib.Path) -> None:
     failed_index = header.index("rustle_failed_rows")
     remote_backlog_index = header.index("max_remote_backlog_bytes")
     bridge_queue_index = header.index("max_bridge_event_queue_remote_bytes")
+    writer_queue_index = header.index("max_agent_writer_queued_bytes")
+    writer_enqueue_index = header.index("agent_writer_enqueue_wait_max_us")
+    writer_write_index = header.index("agent_writer_write_max_us")
+    writer_flush_index = header.index("agent_writer_flush_max_us")
     quic_failures_index = header.index("quic_failures")
     diagnosis_index = header.index("diagnosis")
     for row in rows:
@@ -199,13 +259,25 @@ def verify_live_diagnosis(path: pathlib.Path) -> None:
         failed_count = int(row[failed_index])
         remote_backlog = int(row[remote_backlog_index])
         bridge_queue = int(row[bridge_queue_index])
+        writer_queue = int(row[writer_queue_index])
+        writer_enqueue = int(row[writer_enqueue_index])
+        writer_write = int(row[writer_write_index])
+        writer_flush = int(row[writer_flush_index])
         quic_failures = int(row[quic_failures_index])
         diagnosis = row[diagnosis_index]
         if row_count < 1:
             raise SystemExit(f"live diagnosis {path} has non-positive row count")
         if success_count < 0 or failed_count < 0:
             raise SystemExit(f"live diagnosis {path} has negative Rustle row counts")
-        if remote_backlog < 0 or bridge_queue < 0 or quic_failures < 0:
+        if (
+            remote_backlog < 0
+            or bridge_queue < 0
+            or writer_queue < 0
+            or writer_enqueue < 0
+            or writer_write < 0
+            or writer_flush < 0
+            or quic_failures < 0
+        ):
             raise SystemExit(f"live diagnosis {path} has negative diagnostic counters")
         if not diagnosis or diagnosis == "-":
             raise SystemExit(f"live diagnosis {path} has empty diagnosis")
@@ -224,6 +296,9 @@ def verify_live_compare(directory: pathlib.Path, require_hotpath: bool) -> None:
     LIVE_BENCHMARK_ROWS.verify(require_file(live_compare / "live-results.tsv"))
     if require_hotpath:
         verify_hotpath_summary(live_compare / "hotpath-summary.tsv")
+        verify_agent_writer_summary(live_compare / "agent-writer-summary.tsv")
+    else:
+        verify_optional_agent_writer_summary(live_compare)
     verify_optional_quic_diagnostics(live_compare)
     verify_optional_agent_startup_summary(live_compare)
     verify_optional_live_diagnosis(live_compare)
@@ -253,6 +328,9 @@ def verify_fixtures(directory: pathlib.Path, require_hotpath: bool) -> None:
         LIVE_BENCHMARK_ROWS.verify(require_file(fixture_dir / "live-results.tsv"))
         if require_hotpath:
             verify_hotpath_summary(fixture_dir / "hotpath-summary.tsv")
+            verify_agent_writer_summary(fixture_dir / "agent-writer-summary.tsv")
+        else:
+            verify_optional_agent_writer_summary(fixture_dir)
         verify_optional_quic_diagnostics(fixture_dir)
         verify_optional_agent_startup_summary(fixture_dir)
         verify_optional_live_diagnosis(fixture_dir)
@@ -403,6 +481,27 @@ def write_sample_agent_startup(path: pathlib.Path) -> None:
     )
 
 
+def write_sample_agent_writer(path: pathlib.Path) -> None:
+    path.write_text(
+        "\n".join(
+            [
+                (
+                    "tool\tstatus_lines\tqueued_frames_max\tqueued_bytes_max\tbursts\t"
+                    "burst_frames\tburst_bytes\tburst_frames_max\tburst_bytes_max\t"
+                    "enqueue_wait_samples\tenqueue_wait_total_us\tenqueue_wait_max_us\t"
+                    "write_total_us\twrite_max_us\tflush_total_us\tflush_max_us\tpaths"
+                ),
+                (
+                    "rustle-agent\t2\t3\t4096\t5\t8\t8192\t4\t4096\t"
+                    "8\t7000\t2500\t1200\t600\t900\t500\trun.log"
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_sample_live_diagnosis(path: pathlib.Path, relative_path: str) -> None:
     path.write_text(
         "\n".join(
@@ -411,12 +510,15 @@ def write_sample_live_diagnosis(path: pathlib.Path, relative_path: str) -> None:
                     "path\trows\trustle_success_rows\trustle_failed_rows\t"
                     "agent_p50_ms\tsshuttle_p50_ms\tagent_sshuttle_p50_ratio\t"
                     "agent_throughput_mib_s\tmax_remote_backlog_bytes\t"
-                    "max_bridge_event_queue_remote_bytes\thotpath_bottleneck\t"
-                    "quic_failures\tdiagnosis"
+                    "max_bridge_event_queue_remote_bytes\tmax_agent_writer_queued_bytes\t"
+                    "agent_writer_enqueue_wait_max_us\tagent_writer_write_max_us\t"
+                    "agent_writer_flush_max_us\thotpath_bottleneck\tquic_failures\t"
+                    "diagnosis"
                 ),
                 (
                     f"{relative_path}\t2\t1\t0\t10.00\t12.00\t0.83\t39.06\t"
-                    "8192\t2048\tbody_drain\t0\tpacket_engine_backlog_pressure"
+                    "8192\t2048\t4096\t2500\t600\t500\tbody_drain\t0\t"
+                    "packet_engine_backlog_pressure"
                 ),
             ]
         )
@@ -434,11 +536,13 @@ def populate_sample_evidence(directory: pathlib.Path) -> None:
     write_sample_hotpath(live_compare / "hotpath-summary.tsv")
     write_sample_quic_diagnostics(live_compare / "quic-diagnostics.tsv")
     write_sample_agent_startup(live_compare / "startup-summary.tsv")
+    write_sample_agent_writer(live_compare / "agent-writer-summary.tsv")
     write_sample_live_diagnosis(live_compare / "live-diagnosis.tsv", ".")
     write_sample_live_results(fixture / "live-results.tsv", body_bytes=1048576)
     write_sample_fixture_results(fixture / "fixture-results.tsv", body_bytes=1048576)
     write_sample_hotpath(fixture / "hotpath-summary.tsv")
     write_sample_agent_startup(fixture / "startup-summary.tsv")
+    write_sample_agent_writer(fixture / "agent-writer-summary.tsv")
     write_sample_live_diagnosis(fixture / "live-diagnosis.tsv", ".")
 
 
@@ -469,6 +573,11 @@ def self_test() -> None:
         shutil.copytree(root, missing_hotpath)
         (missing_hotpath / "live-compare" / "hotpath-summary.tsv").unlink()
         assert_rejects(missing_hotpath, "missing required live evidence file")
+
+        missing_writer = pathlib.Path(tmp) / "missing-writer"
+        shutil.copytree(root, missing_writer)
+        (missing_writer / "live-compare" / "agent-writer-summary.tsv").unlink()
+        assert_rejects(missing_writer, "missing required live evidence file")
 
         invalid_fixture = pathlib.Path(tmp) / "invalid-fixture"
         shutil.copytree(root, invalid_fixture)

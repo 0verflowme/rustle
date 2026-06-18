@@ -28,6 +28,7 @@ LIVE_FIXTURE = REPO / "scripts" / "bench-live-fixture.sh"
 LIVE_FIXTURE_ROWS = REPO / "scripts" / "verify-live-fixture-rows.py"
 HOTPATH_TRACE_SUMMARY = REPO / "scripts" / "summarize-hotpath-trace.py"
 AGENT_STARTUP_SUMMARY = REPO / "scripts" / "summarize-agent-startup-trace.py"
+AGENT_WRITER_SUMMARY = REPO / "scripts" / "summarize-agent-writer-status.py"
 QUIC_DIAGNOSTIC_SUMMARY = REPO / "scripts" / "summarize-quic-diagnostics.py"
 LIVE_DIAGNOSIS_SUMMARY = REPO / "scripts" / "summarize-live-evidence.py"
 RELEASE_ARCHIVES = REPO / "scripts" / "verify-release-archives.py"
@@ -821,6 +822,10 @@ REQUIRED_LIVE_BENCH_SNIPPETS = [
     "summarize-hotpath-trace.py",
     "summarize_agent_startup_trace_logs",
     "summarize-agent-startup-trace.py",
+    "summarize_agent_writer_status_logs",
+    "summarize-agent-writer-status.py",
+    "agent-writer-summary.tsv",
+    "agent_writer=",
     "summarize_quic_diagnostic_logs",
     "summarize-quic-diagnostics.py",
     "auto-quic-decision:",
@@ -1339,11 +1344,14 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
     "live-results.tsv",
     "hotpath-summary.tsv",
     "startup-summary.tsv",
+    "agent-writer-summary.tsv",
     "quic-diagnostics.tsv",
     "live-diagnosis.tsv",
     "LIVE_DIAGNOSIS_COLUMNS",
     "AGENT_STARTUP_COLUMNS",
+    "AGENT_WRITER_COLUMNS",
     "verify_optional_agent_startup_summary",
+    "verify_optional_agent_writer_summary",
     "verify_optional_live_diagnosis",
     "--require-hotpath",
     "--self-test",
@@ -1354,6 +1362,7 @@ REQUIRED_LIVE_EVIDENCE_SNIPPETS = [
     "max_remote_backlog_bytes",
     "bridge_event_queue_remote_bytes",
     "max_bridge_event_queue_remote_bytes",
+    "max_agent_writer_queued_bytes",
     "diagnosis",
     "no controlled fixture evidence",
     "missing required live evidence file",
@@ -1416,6 +1425,18 @@ REQUIRED_AGENT_STARTUP_SUMMARY_SNIPPETS = [
     "assert_rejects",
 ]
 
+REQUIRED_AGENT_WRITER_SUMMARY_SNIPPETS = [
+    "agent_writer=",
+    "AGENT_WRITER_RE",
+    "queued_bytes_max",
+    "enqueue_wait_max_us",
+    "write_max_us",
+    "flush_max_us",
+    "paths",
+    "--self-test",
+    "assert_rejects",
+]
+
 REQUIRED_QUIC_DIAGNOSTIC_SUMMARY_SNIPPETS = [
     "quic-auth:",
     "quic-connect:",
@@ -1445,6 +1466,14 @@ REQUIRED_LIVE_DIAGNOSIS_SUMMARY_SNIPPETS = [
     "quic-diagnostics.tsv",
     "remote_backlog_bytes_max",
     "bridge_event_queue_remote_bytes_max",
+    "agent-writer-summary.tsv",
+    "max_agent_writer_queued_bytes",
+    "agent_writer_enqueue_wait_max_us",
+    "agent_writer_write_max_us",
+    "agent_writer_flush_max_us",
+    "agent_writer_queue_pressure",
+    "agent_writer_write_pressure",
+    "agent_writer_flush_pressure",
     "supervisor_event_queue_pressure",
     "packet_engine_backlog_pressure",
     "quic_startup_or_auth_failure",
@@ -1943,6 +1972,7 @@ def main() -> None:
     live_fixture_rows = LIVE_FIXTURE_ROWS.read_text(encoding="utf-8")
     hotpath_trace_summary = HOTPATH_TRACE_SUMMARY.read_text(encoding="utf-8")
     agent_startup_summary = AGENT_STARTUP_SUMMARY.read_text(encoding="utf-8")
+    agent_writer_summary = AGENT_WRITER_SUMMARY.read_text(encoding="utf-8")
     quic_diagnostic_summary = QUIC_DIAGNOSTIC_SUMMARY.read_text(encoding="utf-8")
     live_diagnosis_summary = LIVE_DIAGNOSIS_SUMMARY.read_text(encoding="utf-8")
     release_archives = RELEASE_ARCHIVES.read_text(encoding="utf-8")
@@ -2130,6 +2160,17 @@ def main() -> None:
         fail(
             "scripts/summarize-agent-startup-trace.py is missing required snippets: "
             f"{missing_agent_startup_summary!r}"
+        )
+
+    missing_agent_writer_summary = [
+        snippet
+        for snippet in REQUIRED_AGENT_WRITER_SUMMARY_SNIPPETS
+        if snippet not in agent_writer_summary
+    ]
+    if missing_agent_writer_summary:
+        fail(
+            "scripts/summarize-agent-writer-status.py is missing required snippets: "
+            f"{missing_agent_writer_summary!r}"
         )
 
     missing_quic_diagnostic_summary = [

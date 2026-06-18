@@ -195,9 +195,9 @@ artifacts under `target/live-evidence/release-candidate-<timestamp>` unless
 `fixture-<bytes>-bytes` directory so evidence from different body sizes is not
 overwritten. After the live run completes, the wrapper runs
 `scripts/verify-live-evidence.py --require-hotpath` against that directory so
-missing live comparison rows, fixture rows, hotpath summaries, or optional QUIC
-diagnostics fail the release-candidate run instead of becoming incomplete
-evidence. The live
+missing live comparison rows, fixture rows, hotpath summaries, framed-agent
+writer summaries, or optional QUIC diagnostics fail the release-candidate run
+instead of becoming incomplete evidence. The live
 verifier runs `smoke-live-tunnel.sh` for primary `agent` first and
 `direct-tcpip` second by default; set `RUSTLE_VERIFY_LIVE_TRANSPORTS` only when
 intentionally narrowing that matrix for diagnostics. Skips are useful
@@ -447,6 +447,9 @@ Required before tagging a release:
   `RUSTLE_BENCH_MAX_QUIC_NATIVE_AGENT_P50_RATIO`, so the optional live
   native-QUIC data-plane claim can be gated directly against the primary
   SSH-agent data path when the remote UDP path supports QUIC.
+  Live artifacts also include `agent-writer-summary.tsv`, so agent queue,
+  write, and flush pressure can be diagnosed from the same runs used for
+  sshuttle and QUIC comparison gates.
   `scripts/verify-live-benchmark-rows.py --self-test` must pass so the
   sshuttle throughput ratio, sshuttle p50 ratio, native QUIC throughput ratio,
   native QUIC p50 ratio, live row threshold gates, and diagnostic failure counters
