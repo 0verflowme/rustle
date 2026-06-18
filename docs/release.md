@@ -462,11 +462,13 @@ Required before tagging a release:
   throughput gate with `RUSTLE_BENCH_HTTP_CHUNK_BYTES=262144`,
   `RUSTLE_BENCH_HTTP_CHUNK_DELAY_MS=5`, and
   `RUSTLE_BENCH_MIN_THROUGHPUT_MIB_S=20`, and a hard
-  100 MiB single-flow `agent` throughput gate. The 100 MiB local gate includes
-  `quic-native` with `RUSTLE_BENCH_MIN_QUIC_NATIVE_AGENT_RATIO` so the native
-  data plane must meet or beat the primary agent path on the same-host fixture. The same 100 MiB throughput gate
-  also runs with `RUSTLE_BENCH_BRIDGE_TRANSPORTS="quic-agent"`, proving the
-  optional SSH-bootstrap/UDP-QUIC data plane can sustain a large response with
+  100 MiB single-flow `agent` throughput gate. Push CI runs `quic-native` in
+  the same 100 MiB rootless matrix with the absolute throughput floor, but the
+  native-vs-agent ratio gate is reserved for release-candidate/live runs because
+  `quic-native` is still opt-in and same-host synthetic throughput can favor the
+  SSH-agent path. The same 100 MiB throughput gate also runs with
+  `RUSTLE_BENCH_BRIDGE_TRANSPORTS="quic-agent"`, proving the optional
+  SSH-bootstrap/UDP-QUIC data plane can sustain a large response with
   release-mode code. The large-response gates use
   `RUSTLE_BENCH_BODY_BYTES=104857600`. Together they prove the low-concurrency path
   is not accidentally measured with a debug binary, regressed into

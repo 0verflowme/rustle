@@ -333,7 +333,7 @@ mod tests {
     use super::*;
 
     use std::path::PathBuf;
-    use std::time::Instant as StdInstant;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use russh::keys::PublicKey;
     use ssh_key::known_hosts::HostPatterns;
@@ -462,11 +462,7 @@ mod tests {
             }
         }
 
-        let root = std::env::temp_dir().join(format!(
-            "rustle-known-hosts-accept-new-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
+        let root = unique_temp_path("rustle-known-hosts-accept-new");
         let temp = TempTree { path: root };
         let path = temp.path.join(".ssh").join("known_hosts");
         let verifier = HostKeyVerifier::new(
@@ -579,19 +575,18 @@ mod tests {
     }
 
     fn write_temp_known_hosts(contents: &str) -> PathBuf {
-        static NEXT_KNOWN_HOSTS_FILE: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
-        let sequence = NEXT_KNOWN_HOSTS_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "rustle-known-hosts-{}-{}-{}.tmp",
-            std::process::id(),
-            sequence,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let path = unique_temp_path("rustle-known-hosts").with_extension("tmp");
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        static NEXT_TEMP_PATH: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_TEMP_PATH.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{sequence}-{now}", std::process::id()))
     }
 }

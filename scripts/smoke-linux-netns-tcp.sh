@@ -40,6 +40,10 @@ if [[ -z "$SSHD_PATH" ]]; then
   fi
 fi
 [[ -x "$SSHD_PATH" ]] || smoke_die "sshd is not executable: $SSHD_PATH"
+if [[ ! -d /run/sshd ]]; then
+  "${SUDO_CMD[@]}" mkdir -p /run/sshd
+  "${SUDO_CMD[@]}" chmod 755 /run/sshd
+fi
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustle-netns-tcp-smoke.XXXXXX")"
 NS_NAME="rustle-remote-$$"

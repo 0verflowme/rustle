@@ -213,7 +213,7 @@ pub(crate) fn remote_platform_target_triples(platform: RemotePlatform) -> &'stat
 mod tests {
     use super::*;
 
-    use std::time::Instant as StdInstant;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn local_agent_selection_marks_current_binary_for_matching_platform() {
@@ -247,11 +247,7 @@ mod tests {
             return;
         }
 
-        let root = env::temp_dir().join(format!(
-            "rustle-linux-local-sidecar-test-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
+        let root = unique_temp_root("rustle-linux-local-sidecar-test");
         let temp = TempTree { path: root };
         let bin_dir = temp.path.join("bin");
         std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
@@ -387,11 +383,7 @@ mod tests {
             .expect("at least one nonlocal supported platform")
         }
 
-        let root = env::temp_dir().join(format!(
-            "rustle-agent-sidecar-test-{}-{:?}",
-            std::process::id(),
-            StdInstant::now()
-        ));
+        let root = unique_temp_root("rustle-agent-sidecar-test");
         let temp = TempTree { path: root };
         let bin_dir = temp.path.join("bin");
         std::fs::create_dir_all(&bin_dir).expect("create sidecar test bin dir");
@@ -422,6 +414,16 @@ mod tests {
             .find(|path| path.is_file())
             .expect("matching sidecar should be a selectable candidate");
         assert_eq!(selected, &sidecar);
+    }
+
+    fn unique_temp_root(prefix: &str) -> PathBuf {
+        static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT_TEMP_ROOT.fetch_add(1, Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("{prefix}-{}-{sequence}-{now}", std::process::id()))
     }
 
     #[test]
