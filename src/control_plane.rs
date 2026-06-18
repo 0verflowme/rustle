@@ -2,6 +2,7 @@ mod agent_initial_startup;
 mod agent_lane_batch;
 mod agent_policy;
 mod agent_startup;
+mod agent_startup_trace;
 mod quic_bootstrap;
 mod quic_connect;
 mod quic_startup;

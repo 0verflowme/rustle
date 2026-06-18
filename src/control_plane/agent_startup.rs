@@ -4,7 +4,10 @@ use super::agent_initial_startup::connect_initial_agent_bridge_transports_from_c
 use super::agent_policy::{
     format_agent_fast_start_message, resolve_agent_session_count, validate_agent_session_count,
 };
+use super::agent_startup_trace::AgentStartupTrace;
 use crate::agent_bridge::{AgentBridgeConnector, AgentBridgeTransport};
+
+use std::time::Instant;
 
 pub(crate) async fn connect_agent_bridge_transports_from_connector(
     connector: &dyn AgentBridgeConnector,
@@ -19,9 +22,22 @@ pub(crate) async fn connect_auto_agent_bridge_transports_from_connector(
 ) -> Result<Vec<AgentBridgeTransport>> {
     let desired_sessions = resolve_agent_session_count(desired_sessions);
     validate_agent_session_count(desired_sessions)?;
+    let mut trace = AgentStartupTrace::new("fast", desired_sessions);
 
-    let first = connector.connect_primary().await?;
+    let primary_started_at = Instant::now();
+    let first = match connector.connect_primary().await {
+        Ok(first) => {
+            trace.primary_connect(primary_started_at, true);
+            first
+        }
+        Err(err) => {
+            trace.primary_connect(primary_started_at, false);
+            trace.finish(0, "primary_error");
+            return Err(err);
+        }
+    };
     eprintln!("{}", format_agent_fast_start_message(1, desired_sessions));
+    trace.finish(1, "ok");
     Ok(vec![first])
 }
 

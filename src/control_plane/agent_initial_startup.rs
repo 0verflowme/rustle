@@ -6,7 +6,10 @@ use super::agent_lane_batch::{
 use super::agent_policy::{
     format_agent_established_message, resolve_agent_session_count, validate_agent_session_count,
 };
+use super::agent_startup_trace::AgentStartupTrace;
 use crate::agent_bridge::{AgentBridgeConnector, AgentBridgeTransport};
+
+use std::time::Instant;
 
 const AGENT_INITIAL_CONNECT_RETRY_ROUNDS: usize = 1;
 
@@ -16,27 +19,44 @@ pub(super) async fn connect_initial_agent_bridge_transports_from_connector(
 ) -> Result<Vec<AgentBridgeTransport>> {
     let desired_sessions = resolve_agent_session_count(desired_sessions);
     validate_agent_session_count(desired_sessions)?;
+    let mut trace = AgentStartupTrace::new("initial", desired_sessions);
     let mut transports = Vec::with_capacity(desired_sessions);
 
-    let first = connector.connect_primary().await?;
+    let primary_started_at = Instant::now();
+    let first = match connector.connect_primary().await {
+        Ok(first) => {
+            trace.primary_connect(primary_started_at, true);
+            first
+        }
+        Err(err) => {
+            trace.primary_connect(primary_started_at, false);
+            trace.finish(0, "primary_error");
+            return Err(err);
+        }
+    };
     let additional_agent_command = first.agent_command().to_owned();
     transports.push(first);
 
     let mut index = 1;
     while index < desired_sessions {
         let batch = (desired_sessions - index).min(AGENT_INITIAL_CONNECT_BATCH);
-        for (offset, result) in connect_additional_agent_bridge_transport_batch(
+        let batch_started_at = Instant::now();
+        let results = connect_additional_agent_bridge_transport_batch(
             connector,
             &additional_agent_command,
             batch,
         )
-        .await
-        .into_iter()
-        .enumerate()
-        {
+        .await;
+        let mut successes = 0;
+        let mut failures = 0;
+        for (offset, result) in results.into_iter().enumerate() {
             match result {
-                Ok(transport) => transports.push(transport),
+                Ok(transport) => {
+                    successes += 1;
+                    transports.push(transport);
+                }
                 Err(err) => {
+                    failures += 1;
                     eprintln!(
                         "agent: additional exec transport {}/{} failed: {err:#}; continuing with {} transport(s)",
                         index + offset + 1,
@@ -46,6 +66,7 @@ pub(super) async fn connect_initial_agent_bridge_transports_from_connector(
                 }
             }
         }
+        trace.extra_batch(batch_started_at, batch, successes, failures);
         index += batch;
     }
 
@@ -57,16 +78,24 @@ pub(super) async fn connect_initial_agent_bridge_transports_from_connector(
         eprintln!(
             "agent: retrying {missing} missing exec transport(s) after partial startup (round {retry_round}/{AGENT_INITIAL_CONNECT_RETRY_ROUNDS})"
         );
-        for result in connect_additional_agent_bridge_transport_batch(
+        let retry_batch = missing.min(AGENT_INITIAL_CONNECT_BATCH);
+        let retry_started_at = Instant::now();
+        let results = connect_additional_agent_bridge_transport_batch(
             connector,
             &additional_agent_command,
-            missing.min(AGENT_INITIAL_CONNECT_BATCH),
+            retry_batch,
         )
-        .await
-        {
+        .await;
+        let mut successes = 0;
+        let mut failures = 0;
+        for result in results {
             match result {
-                Ok(transport) => transports.push(transport),
+                Ok(transport) => {
+                    successes += 1;
+                    transports.push(transport);
+                }
                 Err(err) => {
+                    failures += 1;
                     eprintln!(
                         "agent: retry for missing exec transport failed: {err:#}; continuing with {} transport(s)",
                         transports.len()
@@ -74,12 +103,19 @@ pub(super) async fn connect_initial_agent_bridge_transports_from_connector(
                 }
             }
         }
+        trace.retry_batch(retry_started_at, retry_batch, successes, failures);
     }
 
+    let outcome = if transports.len() == desired_sessions {
+        "ok"
+    } else {
+        "degraded"
+    };
     eprintln!(
         "{}",
         format_agent_established_message(transports.len(), desired_sessions)
     );
+    trace.finish(transports.len(), outcome);
     Ok(transports)
 }
 
