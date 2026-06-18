@@ -33,6 +33,22 @@ HOTPATH_COLUMNS = {
     "pre_bridge_queue_wait_p50_ms",
     "pre_bridge_queue_wait_max_ms",
     "pre_bridge_queue_wait_avg_ms",
+    "agent_send_credit_wait_p50_ms",
+    "agent_send_credit_wait_max_ms",
+    "agent_send_credit_wait_avg_ms",
+    "agent_send_outbound_wait_p50_ms",
+    "agent_send_outbound_wait_max_ms",
+    "agent_send_outbound_wait_avg_ms",
+    "agent_remote_read_wait_p50_ms",
+    "agent_remote_read_wait_max_ms",
+    "agent_remote_read_wait_avg_ms",
+    "agent_remote_output_credit_wait_p50_ms",
+    "agent_remote_output_credit_wait_max_ms",
+    "agent_remote_output_credit_wait_avg_ms",
+    "agent_remote_output_send_wait_p50_ms",
+    "agent_remote_output_send_wait_max_ms",
+    "agent_remote_output_send_wait_avg_ms",
+    "remote_event_wait_p50_ms",
     "remote_event_wait_max_ms",
     "remote_event_wait_avg_ms",
     "likely_bottleneck",
@@ -79,6 +95,7 @@ LIVE_DIAGNOSIS_COLUMNS = {
     "agent_writer_write_max_us",
     "agent_writer_flush_max_us",
     "hotpath_bottleneck",
+    "hotpath_pressure",
     "quic_failures",
     "diagnosis",
 }
@@ -527,12 +544,12 @@ def write_sample_live_diagnosis(path: pathlib.Path, relative_path: str) -> None:
                     "agent_throughput_mib_s\tmax_remote_backlog_bytes\t"
                     "max_bridge_event_queue_remote_bytes\tmax_agent_writer_queued_bytes\t"
                     "agent_writer_enqueue_wait_max_us\tagent_writer_write_max_us\t"
-                    "agent_writer_flush_max_us\thotpath_bottleneck\tquic_failures\t"
-                    "diagnosis"
+                    "agent_writer_flush_max_us\thotpath_bottleneck\thotpath_pressure\t"
+                    "quic_failures\tdiagnosis"
                 ),
                 (
                     f"{relative_path}\t2\t1\t0\t10.00\t12.00\t0.83\t39.06\t"
-                    "8192\t2048\t4096\t2500\t600\t500\tbody_drain\t0\t"
+                    "8192\t2048\t4096\t2500\t600\t500\tbody_drain\t-\t0\t"
                     "packet_engine_backlog_pressure"
                 ),
             ]

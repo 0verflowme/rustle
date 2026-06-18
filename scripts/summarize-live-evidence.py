@@ -65,11 +65,23 @@ OUTPUT_COLUMNS = [
     "agent_writer_write_max_us",
     "agent_writer_flush_max_us",
     "hotpath_bottleneck",
+    "hotpath_pressure",
     "quic_failures",
     "diagnosis",
 ]
 PRESSURE_BYTES = 1024 * 1024
 WRITER_PRESSURE_US = 50_000
+HOTPATH_PRESSURE_MS = 50.0
+HOTPATH_PRESSURE_FIELDS = (
+    ("agent_remote_output_credit_wait_max_ms", "agent_remote_output_credit_pressure"),
+    ("agent_remote_output_send_wait_max_ms", "agent_remote_output_send_pressure"),
+    ("remote_event_wait_max_ms", "supervisor_remote_event_pressure"),
+    ("agent_send_credit_wait_max_ms", "agent_send_credit_pressure"),
+    ("agent_send_outbound_wait_max_ms", "agent_send_outbound_pressure"),
+    ("pre_bridge_queue_wait_max_ms", "pre_bridge_queue_pressure"),
+    ("tcp_recv_queue_wait_max_ms", "tcp_recv_queue_pressure"),
+    ("local_queue_wait_max_ms", "local_queue_pressure"),
+)
 
 
 def parse_float(value: str, field: str) -> float:
@@ -92,6 +104,12 @@ def format_float(value: float | None) -> str:
     if value is None:
         return "-"
     return f"{value:.2f}"
+
+
+def parse_optional_float(value: str, field: str) -> float | None:
+    if value in ("", "-"):
+        return None
+    return parse_float(value, field)
 
 
 def average(values: list[float]) -> float | None:
@@ -191,6 +209,38 @@ def read_hotpath_bottleneck(directory: pathlib.Path) -> str:
     return counts.most_common(1)[0][0]
 
 
+def read_hotpath_pressure(directory: pathlib.Path) -> str:
+    path = directory / "hotpath-summary.tsv"
+    if not path.is_file():
+        return "-"
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line]
+    if len(lines) < 2:
+        return "-"
+    header = lines[0].split("\t")
+    indexes = {
+        field: header.index(field)
+        for field, _ in HOTPATH_PRESSURE_FIELDS
+        if field in header
+    }
+    if not indexes:
+        return "-"
+    strongest: tuple[float, str] | None = None
+    for line in lines[1:]:
+        parts = line.split("\t")
+        if len(parts) != len(header):
+            raise SystemExit(f"invalid hotpath row in {path}: {line!r}")
+        for field, label in HOTPATH_PRESSURE_FIELDS:
+            if field not in indexes:
+                continue
+            value = parse_optional_float(parts[indexes[field]], field)
+            if value is None or value < HOTPATH_PRESSURE_MS:
+                continue
+            candidate = (value, label)
+            if strongest is None or candidate[0] > strongest[0]:
+                strongest = candidate
+    return "-" if strongest is None else strongest[1]
+
+
 def read_quic_failures(directory: pathlib.Path) -> int:
     path = directory / "quic-diagnostics.tsv"
     if not path.is_file():
@@ -264,6 +314,7 @@ def diagnose(
     bridge_event_queue_max: int,
     agent_writer_pressure: dict[str, int],
     hotpath_bottleneck: str,
+    hotpath_pressure: str,
     quic_failures: int,
     agent_p50: float | None,
     sshuttle_p50: float | None,
@@ -295,6 +346,8 @@ def diagnose(
         return "agent_writer_write_pressure"
     if agent_writer_pressure["agent_writer_flush_max_us"] >= WRITER_PRESSURE_US:
         return "agent_writer_flush_pressure"
+    if hotpath_pressure != "-":
+        return f"hotpath:{hotpath_pressure}"
     if hotpath_bottleneck != "-":
         return f"hotpath:{hotpath_bottleneck}"
     if quic_failures > 0:
@@ -325,6 +378,7 @@ def summarize_dir(directory: pathlib.Path, root: pathlib.Path) -> dict[str, str]
         "bridge_event_queue_remote_bytes_max",
     )
     hotpath_bottleneck = read_hotpath_bottleneck(directory)
+    hotpath_pressure = read_hotpath_pressure(directory)
     quic_failures = read_quic_failures(directory)
     agent_writer_pressure = read_agent_writer_pressure(directory)
     diagnosis = diagnose(
@@ -333,6 +387,7 @@ def summarize_dir(directory: pathlib.Path, root: pathlib.Path) -> dict[str, str]
         bridge_event_queue_max,
         agent_writer_pressure,
         hotpath_bottleneck,
+        hotpath_pressure,
         quic_failures,
         agent_p50,
         sshuttle_p50,
@@ -361,6 +416,7 @@ def summarize_dir(directory: pathlib.Path, root: pathlib.Path) -> dict[str, str]
             agent_writer_pressure["agent_writer_flush_max_us"]
         ),
         "hotpath_bottleneck": hotpath_bottleneck,
+        "hotpath_pressure": hotpath_pressure,
         "quic_failures": str(quic_failures),
         "diagnosis": diagnosis,
     }
@@ -393,8 +449,14 @@ def self_test() -> None:
             encoding="utf-8",
         )
         (live_compare / "hotpath-summary.tsv").write_text(
-            "transport\tflows\tfailed_flows\tlikely_bottleneck\n"
-            "agent\t4\t0\tbody_drain\n",
+            "transport\tflows\tfailed_flows\tlikely_bottleneck\t"
+            "agent_remote_output_credit_wait_max_ms\t"
+            "agent_remote_output_send_wait_max_ms\tremote_event_wait_max_ms\t"
+            "agent_send_credit_wait_max_ms\tagent_send_outbound_wait_max_ms\t"
+            "pre_bridge_queue_wait_max_ms\ttcp_recv_queue_wait_max_ms\t"
+            "local_queue_wait_max_ms\n"
+            "agent\t4\t0\tbody_drain\t0.000\t0.000\t0.000\t0.000\t0.000\t"
+            "0.000\t0.000\t0.000\n",
             encoding="utf-8",
         )
         (live_compare / "quic-diagnostics.tsv").write_text(
@@ -420,6 +482,7 @@ def self_test() -> None:
         assert row["max_remote_backlog_bytes"] == "2097152"
         assert row["max_agent_writer_queued_bytes"] == "2097152"
         assert row["agent_writer_enqueue_wait_max_us"] == "90000"
+        assert row["hotpath_pressure"] == "-"
         assert row["diagnosis"] == "packet_engine_backlog_pressure"
 
         (live_compare / "live-results.tsv").write_text(
@@ -445,7 +508,34 @@ def self_test() -> None:
             "1200\t900\t400\t300\t200\t100\tlog\n",
             encoding="utf-8",
         )
+        (live_compare / "hotpath-summary.tsv").write_text(
+            "transport\tflows\tfailed_flows\tlikely_bottleneck\t"
+            "agent_remote_output_credit_wait_max_ms\t"
+            "agent_remote_output_send_wait_max_ms\tremote_event_wait_max_ms\t"
+            "agent_send_credit_wait_max_ms\tagent_send_outbound_wait_max_ms\t"
+            "pre_bridge_queue_wait_max_ms\ttcp_recv_queue_wait_max_ms\t"
+            "local_queue_wait_max_ms\n"
+            "agent\t4\t0\tbody_drain\t75.000\t0.000\t0.000\t0.000\t0.000\t"
+            "0.000\t0.000\t0.000\n",
+            encoding="utf-8",
+        )
         rows = summarize(root)
+        assert rows[0]["hotpath_pressure"] == "agent_remote_output_credit_pressure"
+        assert rows[0]["diagnosis"] == "hotpath:agent_remote_output_credit_pressure"
+
+        (live_compare / "hotpath-summary.tsv").write_text(
+            "transport\tflows\tfailed_flows\tlikely_bottleneck\t"
+            "agent_remote_output_credit_wait_max_ms\t"
+            "agent_remote_output_send_wait_max_ms\tremote_event_wait_max_ms\t"
+            "agent_send_credit_wait_max_ms\tagent_send_outbound_wait_max_ms\t"
+            "pre_bridge_queue_wait_max_ms\ttcp_recv_queue_wait_max_ms\t"
+            "local_queue_wait_max_ms\n"
+            "agent\t4\t0\tbody_drain\t0.000\t0.000\t0.000\t0.000\t0.000\t"
+            "0.000\t0.000\t0.000\n",
+            encoding="utf-8",
+        )
+        rows = summarize(root)
+        assert rows[0]["hotpath_pressure"] == "-"
         assert rows[0]["diagnosis"] == "hotpath:body_drain"
 
 

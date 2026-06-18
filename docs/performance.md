@@ -663,8 +663,11 @@ results exist. That file is a first-look triage row, not a gate: it maps
 nonzero final counters to `diagnostic_failure:*`, max packet-engine backlog to
 `packet_engine_backlog_pressure`, max supervisor bridge queue pressure to
 `supervisor_event_queue_pressure`, framed-agent writer queue/write/flush
-pressure to `agent_writer_*_pressure`, hotpath labels to `hotpath:*`, and
-QUIC diagnostic failures to `quic_startup_or_auth_failure`.
+pressure to `agent_writer_*_pressure`, hotpath max-wait signals such as
+`agent_remote_output_credit_pressure`, `agent_remote_output_send_pressure`,
+and `supervisor_remote_event_pressure` to `hotpath:*`, lower-priority hotpath
+labels to `hotpath:*`, and QUIC diagnostic failures to
+`quic_startup_or_auth_failure`.
 Validate a collected artifact tree with:
 
 ```sh
